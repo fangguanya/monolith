@@ -1,0 +1,48 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "MonolithToolRegistry.h"
+
+class FMonolithSourceDatabase;
+
+/**
+ * 9 engine source intelligence actions + 1 reindex trigger.
+ * Ports the Python unreal-source-mcp server tools to native C++.
+ */
+class FMonolithSourceActions
+{
+public:
+	static void RegisterAll();
+
+private:
+	// Action handlers
+	static FMonolithActionResult HandleReadSource(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleFindReferences(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleFindCallers(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleFindCallees(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSearchSource(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetClassHierarchy(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetModuleInfo(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetSymbolContext(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleReadFile(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleTriggerReindex(const TSharedPtr<FJsonObject>& Params);
+
+	// Helpers
+	static FMonolithSourceDatabase* GetDB();
+	static FString ShortPath(const FString& FullPath);
+	static FString ReadFileLines(const FString& FilePath, int32 StartLine, int32 EndLine);
+	static bool IsForwardDeclaration(const FString& FilePath, int32 LineStart, int32 LineEnd);
+	static FString ExtractMembers(const FString& FilePath, int32 StartLine, int32 EndLine);
+
+	static FString MakeTextResult(const FString& Text);
+
+	// Hierarchy walk helpers
+	struct FHierarchyCounter
+	{
+		int32 Shown = 0;
+		int32 Truncated = 0;
+		int32 Limit = 80;
+	};
+	static void WalkAncestors(FMonolithSourceDatabase* DB, int64 SymId, TArray<FString>& Lines, int32 Indent, int32 MaxDepth, FHierarchyCounter& Counter, TSet<int64>& Visited);
+	static void WalkDescendants(FMonolithSourceDatabase* DB, int64 SymId, TArray<FString>& Lines, int32 Indent, int32 MaxDepth, FHierarchyCounter& Counter, TSet<int64>& Visited);
+};

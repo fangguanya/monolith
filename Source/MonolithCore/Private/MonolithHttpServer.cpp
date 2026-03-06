@@ -5,7 +5,6 @@
 #include "MonolithSettings.h"
 #include "HttpServerModule.h"
 #include "HttpServerResponse.h"
-#include "Misc/Guid.h"
 
 FMonolithHttpServer::FMonolithHttpServer()
 {
@@ -87,11 +86,6 @@ void FMonolithHttpServer::Stop()
 	FHttpServerModule::Get().StopAllListeners();
 	HttpRouter.Reset();
 
-	{
-		FScopeLock Lock(&SessionLock);
-		ActiveSessions.Empty();
-	}
-
 	bIsRunning = false;
 	UE_LOG(LogMonolith, Log, TEXT("Monolith MCP server stopped"));
 }
@@ -111,32 +105,6 @@ bool FMonolithHttpServer::HandlePostMcp(const FHttpServerRequest& Request, const
 		TSharedPtr<FJsonObject> Err = FMonolithJsonUtils::ErrorResponse(
 			nullptr, FMonolithJsonUtils::ErrParseError, TEXT("Empty request body"));
 		OnComplete(MakeJsonResponse(FMonolithJsonUtils::Serialize(Err), EHttpServerResponseCodes::BadRequest));
-		return true;
-	}
-
-	// Check for session header — create one if missing (first request)
-	FString SessionId;
-	if (const TArray<FString>* SessionHeader = Request.Headers.Find(TEXT("mcp-session-id")))
-	{
-		if (SessionHeader->Num() > 0)
-		{
-			SessionId = (*SessionHeader)[0];
-		}
-	}
-
-	if (SessionId.IsEmpty())
-	{
-		SessionId = GenerateSessionId();
-		FScopeLock Lock(&SessionLock);
-		ActiveSessions.Add(SessionId);
-	}
-	else if (!IsValidSession(SessionId))
-	{
-		TSharedPtr<FJsonObject> Err = FMonolithJsonUtils::ErrorResponse(
-			nullptr, FMonolithJsonUtils::ErrInvalidRequest, TEXT("Invalid or expired session"));
-		auto Response = MakeJsonResponse(FMonolithJsonUtils::Serialize(Err), EHttpServerResponseCodes::NotFound);
-		AddCorsHeaders(*Response);
-		OnComplete(MoveTemp(Response));
 		return true;
 	}
 
@@ -181,7 +149,7 @@ bool FMonolithHttpServer::HandlePostMcp(const FHttpServerRequest& Request, const
 	// Process each request
 	for (const TSharedPtr<FJsonObject>& Req : Requests)
 	{
-		TSharedPtr<FJsonObject> Resp = ProcessJsonRpcRequest(Req, SessionId);
+		TSharedPtr<FJsonObject> Resp = ProcessJsonRpcRequest(Req);
 		if (Resp.IsValid())
 		{
 			// Only add response if it's not a notification (notifications have no id)
@@ -197,7 +165,6 @@ bool FMonolithHttpServer::HandlePostMcp(const FHttpServerRequest& Request, const
 		auto Response = FHttpServerResponse::Ok();
 		Response->Code = EHttpServerResponseCodes::Accepted;
 		AddCorsHeaders(*Response);
-		Response->Headers.Add(TEXT("Mcp-Session-Id"), {SessionId});
 		OnComplete(MoveTemp(Response));
 		return true;
 	}
@@ -222,66 +189,27 @@ bool FMonolithHttpServer::HandlePostMcp(const FHttpServerRequest& Request, const
 
 	auto Response = MakeJsonResponse(ResponseBody);
 	AddCorsHeaders(*Response);
-	Response->Headers.Add(TEXT("Mcp-Session-Id"), {SessionId});
 	OnComplete(MoveTemp(Response));
 	return true;
 }
 
 bool FMonolithHttpServer::HandleGetMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
 {
-	// SSE endpoint — for now, return a simple SSE stream with a ping
-	// Full SSE streaming will be implemented when we need server-initiated notifications
-
-	FString SessionId;
-	if (const TArray<FString>* SessionHeader = Request.Headers.Find(TEXT("mcp-session-id")))
-	{
-		if (SessionHeader->Num() > 0)
-		{
-			SessionId = (*SessionHeader)[0];
-		}
-	}
-
-	if (SessionId.IsEmpty() || !IsValidSession(SessionId))
-	{
-		auto Response = FHttpServerResponse::Error(EHttpServerResponseCodes::BadRequest,
-			TEXT("BadRequest"), TEXT("Missing or invalid Mcp-Session-Id header"));
-		AddCorsHeaders(*Response);
-		OnComplete(MoveTemp(Response));
-		return true;
-	}
-
-	// Return SSE endpoint acknowledgement
+	// SSE endpoint — return a single SSE event with an endpoint message.
 	// UE's HTTP server doesn't natively support long-lived SSE connections,
-	// so we return a single SSE event with an endpoint message and close.
+	// so we return a single SSE event and close.
 	FString SseBody = TEXT("event: endpoint\ndata: \"/mcp\"\n\n");
 	auto Response = FHttpServerResponse::Create(SseBody, TEXT("text/event-stream"));
 	Response->Code = EHttpServerResponseCodes::Ok;
 	AddCorsHeaders(*Response);
 	Response->Headers.Add(TEXT("Cache-Control"), {TEXT("no-cache")});
 	Response->Headers.Add(TEXT("Connection"), {TEXT("keep-alive")});
-	Response->Headers.Add(TEXT("Mcp-Session-Id"), {SessionId});
 	OnComplete(MoveTemp(Response));
 	return true;
 }
 
 bool FMonolithHttpServer::HandleDeleteMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
 {
-	FString SessionId;
-	if (const TArray<FString>* SessionHeader = Request.Headers.Find(TEXT("mcp-session-id")))
-	{
-		if (SessionHeader->Num() > 0)
-		{
-			SessionId = (*SessionHeader)[0];
-		}
-	}
-
-	if (!SessionId.IsEmpty())
-	{
-		FScopeLock Lock(&SessionLock);
-		ActiveSessions.Remove(SessionId);
-		UE_LOG(LogMonolith, Verbose, TEXT("Session terminated: %s"), *SessionId);
-	}
-
 	auto Response = FHttpServerResponse::Ok();
 	AddCorsHeaders(*Response);
 	OnComplete(MoveTemp(Response));
@@ -300,7 +228,7 @@ bool FMonolithHttpServer::HandleOptions(const FHttpServerRequest& Request, const
 // JSON-RPC 2.0 Processing
 // ============================================================================
 
-TSharedPtr<FJsonObject> FMonolithHttpServer::ProcessJsonRpcRequest(const TSharedPtr<FJsonObject>& Request, const FString& SessionId)
+TSharedPtr<FJsonObject> FMonolithHttpServer::ProcessJsonRpcRequest(const TSharedPtr<FJsonObject>& Request)
 {
 	if (!Request.IsValid())
 	{
@@ -632,17 +560,6 @@ void FMonolithHttpServer::AddCorsHeaders(FHttpServerResponse& Response)
 {
 	Response.Headers.Add(TEXT("Access-Control-Allow-Origin"), {TEXT("*")});
 	Response.Headers.Add(TEXT("Access-Control-Allow-Methods"), {TEXT("GET, POST, DELETE, OPTIONS")});
-	Response.Headers.Add(TEXT("Access-Control-Allow-Headers"), {TEXT("Content-Type, Mcp-Session-Id")});
-	Response.Headers.Add(TEXT("Access-Control-Expose-Headers"), {TEXT("Mcp-Session-Id")});
+	Response.Headers.Add(TEXT("Access-Control-Allow-Headers"), {TEXT("Content-Type")});
 }
 
-FString FMonolithHttpServer::GenerateSessionId()
-{
-	return FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
-}
-
-bool FMonolithHttpServer::IsValidSession(const FString& SessionId) const
-{
-	FScopeLock Lock(&SessionLock);
-	return ActiveSessions.Contains(SessionId);
-}

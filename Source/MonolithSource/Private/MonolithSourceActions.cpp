@@ -1,0 +1,933 @@
+#include "MonolithSourceActions.h"
+#include "MonolithSourceDatabase.h"
+#include "MonolithSourceSubsystem.h"
+#include "MonolithToolRegistry.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Editor.h"
+#include "Internationalization/Regex.h"
+
+// ============================================================================
+// Registration
+// ============================================================================
+
+void FMonolithSourceActions::RegisterAll()
+{
+	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+
+	Registry.RegisterAction(TEXT("source"), TEXT("read_source"),
+		TEXT("Get the implementation source code for a class, function, or struct"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleReadSource));
+
+	Registry.RegisterAction(TEXT("source"), TEXT("find_references"),
+		TEXT("Find all usage sites of a symbol (calls, includes, type references)"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleFindReferences));
+
+	Registry.RegisterAction(TEXT("source"), TEXT("find_callers"),
+		TEXT("Find all functions that call the given function"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleFindCallers));
+
+	Registry.RegisterAction(TEXT("source"), TEXT("find_callees"),
+		TEXT("Find all functions called by the given function"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleFindCallees));
+
+	Registry.RegisterAction(TEXT("source"), TEXT("search_source"),
+		TEXT("Full-text search across Unreal Engine source code and shaders"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleSearchSource));
+
+	Registry.RegisterAction(TEXT("source"), TEXT("get_class_hierarchy"),
+		TEXT("Show the inheritance tree for a class"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleGetClassHierarchy));
+
+	Registry.RegisterAction(TEXT("source"), TEXT("get_module_info"),
+		TEXT("Get module statistics: file count, symbol counts by kind, and key classes"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleGetModuleInfo));
+
+	Registry.RegisterAction(TEXT("source"), TEXT("get_symbol_context"),
+		TEXT("Get a symbol definition with surrounding context lines"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleGetSymbolContext));
+
+	Registry.RegisterAction(TEXT("source"), TEXT("read_file"),
+		TEXT("Read source lines from a file by path"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleReadFile));
+
+	Registry.RegisterAction(TEXT("source"), TEXT("trigger_reindex"),
+		TEXT("Trigger Python indexer to rebuild the engine source DB"),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleTriggerReindex));
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+FMonolithSourceDatabase* FMonolithSourceActions::GetDB()
+{
+	if (!GEditor) return nullptr;
+	UMonolithSourceSubsystem* Subsystem = Cast<UMonolithSourceSubsystem>(GEditor->GetEditorSubsystemBase(UMonolithSourceSubsystem::StaticClass()));
+	if (!Subsystem) return nullptr;
+	return Subsystem->GetDatabase();
+}
+
+FString FMonolithSourceActions::ShortPath(const FString& FullPath)
+{
+	// Shorten to Engine/... relative path
+	FString EngineDir = FPaths::EngineDir();
+	FString ParentDir = FPaths::GetPath(EngineDir); // Parent of Engine/
+	if (!ParentDir.IsEmpty() && FullPath.StartsWith(ParentDir))
+	{
+		FString Relative = FullPath.Mid(ParentDir.Len());
+		Relative.ReplaceInline(TEXT("\\"), TEXT("/"));
+		if (Relative.StartsWith(TEXT("/")))
+		{
+			Relative = Relative.Mid(1);
+		}
+		return Relative;
+	}
+	return FullPath;
+}
+
+FString FMonolithSourceActions::ReadFileLines(const FString& FilePath, int32 StartLine, int32 EndLine)
+{
+	TArray<FString> Lines;
+	if (!FFileHelper::LoadFileToStringArray(Lines, *FilePath))
+	{
+		return FString::Printf(TEXT("[File not found: %s]"), *FilePath);
+	}
+
+	StartLine = FMath::Max(1, StartLine);
+	EndLine = FMath::Min(Lines.Num(), EndLine);
+
+	FString Result;
+	for (int32 i = StartLine; i <= EndLine; ++i)
+	{
+		Result += FString::Printf(TEXT("%5d | %s\n"), i, *Lines[i - 1]);
+	}
+	return Result;
+}
+
+bool FMonolithSourceActions::IsForwardDeclaration(const FString& FilePath, int32 LineStart, int32 LineEnd)
+{
+	if (LineEnd - LineStart > 1)
+	{
+		return false;
+	}
+
+	TArray<FString> Lines;
+	if (!FFileHelper::LoadFileToStringArray(Lines, *FilePath))
+	{
+		return false;
+	}
+
+	if (LineStart <= Lines.Num())
+	{
+		const FString& Line = Lines[LineStart - 1];
+		FRegexPattern Pattern(TEXT("^\\s*(class|struct|enum)\\s+\\w[\\w:]*\\s*;"));
+		FRegexMatcher Matcher(Pattern, Line);
+		return Matcher.FindNext();
+	}
+	return false;
+}
+
+FString FMonolithSourceActions::ExtractMembers(const FString& FilePath, int32 StartLine, int32 EndLine)
+{
+	TArray<FString> Lines;
+	if (!FFileHelper::LoadFileToStringArray(Lines, *FilePath))
+	{
+		return FString::Printf(TEXT("[Error reading %s]"), *FilePath);
+	}
+
+	StartLine = FMath::Max(1, StartLine);
+	EndLine = FMath::Min(Lines.Num(), EndLine);
+
+	FString Result;
+	int32 BraceDepth = 0;
+	bool bInBody = false;
+
+	for (int32 i = StartLine - 1; i < EndLine; ++i)
+	{
+		const FString& Line = Lines[i];
+		FString Stripped = Line.TrimStartAndEnd();
+
+		if (bInBody)
+		{
+			for (TCHAR Ch : Stripped)
+			{
+				if (Ch == TEXT('{')) BraceDepth++;
+				else if (Ch == TEXT('}')) BraceDepth--;
+			}
+			if (BraceDepth <= 0)
+			{
+				bInBody = false;
+				BraceDepth = 0;
+			}
+			continue;
+		}
+
+		// Keep access specifiers, UE macros, declarations, comments, braces
+		bool bKeep = Stripped.StartsWith(TEXT("public:")) || Stripped.StartsWith(TEXT("protected:")) || Stripped.StartsWith(TEXT("private:"))
+			|| Stripped.StartsWith(TEXT("GENERATED")) || Stripped.StartsWith(TEXT("UFUNCTION")) || Stripped.StartsWith(TEXT("UPROPERTY"))
+			|| Stripped.StartsWith(TEXT("UENUM")) || Stripped.StartsWith(TEXT("USTRUCT"))
+			|| Stripped.StartsWith(TEXT("//")) || Stripped.StartsWith(TEXT("/**")) || Stripped.StartsWith(TEXT("*")) || Stripped.StartsWith(TEXT("*/"))
+			|| Stripped.IsEmpty() || Stripped == TEXT("{") || Stripped == TEXT("}")
+			|| Stripped.Contains(TEXT(";"));
+
+		if (bKeep)
+		{
+			Result += FString::Printf(TEXT("%5d | %s\n"), i + 1, *Line);
+		}
+		else if (Stripped.Contains(TEXT("{")))
+		{
+			// Function with inline body — show signature, skip body
+			FString SigPart = Stripped;
+			int32 BraceIdx;
+			if (SigPart.FindChar(TEXT('{'), BraceIdx))
+			{
+				SigPart = SigPart.Left(BraceIdx).TrimEnd();
+			}
+			if (!SigPart.IsEmpty())
+			{
+				Result += FString::Printf(TEXT("%5d | %s;  // [inline body omitted]\n"), i + 1, *SigPart);
+			}
+			BraceDepth = 0;
+			for (TCHAR Ch : Stripped)
+			{
+				if (Ch == TEXT('{')) BraceDepth++;
+				else if (Ch == TEXT('}')) BraceDepth--;
+			}
+			if (BraceDepth > 0)
+			{
+				bInBody = true;
+			}
+		}
+	}
+	return Result;
+}
+
+FString FMonolithSourceActions::MakeTextResult(const FString& Text)
+{
+	// Return text as a JSON result with a "text" field
+	// (But the registry expects FMonolithActionResult with a JSON object)
+	// We'll put it in content[0].text per MCP tool result convention
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), Text);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return Text; // Unused, but we return the text
+}
+
+// ============================================================================
+// Tool 1: read_source
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleReadSource(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+	}
+
+	FString Symbol = Params->GetStringField(TEXT("symbol"));
+	bool bIncludeHeader = true;
+	if (Params->HasField(TEXT("include_header")))
+	{
+		bIncludeHeader = Params->GetBoolField(TEXT("include_header"));
+	}
+	int32 MaxLines = 0;
+	if (Params->HasField(TEXT("max_lines")))
+	{
+		MaxLines = static_cast<int32>(Params->GetNumberField(TEXT("max_lines")));
+	}
+	bool bMembersOnly = false;
+	if (Params->HasField(TEXT("members_only")))
+	{
+		bMembersOnly = Params->GetBoolField(TEXT("members_only"));
+	}
+
+	// Look up by exact name first, then FTS fallback
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(Symbol);
+	if (Symbols.Num() == 0)
+	{
+		Symbols = DB->SearchSymbolsFTS(Symbol, 5);
+	}
+	if (Symbols.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No symbol found matching '%s'."), *Symbol));
+	}
+
+	// Filter out forward declarations when a real definition exists
+	bool bHasDefinition = false;
+	for (const auto& Sym : Symbols)
+	{
+		if (Sym.LineEnd - Sym.LineStart > 1) { bHasDefinition = true; break; }
+	}
+
+	if (bHasDefinition)
+	{
+		TArray<FMonolithSourceSymbol> Filtered;
+		for (const auto& Sym : Symbols)
+		{
+			FString FilePath = DB->GetFilePath(Sym.FileId);
+			if (!IsForwardDeclaration(FilePath, Sym.LineStart, Sym.LineEnd))
+			{
+				Filtered.Add(Sym);
+			}
+		}
+		if (Filtered.Num() > 0) Symbols = Filtered;
+	}
+
+	TArray<FString> Parts;
+	TSet<FString> SeenFiles;
+
+	for (const auto& Sym : Symbols)
+	{
+		FString Key = FString::Printf(TEXT("%lld_%d_%d"), Sym.FileId, Sym.LineStart, Sym.LineEnd);
+		if (SeenFiles.Contains(Key)) continue;
+		SeenFiles.Add(Key);
+
+		FString FilePath = DB->GetFilePath(Sym.FileId);
+
+		if (!bIncludeHeader && FilePath.EndsWith(TEXT(".h")))
+		{
+			continue;
+		}
+
+		FString Header = FString::Printf(TEXT("--- %s (lines %d-%d) ---"), *ShortPath(FilePath), Sym.LineStart, Sym.LineEnd);
+		FString Doc;
+		if (!Sym.Docstring.IsEmpty())
+		{
+			Doc = FString::Printf(TEXT("// %s\n"), *Sym.Docstring);
+		}
+
+		FString Source;
+		if (bMembersOnly && (Sym.Kind == TEXT("class") || Sym.Kind == TEXT("struct")))
+		{
+			Source = ExtractMembers(FilePath, Sym.LineStart, Sym.LineEnd);
+		}
+		else
+		{
+			Source = ReadFileLines(FilePath, Sym.LineStart, Sym.LineEnd);
+		}
+		Parts.Add(Header + TEXT("\n") + Doc + Source);
+	}
+
+	FString ResultText = Parts.Num() > 0
+		? FString::Join(Parts, TEXT("\n"))
+		: FString::Printf(TEXT("Found symbol '%s' but could not read source files."), *Symbol);
+
+	if (MaxLines > 0)
+	{
+		TArray<FString> ResultLines;
+		ResultText.ParseIntoArrayLines(ResultLines);
+		if (ResultLines.Num() > MaxLines)
+		{
+			int32 Remaining = ResultLines.Num() - MaxLines;
+			ResultLines.SetNum(MaxLines);
+			ResultText = FString::Join(ResultLines, TEXT("\n"));
+			ResultText += FString::Printf(TEXT("\n[...truncated, %d more lines]"), Remaining);
+		}
+	}
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Tool 2: find_references
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleFindReferences(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+	}
+
+	FString Symbol = Params->GetStringField(TEXT("symbol"));
+	FString RefKind = Params->HasField(TEXT("ref_kind")) ? Params->GetStringField(TEXT("ref_kind")) : TEXT("");
+	int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 50;
+
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(Symbol);
+	if (Symbols.Num() == 0) Symbols = DB->SearchSymbolsFTS(Symbol, 5);
+	if (Symbols.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No symbol found matching '%s'."), *Symbol));
+	}
+
+	TArray<FString> Lines;
+	for (const auto& Sym : Symbols)
+	{
+		TArray<FMonolithSourceReference> Refs = DB->GetReferencesTo(Sym.Id, RefKind, Limit);
+		for (const auto& Ref : Refs)
+		{
+			Lines.Add(FString::Printf(TEXT("[%s] %s:%d (from %s)"),
+				*Ref.RefKind, *ShortPath(Ref.Path), Ref.Line, *Ref.FromName));
+		}
+	}
+
+	FString ResultText = Lines.Num() > 0
+		? FString::Join(Lines, TEXT("\n"))
+		: FString::Printf(TEXT("No references found for '%s'."), *Symbol);
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Tool 3: find_callers
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleFindCallers(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+	}
+
+	FString Function = Params->GetStringField(TEXT("function"));
+	int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 50;
+
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(Function, TEXT("function"));
+	if (Symbols.Num() == 0)
+	{
+		TArray<FMonolithSourceSymbol> AllSyms = DB->SearchSymbolsFTS(Function, 5);
+		for (const auto& S : AllSyms)
+		{
+			if (S.Kind == TEXT("function")) Symbols.Add(S);
+		}
+	}
+	if (Symbols.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No function found matching '%s'."), *Function));
+	}
+
+	TArray<FString> Lines;
+	for (const auto& Sym : Symbols)
+	{
+		TArray<FMonolithSourceReference> Refs = DB->GetReferencesTo(Sym.Id, TEXT("call"), Limit);
+		for (const auto& Ref : Refs)
+		{
+			Lines.Add(FString::Printf(TEXT("%s \u2014 %s:%d"), *Ref.FromName, *ShortPath(Ref.Path), Ref.Line));
+		}
+	}
+
+	FString ResultText;
+	if (Lines.Num() == 0)
+	{
+		ResultText = FString::Printf(
+			TEXT("No direct C++ callers found for '%s'. This function may be called via delegates, Blueprints, input bindings, or reflection."),
+			*Function);
+	}
+	else
+	{
+		ResultText = FString::Join(Lines, TEXT("\n"));
+	}
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Tool 4: find_callees
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleFindCallees(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+	}
+
+	FString Function = Params->GetStringField(TEXT("function"));
+	int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 50;
+
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(Function, TEXT("function"));
+	if (Symbols.Num() == 0)
+	{
+		TArray<FMonolithSourceSymbol> AllSyms = DB->SearchSymbolsFTS(Function, 5);
+		for (const auto& S : AllSyms)
+		{
+			if (S.Kind == TEXT("function")) Symbols.Add(S);
+		}
+	}
+	if (Symbols.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No function found matching '%s'."), *Function));
+	}
+
+	TArray<FString> Lines;
+	for (const auto& Sym : Symbols)
+	{
+		TArray<FMonolithSourceReference> Refs = DB->GetReferencesFrom(Sym.Id, TEXT("call"), Limit);
+		for (const auto& Ref : Refs)
+		{
+			Lines.Add(FString::Printf(TEXT("%s \u2014 %s:%d"), *Ref.ToName, *ShortPath(Ref.Path), Ref.Line));
+		}
+	}
+
+	FString ResultText = Lines.Num() > 0
+		? FString::Join(Lines, TEXT("\n"))
+		: FString::Printf(TEXT("No callees found for '%s'."), *Function);
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Tool 5: search_source
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleSearchSource(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+	}
+
+	FString Query = Params->GetStringField(TEXT("query"));
+	FString Scope = Params->HasField(TEXT("scope")) ? Params->GetStringField(TEXT("scope")) : TEXT("all");
+	int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 20;
+	FString Mode = Params->HasField(TEXT("mode")) ? Params->GetStringField(TEXT("mode")) : TEXT("fts");
+	FString Module = Params->HasField(TEXT("module")) ? Params->GetStringField(TEXT("module")) : TEXT("");
+	FString PathFilter = Params->HasField(TEXT("path_filter")) ? Params->GetStringField(TEXT("path_filter")) : TEXT("");
+	FString SymbolKind = Params->HasField(TEXT("symbol_kind")) ? Params->GetStringField(TEXT("symbol_kind")) : TEXT("");
+
+	TArray<FString> Parts;
+
+	// Symbol FTS search
+	TArray<FMonolithSourceSymbol> SymResults = DB->SearchSymbolsFTSFiltered(Query, SymbolKind, Module, PathFilter, Limit);
+	if (SymResults.Num() > 0)
+	{
+		Parts.Add(TEXT("=== Symbol Matches ==="));
+		for (const auto& Sym : SymResults)
+		{
+			FString FilePath = DB->GetFilePath(Sym.FileId);
+			Parts.Add(FString::Printf(TEXT("  [%s] %s (%s:%d)"), *Sym.Kind, *Sym.QualifiedName, *ShortPath(FilePath), Sym.LineStart));
+			if (!Sym.Signature.IsEmpty())
+			{
+				Parts.Add(FString::Printf(TEXT("         %s"), *Sym.Signature));
+			}
+		}
+	}
+
+	// Source FTS search — expand scope to file_type values
+	TArray<FString> Scopes;
+	if (Scope == TEXT("cpp"))
+	{
+		Scopes = { TEXT("header"), TEXT("source"), TEXT("inline") };
+	}
+	else if (Scope == TEXT("shaders"))
+	{
+		Scopes = { TEXT("shader"), TEXT("shader_header") };
+	}
+	else
+	{
+		Scopes = { TEXT("all") };
+	}
+
+	TArray<FMonolithSourceChunk> SourceResults;
+	for (const FString& S : Scopes)
+	{
+		SourceResults.Append(DB->SearchSourceFTSFiltered(Query, S, Module, PathFilter, Limit));
+	}
+
+	if (SourceResults.Num() > 0)
+	{
+		Parts.Add(TEXT("\n=== Source Line Matches ==="));
+		TSet<FString> Seen;
+		int32 Shown = 0;
+		for (const auto& Match : SourceResults)
+		{
+			if (Shown >= Limit) break;
+			FString Key = FString::Printf(TEXT("%lld_%d"), Match.FileId, Match.LineNumber);
+			if (Seen.Contains(Key)) continue;
+			Seen.Add(Key);
+
+			FString FilePath = DB->GetFilePath(Match.FileId);
+			FString Text = Match.Text.TrimStartAndEnd();
+			if (Text.Len() > 120) Text = Text.Left(120) + TEXT("...");
+			Parts.Add(FString::Printf(TEXT("  %s:%d"), *ShortPath(FilePath), Match.LineNumber));
+			Parts.Add(FString::Printf(TEXT("    %s"), *Text));
+			Shown++;
+		}
+	}
+
+	FString ResultText = Parts.Num() > 0
+		? FString::Join(Parts, TEXT("\n"))
+		: FString::Printf(TEXT("No results found for '%s'."), *Query);
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Tool 6: get_class_hierarchy
+// ============================================================================
+
+void FMonolithSourceActions::WalkAncestors(FMonolithSourceDatabase* DB, int64 SymId, TArray<FString>& Lines, int32 Indent, int32 MaxDepth, FHierarchyCounter& Counter, TSet<int64>& Visited)
+{
+	if (Indent > MaxDepth || Visited.Contains(SymId)) return;
+	Visited.Add(SymId);
+
+	TArray<FMonolithSourceInheritance> Parents = DB->GetParents(SymId);
+	for (const auto& P : Parents)
+	{
+		if (Counter.Shown >= Counter.Limit) { Counter.Truncated++; continue; }
+		FString Prefix;
+		for (int32 i = 0; i < Indent; ++i) Prefix += TEXT("  ");
+		Lines.Add(FString::Printf(TEXT("%s<- %s"), *Prefix, *P.Name));
+		Counter.Shown++;
+		WalkAncestors(DB, P.Id, Lines, Indent + 1, MaxDepth, Counter, Visited);
+	}
+}
+
+void FMonolithSourceActions::WalkDescendants(FMonolithSourceDatabase* DB, int64 SymId, TArray<FString>& Lines, int32 Indent, int32 MaxDepth, FHierarchyCounter& Counter, TSet<int64>& Visited)
+{
+	if (Indent > MaxDepth || Visited.Contains(SymId)) return;
+	Visited.Add(SymId);
+
+	TArray<FMonolithSourceInheritance> Children = DB->GetChildren(SymId);
+	if (Indent >= MaxDepth && Children.Num() > 0) { Counter.Truncated += Children.Num(); return; }
+
+	for (const auto& C : Children)
+	{
+		if (Counter.Shown >= Counter.Limit) { Counter.Truncated++; continue; }
+		FString Prefix;
+		for (int32 i = 0; i < Indent; ++i) Prefix += TEXT("  ");
+		Lines.Add(FString::Printf(TEXT("%s-> %s"), *Prefix, *C.Name));
+		Counter.Shown++;
+		WalkDescendants(DB, C.Id, Lines, Indent + 1, MaxDepth, Counter, Visited);
+	}
+}
+
+FMonolithActionResult FMonolithSourceActions::HandleGetClassHierarchy(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+	}
+
+	FString ClassName = Params->GetStringField(TEXT("class_name"));
+	FString Direction = Params->HasField(TEXT("direction")) ? Params->GetStringField(TEXT("direction")) : TEXT("both");
+	int32 Depth = Params->HasField(TEXT("depth")) ? static_cast<int32>(Params->GetNumberField(TEXT("depth"))) : 1;
+
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(ClassName, TEXT("class"));
+	if (Symbols.Num() == 0) Symbols = DB->GetSymbolsByName(ClassName, TEXT("struct"));
+	if (Symbols.Num() == 0)
+	{
+		TArray<FMonolithSourceSymbol> AllSyms = DB->SearchSymbolsFTS(ClassName, 5);
+		for (const auto& S : AllSyms)
+		{
+			if (S.Kind == TEXT("class") || S.Kind == TEXT("struct")) Symbols.Add(S);
+		}
+	}
+	if (Symbols.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No class or struct found matching '%s'."), *ClassName));
+	}
+
+	const FMonolithSourceSymbol& Sym = Symbols[0];
+	FString FilePath = DB->GetFilePath(Sym.FileId);
+	TArray<FString> Lines;
+	Lines.Add(FString::Printf(TEXT("%s (%s)"), *Sym.Name, *ShortPath(FilePath)));
+
+	FHierarchyCounter Counter;
+
+	if (Direction == TEXT("ancestors") || Direction == TEXT("both"))
+	{
+		Lines.Add(TEXT("\nAncestors:"));
+		TSet<int64> Visited;
+		WalkAncestors(DB, Sym.Id, Lines, 1, Depth, Counter, Visited);
+		bool bHasAncestors = false;
+		for (const FString& L : Lines) { if (L.Contains(TEXT("<-"))) { bHasAncestors = true; break; } }
+		if (!bHasAncestors) Lines.Add(TEXT("  (none)"));
+	}
+
+	if (Direction == TEXT("descendants") || Direction == TEXT("both"))
+	{
+		Lines.Add(TEXT("\nDescendants:"));
+		TSet<int64> Visited;
+		WalkDescendants(DB, Sym.Id, Lines, 1, Depth, Counter, Visited);
+		if (Counter.Truncated > 0)
+		{
+			Lines.Add(FString::Printf(TEXT("\n  ... and %d more (increase depth to see all)"), Counter.Truncated));
+		}
+	}
+
+	FString ResultText = FString::Join(Lines, TEXT("\n"));
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Tool 7: get_module_info
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleGetModuleInfo(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+	}
+
+	FString ModuleName = Params->GetStringField(TEXT("module_name"));
+
+	TOptional<FMonolithSourceModuleStats> Stats = DB->GetModuleStats(ModuleName);
+	if (!Stats.IsSet())
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No module found matching '%s'."), *ModuleName));
+	}
+
+	const FMonolithSourceModuleStats& S = Stats.GetValue();
+	TArray<FString> Lines;
+	Lines.Add(FString::Printf(TEXT("Module: %s"), *S.Name));
+	Lines.Add(FString::Printf(TEXT("Path: %s"), *ShortPath(S.Path)));
+	Lines.Add(FString::Printf(TEXT("Type: %s"), *S.ModuleType));
+	Lines.Add(FString::Printf(TEXT("Files: %d"), S.FileCount));
+	Lines.Add(TEXT(""));
+	Lines.Add(TEXT("Symbol counts by kind:"));
+
+	TArray<FString> SortedKinds;
+	S.SymbolCounts.GetKeys(SortedKinds);
+	SortedKinds.Sort();
+	for (const FString& Kind : SortedKinds)
+	{
+		Lines.Add(FString::Printf(TEXT("  %s: %d"), *Kind, S.SymbolCounts[Kind]));
+	}
+
+	// Show key classes
+	TArray<FMonolithSourceSymbol> KeyClasses = DB->GetSymbolsInModule(ModuleName, TEXT("class"), 20);
+	if (KeyClasses.Num() > 0)
+	{
+		Lines.Add(TEXT(""));
+		Lines.Add(TEXT("Key classes:"));
+		for (const auto& Cls : KeyClasses)
+		{
+			Lines.Add(FString::Printf(TEXT("  %s (line %d)"), *Cls.Name, Cls.LineStart));
+		}
+	}
+
+	FString ResultText = FString::Join(Lines, TEXT("\n"));
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Tool 8: get_symbol_context
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleGetSymbolContext(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+	}
+
+	FString Symbol = Params->GetStringField(TEXT("symbol"));
+	int32 ContextLines = Params->HasField(TEXT("context_lines")) ? static_cast<int32>(Params->GetNumberField(TEXT("context_lines"))) : 20;
+
+	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(Symbol);
+	if (Symbols.Num() == 0) Symbols = DB->SearchSymbolsFTS(Symbol, 5);
+	if (Symbols.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No symbol found matching '%s'."), *Symbol));
+	}
+
+	TArray<FString> Parts;
+	int32 Shown = 0;
+	for (const auto& Sym : Symbols)
+	{
+		if (Shown >= 3) break;
+
+		FString FilePath = DB->GetFilePath(Sym.FileId);
+		int32 CtxStart = FMath::Max(1, Sym.LineStart - ContextLines);
+		int32 CtxEnd = Sym.LineEnd + ContextLines;
+
+		FString Header = FString::Printf(TEXT("--- %s ---"), *Sym.QualifiedName);
+		TArray<FString> InfoParts;
+		if (!Sym.Docstring.IsEmpty())
+		{
+			InfoParts.Add(FString::Printf(TEXT("Docstring: %s"), *Sym.Docstring));
+		}
+		if (!Sym.Signature.IsEmpty())
+		{
+			InfoParts.Add(FString::Printf(TEXT("Signature: %s"), *Sym.Signature));
+		}
+		InfoParts.Add(FString::Printf(TEXT("File: %s (lines %d-%d)"), *ShortPath(FilePath), Sym.LineStart, Sym.LineEnd));
+
+		FString Source = ReadFileLines(FilePath, CtxStart, CtxEnd);
+		Parts.Add(Header + TEXT("\n") + FString::Join(InfoParts, TEXT("\n")) + TEXT("\n\n") + Source);
+		Shown++;
+	}
+
+	FString ResultText = Parts.Num() > 0
+		? FString::Join(Parts, TEXT("\n\n"))
+		: FString::Printf(TEXT("Found symbol '%s' but could not read source."), *Symbol);
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Tool 9: read_file
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleReadFile(const TSharedPtr<FJsonObject>& Params)
+{
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+	}
+
+	FString Path = Params->GetStringField(TEXT("path"));
+	int32 StartLine = Params->HasField(TEXT("start_line")) ? static_cast<int32>(Params->GetNumberField(TEXT("start_line"))) : 1;
+	int32 EndLine = Params->HasField(TEXT("end_line")) ? static_cast<int32>(Params->GetNumberField(TEXT("end_line"))) : 0;
+
+	// Resolve path
+	FString ResolvedPath;
+
+	// Try as absolute first
+	if (FPaths::FileExists(Path))
+	{
+		ResolvedPath = Path;
+	}
+	else
+	{
+		// Try DB lookup by exact path
+		TOptional<FMonolithSourceFile> F = DB->FindFileByPath(Path);
+		if (F.IsSet())
+		{
+			ResolvedPath = F->Path;
+		}
+		else
+		{
+			// Try suffix match
+			F = DB->FindFileBySuffix(Path);
+			if (F.IsSet())
+			{
+				ResolvedPath = F->Path;
+			}
+		}
+	}
+
+	if (ResolvedPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("No file found matching '%s'."), *Path));
+	}
+
+	if (EndLine <= 0)
+	{
+		EndLine = StartLine + 199;
+	}
+
+	FString Header = FString::Printf(TEXT("--- %s (lines %d-%d) ---"), *ShortPath(ResolvedPath), StartLine, EndLine);
+	FString Source = ReadFileLines(ResolvedPath, StartLine, EndLine);
+
+	FString ResultText = Header + TEXT("\n") + Source;
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), ResultText);
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}
+
+// ============================================================================
+// Bonus: trigger_reindex
+// ============================================================================
+
+FMonolithActionResult FMonolithSourceActions::HandleTriggerReindex(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("Editor not available."));
+	}
+
+	UMonolithSourceSubsystem* Subsystem = Cast<UMonolithSourceSubsystem>(GEditor->GetEditorSubsystemBase(UMonolithSourceSubsystem::StaticClass()));
+	if (!Subsystem)
+	{
+		return FMonolithActionResult::Error(TEXT("MonolithSourceSubsystem not available."));
+	}
+
+	if (Subsystem->IsIndexing())
+	{
+		return FMonolithActionResult::Error(TEXT("Indexing already in progress."));
+	}
+
+	Subsystem->TriggerReindex();
+
+	auto ResultObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> ContentArr;
+	auto ContentItem = MakeShared<FJsonObject>();
+	ContentItem->SetStringField(TEXT("type"), TEXT("text"));
+	ContentItem->SetStringField(TEXT("text"), TEXT("Engine source indexing started. This runs in the background — check editor log for progress."));
+	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
+	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	return FMonolithActionResult::Success(ResultObj);
+}

@@ -1,14 +1,22 @@
 #include "MonolithSourceModule.h"
+#include "MonolithSourceActions.h"
+#include "MonolithToolRegistry.h"
+#include "MonolithJsonUtils.h"
+#include "MonolithSettings.h"
 
 #define LOCTEXT_NAMESPACE "FMonolithSourceModule"
 
 void FMonolithSourceModule::StartupModule()
 {
-	UE_LOG(LogTemp, Log, TEXT("Monolith — Source module loaded (14 actions, bundled Python indexer)"));
+	if (!GetDefault<UMonolithSettings>()->bEnableSource) return;
+
+	FMonolithSourceActions::RegisterAll();
+	UE_LOG(LogMonolith, Log, TEXT("Monolith \u2014 Source module loaded (10 actions, bundled Python indexer)"));
 }
 
 void FMonolithSourceModule::ShutdownModule()
 {
+	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("source"));
 }
 
 #undef LOCTEXT_NAMESPACE

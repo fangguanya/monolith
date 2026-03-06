@@ -36,7 +36,7 @@ private:
 	bool HandleOptions(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 
 	// --- JSON-RPC Processing ---
-	TSharedPtr<FJsonObject> ProcessJsonRpcRequest(const TSharedPtr<FJsonObject>& Request, const FString& SessionId);
+	TSharedPtr<FJsonObject> ProcessJsonRpcRequest(const TSharedPtr<FJsonObject>& Request);
 	TSharedPtr<FJsonObject> HandleInitialize(const TSharedPtr<FJsonValue>& Id, const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleToolsList(const TSharedPtr<FJsonValue>& Id, const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleToolsCall(const TSharedPtr<FJsonValue>& Id, const TSharedPtr<FJsonObject>& Params);
@@ -46,16 +46,10 @@ private:
 	TUniquePtr<FHttpServerResponse> MakeJsonResponse(const FString& JsonBody, EHttpServerResponseCodes Code = EHttpServerResponseCodes::Ok);
 	TUniquePtr<FHttpServerResponse> MakeSseResponse(const TArray<TSharedPtr<FJsonObject>>& Messages);
 	void AddCorsHeaders(FHttpServerResponse& Response);
-	FString GenerateSessionId();
-	bool IsValidSession(const FString& SessionId) const;
 
 	// --- State ---
 	TSharedPtr<IHttpRouter> HttpRouter;
 	TArray<FHttpRouteHandle> RouteHandles;
 	int32 BoundPort = 0;
 	bool bIsRunning = false;
-
-	/** Active session IDs */
-	TSet<FString> ActiveSessions;
-	mutable FCriticalSection SessionLock;
 };
