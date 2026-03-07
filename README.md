@@ -10,24 +10,29 @@
 
 ## What is Monolith?
 
-Monolith is a single Unreal Engine editor plugin that lets AI assistants control your UE editor through the **Model Context Protocol (MCP)** — an open standard that lets AI tools talk to external systems. Install one plugin, connect one endpoint, and your AI assistant gains full read/write access to Blueprints, Materials, Animation, Niagara, project configuration, and more.
+Monolith is an Unreal Engine editor plugin that gives AI assistants full read/write access to your project through the [Model Context Protocol (MCP)](https://modelcontextprotocol.io). Install one plugin, point your AI client at one endpoint, and it can work with Blueprints, Materials, Animation, Niagara, project configuration, and more.
 
-Under the hood, Monolith embeds a Streamable HTTP server directly in the editor. It exposes **119 actions across 9 domains** — from inspecting Blueprint graph topology to building entire Niagara particle systems from a declarative spec. A built-in SQLite FTS5 project indexer lets your AI search across every asset in your project, and an optional engine source indexer provides offline C++ API lookups with call graphs and class hierarchies.
+It works with **Claude Code**, **Cursor**, or any MCP-compatible client. If your AI tool speaks MCP, it can drive Monolith.
 
-Monolith is built for UE developers using **Claude Code**, **Cursor**, or any other MCP-compatible client. If your AI tool speaks MCP, it can drive Monolith.
+> **Platform:** Windows only. Mac and Linux support is coming soon.
+
+## Why Monolith?
+
+Most MCP integrations register every action as a separate tool, which floods the AI's context window with tool descriptions. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}.query(action, params)` tool, and a central `monolith.discover()` call lists what's available. This keeps the tool list small (around a dozen entries) while still exposing over a hundred actions across nine domains.
 
 ## Features
 
-- **9 domains** — Blueprints, Materials, Animation, Niagara, Editor, Config, Project Index, Engine Source
-- **~14 namespace tools** — Discovery/dispatch pattern keeps AI context lean (~95% reduction vs individual tools)
-- **119 actions** — Full read/write coverage across all domains
-- **Deep project indexer** — SQLite FTS5 full-text search across all asset types
-- **Engine source intelligence** — Tree-sitter C++ parsing of the entire UE source tree with call graphs and inheritance
+- **Full Blueprint inspection** — Graph topology, variables, execution flow, node search
+- **Material graph editing** — Read, build, and validate material graphs with preview support
+- **Animation coverage** — Montages, blend spaces, ABP state machines, skeletons, bone tracks
+- **Niagara particle systems** — Create and edit systems, emitters, modules, parameters, renderers, and HLSL
+- **Editor integration** — Build triggers, log capture, compile output, crash context, Live Coding support
+- **Config management** — INI resolution, diff, search, and explain
+- **Deep project search** — SQLite FTS5 full-text search across all indexed assets
+- **Engine source intelligence** — Tree-sitter C++ parsing of the UE source tree with call graphs and class hierarchy
 - **Auto-updater** — Checks GitHub Releases on editor startup, one-click update
-- **9 Claude Code skills** — Domain-specific workflow guides bundled with the plugin
-- **Live Coding integration** — Compile output capture with time-windowed error filtering
-- **Pure C++** — Direct UE API access, embedded Streamable HTTP MCP server
-- **Windows-only** — Mac and Linux support coming soon
+- **Claude Code skills** — Domain-specific workflow guides bundled with the plugin
+- **Pure C++** — Direct UE API access, embedded Streamable HTTP server
 
 ---
 
@@ -101,7 +106,7 @@ cp Plugins/Monolith/Templates/.mcp.json.example .mcp.json
 
 Open your `.uproject` file as normal. On first launch:
 
-1. Monolith auto-indexes your entire project (takes 30–60 seconds depending on project size)
+1. Monolith auto-indexes your entire project (takes 30-60 seconds depending on project size)
 2. Open the **Output Log** (Window > Developer Tools > Output Log)
 3. Filter for `LogMonolith` — you should see messages about the server starting and indexing completing
 
@@ -138,7 +143,7 @@ You should get a JSON response listing all available Monolith tools. If you get 
 
 ### (Optional) Install Claude Code Skills
 
-Monolith ships with 9 domain-specific workflow skills for Claude Code:
+Monolith ships with domain-specific workflow skills for Claude Code:
 
 ```bash
 cp -r Plugins/Monolith/Skills/* ~/.claude/skills/
@@ -146,18 +151,10 @@ cp -r Plugins/Monolith/Skills/* ~/.claude/skills/
 
 ---
 
-## How It Works
-
-Monolith uses a **discovery/dispatch pattern**. Instead of registering 119 individual MCP tools (which would flood your AI's context window), each domain exposes a single `{namespace}.query(action, params)` tool. Call `monolith.discover()` to see what actions are available, then call the relevant namespace tool with the action name.
-
-This means your AI only sees ~14 tools instead of 119, reducing token overhead by ~95% while keeping every action accessible. The central `FMonolithToolRegistry` routes each request to the correct handler.
-
----
-
 ## Architecture
 
 ```
-Monolith.uplugin (119 actions total)
+Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, auto-updater (4 actions)
   MonolithBlueprint     — Blueprint graph reading (5 actions)
   MonolithMaterial      — Material inspection + graph editing (14 actions)
@@ -168,6 +165,8 @@ Monolith.uplugin (119 actions total)
   MonolithIndex         — SQLite FTS5 deep project indexer (5 actions)
   MonolithSource        — Engine source + API lookup (10 actions)
 ```
+
+**119 actions total across 9 modules, exposed through ~14 namespace tools.**
 
 ### Tool Reference
 
@@ -248,7 +247,7 @@ Monolith bundles 9 Claude Code skills in `Skills/` for domain-specific workflows
 
 ## Documentation
 
-- [API_REFERENCE.md](Docs/API_REFERENCE.md) — Full reference for all 119 actions with parameters
+- [API_REFERENCE.md](Docs/API_REFERENCE.md) — Full action reference with parameters
 - [SPEC.md](Docs/SPEC.md) — Technical specification and design decisions
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Development setup, coding conventions, PR process
 - [CHANGELOG.md](CHANGELOG.md) — Version history and release notes
