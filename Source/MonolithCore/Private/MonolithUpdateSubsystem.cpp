@@ -38,7 +38,8 @@ FMonolithVersionInfo FMonolithVersionInfo::LoadFromDisk()
 		TSharedPtr<FJsonObject> JsonObj = FMonolithJsonUtils::Parse(JsonString);
 		if (JsonObj.IsValid())
 		{
-			JsonObj->TryGetStringField(TEXT("current"), Info.Current);
+			// Current version always comes from compiled MONOLITH_VERSION — never from disk.
+			// version.json only stores pending update state.
 			JsonObj->TryGetStringField(TEXT("pending"), Info.Pending);
 			JsonObj->TryGetBoolField(TEXT("staging"), Info.bStaging);
 		}
@@ -587,11 +588,7 @@ void UMonolithUpdateSubsystem::OnPreExit()
 		return;
 	}
 
-	// Update version.json: current = pending, clear staging
-	if (!VersionInfo.Pending.IsEmpty())
-	{
-		VersionInfo.Current = VersionInfo.Pending;
-	}
+	// Clear staging state — the new compiled MONOLITH_VERSION will be the current version after swap
 	VersionInfo.Pending.Empty();
 	VersionInfo.bStaging = false;
 	VersionInfo.SaveToDisk();

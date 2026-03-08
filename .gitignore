@@ -1,0 +1,8 @@
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+*.pdb
+*.patch_*
+__pycache__/
+*.pyc
