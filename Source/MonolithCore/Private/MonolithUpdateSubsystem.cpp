@@ -806,25 +806,29 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 		TEXT(")\r\n")
 		TEXT("echo.\r\n")
 		TEXT("echo  Backing up current installation...\r\n")
-		// Remove stale backup first (Bug 4 fix)
+		// Remove stale backup first
 		TEXT("if exist \"%s\" rmdir /s /q \"%s\"\r\n")
-		// Use move instead of ren for robustness with quoted paths (Bug 1 fix)
-		TEXT("move \"%s\" \"%s\"\r\n")
-		// Use || goto pattern instead of broken errorlevel check (Bug 2 fix)
-		TEXT("if errorlevel 1 (\r\n")
-		TEXT("    echo  Rename failed, retrying in 10 seconds...\r\n")
-		TEXT("    timeout /t 10 /nobreak > nul\r\n")
-		TEXT("    move \"%s\" \"%s\"\r\n")
-		TEXT("    if errorlevel 1 goto RENAME_FAILED\r\n")
+		// Retry loop — handles transient locks from Defender, Search Indexer, shell extensions
+		TEXT("set MOVE_OK=0\r\n")
+		TEXT("for /L %%%%a in (1,1,10) do (\r\n")
+		TEXT("    if !MOVE_OK! EQU 0 (\r\n")
+		TEXT("        move \"%s\" \"%s\" >nul 2>&1\r\n")
+		TEXT("        if not errorlevel 1 (\r\n")
+		TEXT("            set MOVE_OK=1\r\n")
+		TEXT("        ) else (\r\n")
+		TEXT("            echo  Access denied, retrying in 3 seconds... attempt %%%%a/10\r\n")
+		TEXT("            timeout /t 3 /nobreak > nul\r\n")
+		TEXT("        )\r\n")
+		TEXT("    )\r\n")
 		TEXT(")\r\n")
-		TEXT("goto RENAME_OK\r\n")
-		TEXT(":RENAME_FAILED\r\n")
-		TEXT("echo.\r\n")
-		TEXT("echo  ERROR: Could not rename plugin folder.\r\n")
-		TEXT("echo  Make sure the Unreal Editor is fully closed.\r\n")
-		TEXT("pause\r\n")
-		TEXT("exit /b 1\r\n")
-		TEXT(":RENAME_OK\r\n")
+		TEXT("if !MOVE_OK! EQU 0 (\r\n")
+		TEXT("    echo.\r\n")
+		TEXT("    echo  ERROR: Could not rename plugin folder after 10 attempts.\r\n")
+		TEXT("    echo  Something is locking files. Check Windows Defender, Search Indexer,\r\n")
+		TEXT("    echo  or any IDE/editor with the plugin folder open.\r\n")
+		TEXT("    pause\r\n")
+		TEXT("    exit /b 1\r\n")
+		TEXT(")\r\n")
 		TEXT("echo  Installing new version...\r\n")
 		// Added /h flag for hidden files (Bug 7 fix)
 		TEXT("xcopy /s /e /i /q /h \"%s\\*\" \"%s\\\"\r\n")
@@ -855,9 +859,7 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 		TEXT("timeout /t 5 > nul\r\n"),
 		// Remove stale backup
 		*WinBackupDir, *WinBackupDir,
-		// First move attempt (full paths — move supports them unlike ren)
-		*WinPluginDir, *WinBackupDir,
-		// Retry move attempt
+		// Move in retry loop
 		*WinPluginDir, *WinBackupDir,
 		// xcopy staging -> plugin
 		*WinStagingDir, *WinPluginDir,
