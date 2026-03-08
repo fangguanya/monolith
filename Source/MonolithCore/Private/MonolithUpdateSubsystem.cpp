@@ -128,6 +128,10 @@ void UMonolithUpdateSubsystem::Deinitialize()
 		UpdateCheckTickerHandle.Reset();
 	}
 
+	// Run the swap logic here — OnPreExit fires too late (after subsystem teardown)
+	// or may not fire at all. Deinitialize is the last reliable hook we have.
+	OnPreExit();
+
 	if (PreExitHandle.IsValid())
 	{
 		FCoreDelegates::OnPreExit.Remove(PreExitHandle);
@@ -694,7 +698,7 @@ void UMonolithUpdateSubsystem::OnPreExit()
 	FProcHandle Proc = FPlatformProcess::CreateProc(
 		TEXT("cmd.exe"), *Args,
 		true,  // bLaunchDetached
-		true,  // bLaunchHidden
+		false, // bLaunchHidden — visible so user can confirm
 		false, // bLaunchReallyHidden
 		&ProcessId,
 		0,     // PriorityModifier
@@ -754,22 +758,76 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 
 	ScriptContent = FString::Printf(
 		TEXT("@echo off\r\n")
-		TEXT("timeout /t 3 /nobreak > nul\r\n")
+		TEXT("title Monolith Updater\r\n")
+		TEXT("echo.\r\n")
+		TEXT("echo  ========================================\r\n")
+		TEXT("echo   Monolith Update Ready\r\n")
+		TEXT("echo  ========================================\r\n")
+		TEXT("echo.\r\n")
+		TEXT("echo  Please close the Unreal Editor completely\r\n")
+		TEXT("echo  before proceeding.\r\n")
+		TEXT("echo.\r\n")
+		TEXT("set /p CONFIRM=\"  Install update? (Y/N): \"\r\n")
+		TEXT("if /i not \"%%CONFIRM%%\"==\"Y\" (\r\n")
+		TEXT("    echo.\r\n")
+		TEXT("    echo  Update cancelled.\r\n")
+		TEXT("    timeout /t 3 > nul\r\n")
+		TEXT("    exit /b 0\r\n")
+		TEXT(")\r\n")
+		TEXT("echo.\r\n")
+		TEXT("echo  Waiting for editor to release file locks...\r\n")
+		TEXT("timeout /t 5 /nobreak > nul\r\n")
+		TEXT("echo  Backing up current installation...\r\n")
 		TEXT("if exist \"%s\" rmdir /s /q \"%s\"\r\n")
 		TEXT("cd /d \"%s\"\r\n")
 		TEXT("ren \"%s\" \"%s\"\r\n")
-		TEXT("if errorlevel 1 (timeout /t 5 /nobreak > nul & ren \"%s\" \"%s\")\r\n")
+		TEXT("if errorlevel 1 (\r\n")
+		TEXT("    echo  Editor still running, waiting longer...\r\n")
+		TEXT("    timeout /t 10 /nobreak > nul\r\n")
+		TEXT("    ren \"%s\" \"%s\"\r\n")
+		TEXT(")\r\n")
+		TEXT("if errorlevel 1 (\r\n")
+		TEXT("    echo.\r\n")
+		TEXT("    echo  ERROR: Could not rename plugin folder.\r\n")
+		TEXT("    echo  Make sure the Unreal Editor is fully closed.\r\n")
+		TEXT("    pause\r\n")
+		TEXT("    exit /b 1\r\n")
+		TEXT(")\r\n")
+		TEXT("echo  Installing new version...\r\n")
 		TEXT("xcopy /s /e /i /q \"%s\\*\" \"%s\\\"\r\n")
-		TEXT("if errorlevel 1 (ren \"%s\" \"%s\" & echo FAILED & pause & exit /b 1)\r\n")
+		TEXT("if errorlevel 1 (\r\n")
+		TEXT("    echo  ERROR: Copy failed, restoring backup...\r\n")
+		TEXT("    ren \"%s\" \"%s\"\r\n")
+		TEXT("    pause\r\n")
+		TEXT("    exit /b 1\r\n")
+		TEXT(")\r\n")
+		TEXT("rem Preserve .git if it exists (developer workflow)\r\n")
+		TEXT("if exist \"%s\\.git\" (\r\n")
+		TEXT("    echo  Preserving git repository...\r\n")
+		TEXT("    xcopy /s /e /i /q /h \"%s\\.git\" \"%s\\.git\\\"\r\n")
+		TEXT(")\r\n")
+		TEXT("if exist \"%s\\.gitignore\" copy /y \"%s\\.gitignore\" \"%s\\.gitignore\" > nul\r\n")
+		TEXT("if exist \"%s\\.github\" xcopy /s /e /i /q /h \"%s\\.github\" \"%s\\.github\\\"\r\n")
+		TEXT("echo  Cleaning up...\r\n")
 		TEXT("rmdir /s /q \"%s\"\r\n")
 		TEXT("rmdir /s /q \"%s\"\r\n")
-		TEXT("echo Monolith updated successfully.\r\n"),
+		TEXT("echo.\r\n")
+		TEXT("echo  ========================================\r\n")
+		TEXT("echo   Monolith updated successfully!\r\n")
+		TEXT("echo   You can now relaunch the editor.\r\n")
+		TEXT("echo  ========================================\r\n")
+		TEXT("echo.\r\n")
+		TEXT("timeout /t 5 > nul\r\n"),
 		*WinBackupDir, *WinBackupDir,
 		*PluginParent,
 		*PluginFolderName, *BackupFolderName,
 		*PluginFolderName, *BackupFolderName,
 		*WinStagingDir, *WinPluginDir,
 		*BackupFolderName, *PluginFolderName,
+		// Preserve .git from backup
+		*WinBackupDir, *WinBackupDir, *WinPluginDir,
+		*WinBackupDir, *WinBackupDir, *WinPluginDir,
+		*WinBackupDir, *WinBackupDir, *WinPluginDir,
 		*WinBackupDir,
 		*WinStagingDir
 	);
@@ -785,12 +843,20 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 		TEXT("mv \"%s\" \"%s\" || { sleep 5; mv \"%s\" \"%s\"; }\n")
 		TEXT("cp -r \"%s/.\" \"%s/\"\n")
 		TEXT("if [ $? -ne 0 ]; then mv \"%s\" \"%s\"; echo 'FAILED'; exit 1; fi\n")
+		TEXT("# Preserve .git if it exists (developer workflow)\n")
+		TEXT("[ -d \"%s/.git\" ] && cp -r \"%s/.git\" \"%s/.git\"\n")
+		TEXT("[ -f \"%s/.gitignore\" ] && cp \"%s/.gitignore\" \"%s/.gitignore\"\n")
+		TEXT("[ -d \"%s/.github\" ] && cp -r \"%s/.github\" \"%s/.github\"\n")
 		TEXT("rm -rf \"%s\" \"%s\"\n")
 		TEXT("echo 'Monolith updated successfully.'\n"),
 		*BackupDir,
 		*PluginDir, *BackupDir, *PluginDir, *BackupDir,
 		*StagingDir, *PluginDir,
 		*BackupDir, *PluginDir,
+		// Preserve .git from backup
+		*BackupDir, *BackupDir, *PluginDir,
+		*BackupDir, *BackupDir, *PluginDir,
+		*BackupDir, *BackupDir, *PluginDir,
 		*BackupDir, *StagingDir
 	);
 
