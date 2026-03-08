@@ -1,6 +1,6 @@
 # Monolith — TODO
 
-Last updated: 2026-03-07
+Last updated: 2026-03-08
 
 ---
 
@@ -122,3 +122,7 @@ None! All minor bugs resolved.
 - [x] Inheritance resolution — 37,010 links across 34,444 classes, full ancestor chains working (2026-03-08)
 - [x] Diagnostic counters — definitions/forward_decls/with_base_classes/inheritance_resolved/failed printed after indexing (2026-03-08)
 - [x] Preprocessor in ReferenceBuilder — consistent AST for cross-reference extraction (2026-03-08)
+- [x] Auto-updater rewrite — tasklist polling, move retry loop 10x3s, errorlevel fix, cmd /c quoting, DelayedExpansion, xcopy /h, rollback rmdir. Windows end-to-end tested v0.4.0→v0.5.0 (2026-03-08)
+- [x] Release script `Scripts/make_release.ps1` — sets `"Installed": true` in zip for BP-only users (2026-03-08)
+- [x] BP-only support — release zips work without rebuild for Blueprint-only projects (2026-03-08)
+- [x] GitHub Wiki — 11 pages: Installation, Tool Reference, Test Status, Auto-Updater, FAQ, Changelog, etc. (2026-03-08)

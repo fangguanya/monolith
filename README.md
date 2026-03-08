@@ -69,7 +69,7 @@ git clone https://github.com/tumourlove/monolith.git Monolith
 
 **Option B: Download ZIP**
 
-Download the latest release from [GitHub Releases](https://github.com/tumourlove/monolith/releases), extract it, and place the folder at `YourProject/Plugins/Monolith/`.
+Download the latest release from [GitHub Releases](https://github.com/tumourlove/monolith/releases), extract it, and place the folder at `YourProject/Plugins/Monolith/`. The release ZIP includes precompiled DLLs — Blueprint-only projects can launch the editor immediately without rebuilding. C++ projects should rebuild first.
 
 ### Step 2: Configure the MCP Connection
 
@@ -251,6 +251,7 @@ Monolith bundles 9 Claude Code skills in `Skills/` for domain-specific workflows
 - [SPEC.md](Docs/SPEC.md) — Technical specification and design decisions
 - [CONTRIBUTING.md](CONTRIBUTING.md) — Development setup, coding conventions, PR process
 - [CHANGELOG.md](CHANGELOG.md) — Version history and release notes
+- [Wiki](https://github.com/tumourlove/monolith/wiki) — Installation guides, test status, FAQ
 
 ---
 

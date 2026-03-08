@@ -1,6 +1,7 @@
 # Monolith — Technical Specification
 
-**Version:** 0.1.0 (Beta)
+**Version:** 0.5.0 (Beta)
+**Wiki:** https://github.com/tumourlove/monolith/wiki
 **Engine:** Unreal Engine 5.7+
 **Platform:** Windows, macOS, Linux
 **License:** MIT
@@ -621,10 +622,10 @@ This folder is both the working copy and the git repo (`git@github.com:tumourlov
 2. Update `CHANGELOG.md`
 3. UBT build (bakes version into DLLs)
 4. `git add -A && git commit && git push origin master`
-5. Create zip: `powershell Compress-Archive -Path './*' -DestinationPath '../Monolith-vX.Y.Z.zip'` (includes Binaries/*.dll — .gitignore is ignored by Compress-Archive)
+5. Create zip: `powershell -ExecutionPolicy Bypass -File Scripts/make_release.ps1 -Version "X.Y.Z"` (excludes Intermediate/Saved/.git, sets `"Installed": true` for BP-only users)
 6. `gh release create vX.Y.Z "../Monolith-vX.Y.Z.zip" --title "..." --notes "..."`
 
-**Important:** Release zips MUST include pre-compiled DLLs (`Binaries/Win64/*.dll`) so users without Visual Studio don't need to rebuild.
+**Important:** Release zips MUST include pre-compiled DLLs (`Binaries/Win64/*.dll`) so Blueprint-only users can use the plugin without rebuilding. The `make_release.ps1` script sets `"Installed": true` in the zip's `.uplugin` to suppress rebuild prompts. The local dev copy keeps `"Installed": false`.
 
 #### Auto-updater flow
 
@@ -632,7 +633,13 @@ This folder is both the working copy and the git repo (`git@github.com:tumourlov
 2. Compares `tag_name` semver against compiled `MONOLITH_VERSION`
 3. If newer: shows a dialog window with full release notes + "Install Update" / "Remind Me Later"
 4. Download stages to `Saved/Monolith/Staging/` (NOT Plugins/ — would cause UBT conflicts)
-5. On editor exit, a swap script replaces the plugin directory and launches detached
+5. On editor exit, a detached swap script runs:
+   - Polls `tasklist` for `UnrealEditor.exe` until it's gone (120s timeout)
+   - Asks for user confirmation (Y/N)
+   - `move` command with retry loop (10 attempts × 3s) to handle Defender/Indexer file locks
+   - `xcopy /h` copies new version, preserves `.git/`, `.gitignore`, `.github/`
+   - Rollback on failure: removes partial copy, restores backup
+   - Shows conditional message: C++ users rebuild, BP-only users launch immediately
 
 ### Installation (for other projects)
 
