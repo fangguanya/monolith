@@ -4,6 +4,33 @@ All notable changes to Monolith will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] - 2026-03-08
+
+Source indexer overhaul and auto-updater improvements.
+
+### Fixed
+
+- **Source Indexer** — UE macros (UCLASS, ENGINE_API, GENERATED_BODY) now stripped before tree-sitter parsing, fixing class hierarchy and inheritance resolution
+- **Source Indexer** — Class definitions increased from ~0 to 62,059; inheritance links from ~0 to 37,010
+- **Source Indexer** — `read_source members_only` now returns class members correctly
+- **Source Indexer** — `get_class_hierarchy` ancestor traversal now works
+- **MonolithSource** — `get_class_hierarchy` accepts both `symbol` and `class_name` params (was inconsistent)
+
+### Added
+
+- **Source Indexer** — UE macro preprocessor (`ue_preprocessor.py`) with balanced-paren stripping for UCLASS/USTRUCT/UENUM/UINTERFACE
+- **Source Indexer** — `--clean` flag for `__main__.py` to delete DB before reindexing
+- **Source Indexer** — Diagnostic output after indexing (definitions, forward decls, inheritance stats)
+- **Auto-Updater** — Release notes now shown in update notification toast and logged to Output Log
+
+### Changed
+
+- **Source Indexer** — `reference_builder.py` now preprocesses source before tree-sitter parsing
+
+### Important
+
+- **You MUST delete your existing source database and reindex** after updating to 0.2.0. The old database has empty class hierarchy data. Delete the `.db` file in your Saved/Monolith/ directory and run the indexer with `--clean`.
+
 ## [0.1.0] - 2026-03-07
 
 Initial beta release. One plugin, 9 domains, 119 actions.
