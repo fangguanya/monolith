@@ -87,8 +87,8 @@ def test_action(namespace, action, params=None):
 | `discover` | PASS | Returned all 9 namespaces, 119 actions |
 | `discover(namespace)` | PASS | Tested all 8 namespaces, correct action counts |
 | `status` | PASS | Returns version 0.1.0, port 9316, 119 actions, engine 5.7, project Leviathan |
-| `update(check)` | UNTESTED | Requires internet connection to GitHub |
-| `update(install)` | UNTESTED | Windows-only, requires internet |
+| `update(check)` | PASS | Detected v0.5.0 from GitHub, showed update dialog with release notes |
+| `update(install)` | PASS | Downloaded zip, staged, swapped on exit. Retry loop handled Defender file locks. Windows tested. |
 | `reindex` | PASS | Triggers successfully |
 
 ### MonolithBlueprint (namespace: "blueprint")
@@ -264,8 +264,8 @@ def test_action(namespace, action, params=None):
 | Unknown method handling | UNTESTED | Should return -32601 Method not found |
 | Undo/redo after write operations | UNTESTED | Test material build, niagara add_emitter, animation add_section |
 | Module enable toggles functional | UNTESTED | Disable a module in settings, verify its actions are not registered on restart |
-| Cross-platform update extraction | UNTESTED | Test update install on Windows (PowerShell), macOS/Linux (unzip) |
-| Hot-swap plugin on editor exit | UNTESTED | Stage an update, exit editor, verify plugin files are replaced |
+| Cross-platform update extraction | PASS | Windows PowerShell Expand-Archive verified. macOS/Linux untested. |
+| Hot-swap plugin on editor exit | PASS | v0.4.0→v0.5.0 swap successful. tasklist polling, move retry loop (10x3s), backup cleanup, .git preservation all verified. |
 | Incremental indexing | UNTESTED | Add/remove/rename an asset, verify index updates via Asset Registry callbacks |
 | Deep asset indexing (game-thread) | UNTESTED | Verify deep indexing batches run on game thread without editor hitches |
 | 10 new indexers register | UNTESTED | Verify Animation, Niagara, DataTable, Level, GameplayTag, Config, Cpp, UserDefinedEnum, UserDefinedStruct, InputAction indexers produce data |
@@ -300,6 +300,7 @@ def test_action(namespace, action, params=None):
 | 2026-03-07 | tumourlove + Claude | Waves 1-4 features | PASS | Module enable toggles enforced, editor.live_compile added, diff_from_default GConfig+5 layers, Niagara reorder_emitters PostEditChange+MarkPackageDirty, cross-platform update extraction, hot-swap plugin on exit, 7 new indexers (Animation/Niagara/DataTable/Level/GameplayTag/Config/Cpp), incremental indexing with Asset Registry callbacks, deep asset indexing with game-thread batching |
 | 2026-03-07 | tumourlove + Claude | Project index actions | PASS | All 5 MCP actions verified: search (FTS5 ranking), find_references (bidirectional), find_by_type (5 types + pagination), get_stats (11 tables, ~211K data points), get_asset_details (deep nodes/vars/refs across BP/Material/AnimBP) |
 | 2026-03-08 | tumourlove + Claude | Source indexer overhaul | PASS | UE macro preprocessor (strips UCLASS/API/GENERATED_BODY), --clean flag, diagnostic counters. Results: 1.1M symbols, 81K files, 62K class definitions, 37K inheritance links, full ancestor chains (AActor→UObject, APawn→AActor, ACharacter→APawn). DB: 1.8GB. |
+| 2026-03-08 | tumourlove + Claude | Auto-updater end-to-end | PASS | Full cycle: v0.4.0→v0.5.0 via GitHub Releases. Fixed 7 bugs in swap script (tasklist polling, errorlevel fix, move retry loop 10x3s, cmd /c quoting, DelayedExpansion, xcopy /h, rollback rmdir). Defender file locks handled by retry loop. Backup + staging cleaned up. .git/.github preserved. |
 | 2026-03-07 | tumourlove + Claude | Wave 1 full test | PASS | Integration (10/10), Core (4/4), Editor (11/11 +2 skip), Config (6/6), Source (9/10 +1 deferred). Bugs found and fixed: find_callers/find_callees param mismatch, read_file param mismatch + path normalization, get_recent_logs max param, search_config category filter, get_section category resolution, get_class_hierarchy forward-decl filtering, ExtractMembers brace depth rewrite, MonolithHttpServer top-level param merge, SQLite WAL→DELETE + ReadWrite, reindex absolute path. members_only deferred pending indexer improvement. |
 
 ---

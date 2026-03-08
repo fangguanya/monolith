@@ -855,9 +855,11 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 		TEXT("echo   Monolith updated successfully!\r\n")
 		TEXT("echo  ========================================\r\n")
 		TEXT("echo.\r\n")
-		TEXT("echo   IMPORTANT: You must rebuild before\r\n")
-		TEXT("echo   launching the editor. Run UBT or\r\n")
-		TEXT("echo   open your IDE and build the project.\r\n")
+		TEXT("echo   C++ projects: Rebuild before launching\r\n")
+		TEXT("echo   (run UBT or build from your IDE).\r\n")
+		TEXT("echo.\r\n")
+		TEXT("echo   Blueprint-only projects: You can\r\n")
+		TEXT("echo   launch the editor immediately.\r\n")
 		TEXT("echo.\r\n")
 		TEXT("timeout /t 5 > nul\r\n"),
 		// Remove stale backup
