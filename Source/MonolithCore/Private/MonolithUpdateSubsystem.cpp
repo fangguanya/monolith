@@ -731,7 +731,7 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 
 FString UMonolithUpdateSubsystem::GetStagingPath()
 {
-	return FPaths::Combine(FPaths::ProjectPluginsDir(), TEXT("Monolith_Staging"));
+	return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Monolith"), TEXT("Staging"));
 }
 
 FString UMonolithUpdateSubsystem::GetPluginPath()
