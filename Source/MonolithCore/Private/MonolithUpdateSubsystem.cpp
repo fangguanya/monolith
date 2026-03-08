@@ -16,6 +16,15 @@
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "Containers/Ticker.h"
+#include "Widgets/SWindow.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/Layout/SScrollBox.h"
+#include "Widgets/Layout/SSpacer.h"
+#include "Widgets/Layout/SBorder.h"
+#include "Widgets/Text/STextBlock.h"
+#include "Widgets/Text/SRichTextBlock.h"
+#include "Widgets/Input/SButton.h"
+#include "Styling/AppStyle.h"
 
 #define MONOLITH_GITHUB_API TEXT("https://api.github.com/repos/tumourlove/monolith/releases/latest")
 
@@ -260,11 +269,10 @@ int32 UMonolithUpdateSubsystem::CompareVersions(const FString& Current, const FS
 
 void UMonolithUpdateSubsystem::ShowUpdateNotification(const FString& NewVersion, const FString& ZipUrl, const FString& ReleaseNotes)
 {
-	// Log release notes so users can see what changed
+	// Log release notes to Output Log
 	UE_LOG(LogMonolith, Log, TEXT("===== Monolith %s Release Notes ====="), *NewVersion);
 	if (!ReleaseNotes.IsEmpty())
 	{
-		// Log each line separately for readability
 		TArray<FString> Lines;
 		ReleaseNotes.ParseIntoArrayLines(Lines);
 		for (const FString& Line : Lines)
@@ -272,69 +280,150 @@ void UMonolithUpdateSubsystem::ShowUpdateNotification(const FString& NewVersion,
 			UE_LOG(LogMonolith, Log, TEXT("  %s"), *Line);
 		}
 	}
-	else
-	{
-		UE_LOG(LogMonolith, Log, TEXT("  No release notes provided."));
-	}
 	UE_LOG(LogMonolith, Log, TEXT("====================================="));
 
-	// Build notification text — include first few lines of release notes
-	FString NotifBody = FString::Printf(TEXT("Monolith %s is available (current: %s)"),
-		*NewVersion, *VersionInfo.Current);
-	if (!ReleaseNotes.IsEmpty())
+	// Show the full dialog window
+	ShowUpdateDialog(NewVersion, ZipUrl, ReleaseNotes);
+}
+
+void UMonolithUpdateSubsystem::ShowUpdateDialog(const FString& NewVersion, const FString& ZipUrl, const FString& ReleaseNotes)
+{
+	// Don't open duplicate windows
+	if (UpdateDialogWindow.IsValid())
 	{
-		// Extract first 3 non-empty lines for the notification toast
-		TArray<FString> Lines;
-		ReleaseNotes.ParseIntoArrayLines(Lines);
-		FString Preview;
-		int32 Count = 0;
-		for (const FString& Line : Lines)
-		{
-			FString Trimmed = Line.TrimStartAndEnd();
-			if (Trimmed.IsEmpty() || Trimmed.StartsWith(TEXT("#")))
-			{
-				continue;
-			}
-			if (Count > 0)
-			{
-				Preview += TEXT("\n");
-			}
-			Preview += Trimmed;
-			if (++Count >= 3)
-			{
-				break;
-			}
-		}
-		if (!Preview.IsEmpty())
-		{
-			NotifBody += TEXT("\n") + Preview;
-		}
+		UpdateDialogWindow.Pin()->BringToFront();
+		return;
 	}
 
-	FNotificationInfo Info(FText::FromString(NotifBody));
-	Info.bFireAndForget = false;
-	Info.ExpireDuration = 30.0f;
-	Info.bUseThrobber = false;
-	Info.bUseLargeFont = false;
+	// --- Convert markdown-ish release notes to cleaner display text ---
+	FString DisplayNotes = ReleaseNotes;
+	if (DisplayNotes.IsEmpty())
+	{
+		DisplayNotes = TEXT("No release notes provided.");
+	}
 
-	// "Update" hyperlink
+	// Captures for lambdas
 	FString CapturedUrl = ZipUrl;
 	FString CapturedVersion = NewVersion;
 	TWeakObjectPtr<UMonolithUpdateSubsystem> WeakSelf(this);
-	Info.HyperlinkText = NSLOCTEXT("Monolith", "UpdateHyperlink", "Install Update");
-	Info.Hyperlink = FSimpleDelegate::CreateLambda(
-		[WeakSelf, CapturedUrl, CapturedVersion]()
-		{
-			if (UMonolithUpdateSubsystem* Self = WeakSelf.Get())
-			{
-				Self->DownloadUpdate(CapturedUrl, CapturedVersion);
-			}
-		}
+
+	TSharedRef<SWindow> Window = SNew(SWindow)
+		.Title(FText::Format(NSLOCTEXT("Monolith", "UpdateDialogTitle", "Monolith {0} Available"), FText::FromString(NewVersion)))
+		.SizingRule(ESizingRule::UserSized)
+		.ClientSize(FVector2D(600, 500))
+		.SupportsMinimize(false)
+		.SupportsMaximize(false);
+
+	TWeakPtr<SWindow> WeakWindow = Window;
+
+	Window->SetContent(
+		SNew(SBorder)
+		.BorderImage(FAppStyle::GetBrush("ToolPanel.GroupBorder"))
+		.Padding(16.0f)
+		[
+			SNew(SVerticalBox)
+
+			// --- Header ---
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(0, 0, 0, 8)
+			[
+				SNew(STextBlock)
+				.Text(FText::Format(
+					NSLOCTEXT("Monolith", "UpdateHeader", "Monolith {0} is available (you have {1})"),
+					FText::FromString(NewVersion),
+					FText::FromString(VersionInfo.Current)))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 14))
+			]
+
+			// --- Separator ---
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(0, 0, 0, 8)
+			[
+				SNew(SSeparator)
+			]
+
+			// --- Release Notes Label ---
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.Padding(0, 0, 0, 4)
+			[
+				SNew(STextBlock)
+				.Text(NSLOCTEXT("Monolith", "ReleaseNotesLabel", "Release Notes:"))
+				.Font(FCoreStyle::GetDefaultFontStyle("Bold", 10))
+			]
+
+			// --- Scrollable Release Notes ---
+			+ SVerticalBox::Slot()
+			.FillHeight(1.0f)
+			.Padding(0, 0, 0, 12)
+			[
+				SNew(SBorder)
+				.BorderImage(FAppStyle::GetBrush("ToolPanel.DarkGroupBorder"))
+				.Padding(8.0f)
+				[
+					SNew(SScrollBox)
+					+ SScrollBox::Slot()
+					[
+						SNew(STextBlock)
+						.Text(FText::FromString(DisplayNotes))
+						.AutoWrapText(true)
+						.Font(FCoreStyle::GetDefaultFontStyle("Regular", 10))
+					]
+				]
+			]
+
+			// --- Buttons ---
+			+ SVerticalBox::Slot()
+			.AutoHeight()
+			.HAlign(HAlign_Right)
+			[
+				SNew(SHorizontalBox)
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				.Padding(0, 0, 8, 0)
+				[
+					SNew(SButton)
+					.Text(NSLOCTEXT("Monolith", "RemindLater", "Remind Me Later"))
+					.OnClicked_Lambda([WeakWindow]() -> FReply
+					{
+						if (TSharedPtr<SWindow> Win = WeakWindow.Pin())
+						{
+							Win->RequestDestroyWindow();
+						}
+						return FReply::Handled();
+					})
+				]
+
+				+ SHorizontalBox::Slot()
+				.AutoWidth()
+				[
+					SNew(SButton)
+					.Text(NSLOCTEXT("Monolith", "InstallUpdate", "Install Update"))
+					.ButtonStyle(&FAppStyle::Get().GetWidgetStyle<FButtonStyle>("PrimaryButton"))
+					.OnClicked_Lambda([WeakSelf, CapturedUrl, CapturedVersion, WeakWindow]() -> FReply
+					{
+						if (UMonolithUpdateSubsystem* Self = WeakSelf.Get())
+						{
+							Self->DownloadUpdate(CapturedUrl, CapturedVersion);
+						}
+						if (TSharedPtr<SWindow> Win = WeakWindow.Pin())
+						{
+							Win->RequestDestroyWindow();
+						}
+						return FReply::Handled();
+					})
+				]
+			]
+		]
 	);
 
-	FSlateNotificationManager::Get().AddNotification(Info);
+	UpdateDialogWindow = Window;
+	FSlateApplication::Get().AddWindow(Window);
 
-	UE_LOG(LogMonolith, Log, TEXT("Update notification shown for version %s"), *NewVersion);
+	UE_LOG(LogMonolith, Log, TEXT("Update dialog shown for version %s"), *NewVersion);
 }
 
 void UMonolithUpdateSubsystem::DownloadUpdate(const FString& ZipUrl, const FString& Version)

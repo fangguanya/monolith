@@ -61,8 +61,13 @@ private:
 	FDelegateHandle PreExitHandle;
 	FString PendingStagingDir;
 
-	/** Show an editor notification with an Update button and release notes. */
+	/** Show a small toast notification. */
 	void ShowUpdateNotification(const FString& NewVersion, const FString& ZipUrl, const FString& ReleaseNotes);
+
+	/** Show a full dialog window with scrollable release notes. */
+	void ShowUpdateDialog(const FString& NewVersion, const FString& ZipUrl, const FString& ReleaseNotes);
+
+	TWeakPtr<SWindow> UpdateDialogWindow;
 
 	/** Called when the update zip download completes. */
 	void OnDownloadComplete(const FString& Version, bool bSuccess, const TArray<uint8>& Data);
