@@ -2,7 +2,7 @@
 
 #include "Modules/ModuleManager.h"
 
-#define MONOLITH_VERSION TEXT("0.4.0")
+#define MONOLITH_VERSION TEXT("0.5.0")
 
 class FMonolithHttpServer;
 
