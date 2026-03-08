@@ -88,7 +88,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | `FMonolithJsonUtils` | Static JSON-RPC 2.0 helpers. Standard error codes (-32700 through -32603). Declares `LogMonolith` category |
 | `FMonolithAssetUtils` | Asset loading with 4-tier fallback: StaticLoadObject(resolved) -> PackageName.ObjectName -> FindObject+_C suffix -> ForEachObjectWithPackage |
 | `UMonolithSettings` | UDeveloperSettings (config=Monolith). ServerPort, bAutoUpdateEnabled, DatabasePathOverride, EngineSourceDBPathOverride, EngineSourcePath, 8 module enable toggles (functional — checked at registration time), LogVerbosity. Settings UI customized via `FMonolithSettingsCustomization` (IDetailCustomization) with re-index buttons for project and source databases |
-| `UMonolithUpdateSubsystem` | UEditorSubsystem. GitHub Releases auto-updater. Downloads zip, cross-platform extraction (PowerShell on Windows, unzip on Mac/Linux). Hot-swap: stages update and applies on editor exit via FCoreDelegates::OnPreExit. version.json in Saved/Monolith/ |
+| `UMonolithUpdateSubsystem` | UEditorSubsystem. GitHub Releases auto-updater. Shows dialog window with full release notes on update detection. Downloads zip, cross-platform extraction (PowerShell on Windows, unzip on Mac/Linux). Stages to Saved/Monolith/Staging/, hot-swaps on editor exit via FCoreDelegates::OnPreExit. Current version always from compiled MONOLITH_VERSION (version.json only stores pending/staging state). Release zips include pre-compiled DLLs. |
 | `FMonolithCoreTools` | Registers 4 core actions |
 
 #### Actions (4 — namespace: "monolith")
@@ -609,14 +609,30 @@ C:\Projects\Monolith\
 
 ## 9. Deployment
 
-### Dual-Location Workflow
+### Development & Release Workflow
 
-Monolith exists in two locations that must be kept in sync:
+Everything lives in one place: `D:\Unreal Projects\Leviathan\Plugins\Monolith\`
 
-1. **Source of truth:** `C:\Projects\Monolith\` — standalone repo for development
-2. **Build-testable copy:** `D:\Unreal Projects\Leviathan\Plugins\Monolith\` — where the editor loads it
+This folder is both the working copy and the git repo (`git@github.com:tumourlove/monolith.git`). Edit, build, commit, push, and release all happen here — no file copying.
 
-After making changes at the source of truth, sync to the Leviathan copy for testing.
+#### Publishing a release
+
+1. Bump version in `Source/MonolithCore/Public/MonolithCoreModule.h` (`MONOLITH_VERSION`) and `Monolith.uplugin` (`VersionName`)
+2. Update `CHANGELOG.md`
+3. UBT build (bakes version into DLLs)
+4. `git add -A && git commit && git push origin master`
+5. Create zip: `powershell Compress-Archive -Path './*' -DestinationPath '../Monolith-vX.Y.Z.zip'` (includes Binaries/*.dll — .gitignore is ignored by Compress-Archive)
+6. `gh release create vX.Y.Z "../Monolith-vX.Y.Z.zip" --title "..." --notes "..."`
+
+**Important:** Release zips MUST include pre-compiled DLLs (`Binaries/Win64/*.dll`) so users without Visual Studio don't need to rebuild.
+
+#### Auto-updater flow
+
+1. On editor startup (5s delay), checks `api.github.com/repos/tumourlove/monolith/releases/latest`
+2. Compares `tag_name` semver against compiled `MONOLITH_VERSION`
+3. If newer: shows a dialog window with full release notes + "Install Update" / "Remind Me Later"
+4. Download stages to `Saved/Monolith/Staging/` (NOT Plugins/ — would cause UBT conflicts)
+5. On editor exit, a swap script replaces the plugin directory and launches detached
 
 ### Installation (for other projects)
 

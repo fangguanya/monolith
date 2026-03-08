@@ -4,6 +4,21 @@ All notable changes to Monolith will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-03-08
+
+Auto-updater rewrite — fixes all swap script failures on Windows.
+
+### Fixed
+
+- **Auto-Updater** — Swap script now polls `tasklist` for `UnrealEditor.exe` instead of a cosmetic 10-second countdown (was launching before editor fully exited)
+- **Auto-Updater** — `errorlevel` check after retry rename was unreachable due to cmd.exe resetting `%ERRORLEVEL%` on closing `)` — replaced with `goto` pattern
+- **Auto-Updater** — Launcher script now uses outer-double-quote trick for `cmd /c` paths with spaces (`D:\Unreal Projects\...`)
+- **Auto-Updater** — Switched from `ren` (bare filename only) to `move` (full path support) for plugin folder rename
+- **Auto-Updater** — Retry now cleans stale backup before re-attempting rename
+- **Auto-Updater** — Rollback on failed xcopy now removes partial destination before restoring backup
+- **Auto-Updater** — Added `/h` flag to primary xcopy to include hidden-attribute files
+- **Auto-Updater** — Enabled `DelayedExpansion` for correct variable expansion inside `if` blocks
+
 ## [0.2.0] - 2026-03-08
 
 Source indexer overhaul and auto-updater improvements.

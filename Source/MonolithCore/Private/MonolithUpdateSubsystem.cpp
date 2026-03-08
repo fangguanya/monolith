@@ -698,7 +698,7 @@ void UMonolithUpdateSubsystem::OnPreExit()
 	FString LauncherPath = FPaths::ConvertRelativePathToFull(FPaths::Combine(ScriptDir, TEXT("monolith_launch.bat")));
 	LauncherPath.ReplaceInline(TEXT("/"), TEXT("\\"));
 	FString LauncherContent = FString::Printf(
-		TEXT("@echo off\r\nstart \"Monolith Updater\" cmd /c \"%s\"\r\n"),
+		TEXT("@echo off\r\nstart \"Monolith Updater\" cmd /c \"\"%s\"\"\r\n"),
 		*ScriptPath
 	);
 	FFileHelper::SaveStringToFile(LauncherContent, *LauncherPath);
@@ -768,6 +768,7 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 
 	ScriptContent = FString::Printf(
 		TEXT("@echo off\r\n")
+		TEXT("setlocal EnableDelayedExpansion\r\n")
 		TEXT("title Monolith Updater\r\n")
 		TEXT("echo.\r\n")
 		TEXT("echo  ========================================\r\n")
@@ -776,10 +777,25 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 		TEXT("echo.\r\n")
 		TEXT("echo  Waiting for Unreal Editor to close...\r\n")
 		TEXT("echo.\r\n")
-		TEXT("for /L %%%%i in (10,-1,1) do (\r\n")
-		TEXT("    echo  %%%%i seconds remaining...\r\n")
-		TEXT("    timeout /t 1 /nobreak > nul\r\n")
+		// Real process polling loop — wait until UnrealEditor.exe is gone (Bug 3 fix)
+		TEXT("set WAIT_COUNT=0\r\n")
+		TEXT(":WAIT_LOOP\r\n")
+		TEXT("tasklist /FI \"IMAGENAME eq UnrealEditor.exe\" 2>nul | find /I \"UnrealEditor.exe\" >nul\r\n")
+		TEXT("if not errorlevel 1 (\r\n")
+		TEXT("    set /a WAIT_COUNT+=2\r\n")
+		TEXT("    if !WAIT_COUNT! GEQ 120 (\r\n")
+		TEXT("        echo.\r\n")
+		TEXT("        echo  ERROR: Editor did not close within 120 seconds.\r\n")
+		TEXT("        pause\r\n")
+		TEXT("        exit /b 1\r\n")
+		TEXT("    )\r\n")
+		TEXT("    echo  Editor still running... !WAIT_COUNT!s elapsed\r\n")
+		TEXT("    timeout /t 2 /nobreak > nul\r\n")
+		TEXT("    goto WAIT_LOOP\r\n")
 		TEXT(")\r\n")
+		TEXT("echo  Editor closed.\r\n")
+		// Small grace period for any lingering file handles
+		TEXT("timeout /t 2 /nobreak > nul\r\n")
 		TEXT("echo.\r\n")
 		TEXT("set /p CONFIRM=\"  Install update? (Y/N): \"\r\n")
 		TEXT("if /i not \"%%CONFIRM%%\"==\"Y\" (\r\n")
@@ -790,26 +806,33 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 		TEXT(")\r\n")
 		TEXT("echo.\r\n")
 		TEXT("echo  Backing up current installation...\r\n")
+		// Remove stale backup first (Bug 4 fix)
 		TEXT("if exist \"%s\" rmdir /s /q \"%s\"\r\n")
-		TEXT("cd /d \"%s\"\r\n")
-		TEXT("ren \"%s\" \"%s\"\r\n")
+		// Use move instead of ren for robustness with quoted paths (Bug 1 fix)
+		TEXT("move \"%s\" \"%s\"\r\n")
+		// Use || goto pattern instead of broken errorlevel check (Bug 2 fix)
 		TEXT("if errorlevel 1 (\r\n")
-		TEXT("    echo  Editor still running, waiting longer...\r\n")
+		TEXT("    echo  Rename failed, retrying in 10 seconds...\r\n")
 		TEXT("    timeout /t 10 /nobreak > nul\r\n")
-		TEXT("    ren \"%s\" \"%s\"\r\n")
+		TEXT("    move \"%s\" \"%s\"\r\n")
+		TEXT("    if errorlevel 1 goto RENAME_FAILED\r\n")
 		TEXT(")\r\n")
-		TEXT("if errorlevel 1 (\r\n")
-		TEXT("    echo.\r\n")
-		TEXT("    echo  ERROR: Could not rename plugin folder.\r\n")
-		TEXT("    echo  Make sure the Unreal Editor is fully closed.\r\n")
-		TEXT("    pause\r\n")
-		TEXT("    exit /b 1\r\n")
-		TEXT(")\r\n")
+		TEXT("goto RENAME_OK\r\n")
+		TEXT(":RENAME_FAILED\r\n")
+		TEXT("echo.\r\n")
+		TEXT("echo  ERROR: Could not rename plugin folder.\r\n")
+		TEXT("echo  Make sure the Unreal Editor is fully closed.\r\n")
+		TEXT("pause\r\n")
+		TEXT("exit /b 1\r\n")
+		TEXT(":RENAME_OK\r\n")
 		TEXT("echo  Installing new version...\r\n")
-		TEXT("xcopy /s /e /i /q \"%s\\*\" \"%s\\\"\r\n")
+		// Added /h flag for hidden files (Bug 7 fix)
+		TEXT("xcopy /s /e /i /q /h \"%s\\*\" \"%s\\\"\r\n")
 		TEXT("if errorlevel 1 (\r\n")
 		TEXT("    echo  ERROR: Copy failed, restoring backup...\r\n")
-		TEXT("    ren \"%s\" \"%s\"\r\n")
+		// Remove partial copy before restoring backup (Bug 6 fix)
+		TEXT("    if exist \"%s\" rmdir /s /q \"%s\"\r\n")
+		TEXT("    move \"%s\" \"%s\"\r\n")
 		TEXT("    pause\r\n")
 		TEXT("    exit /b 1\r\n")
 		TEXT(")\r\n")
@@ -830,16 +853,22 @@ bool UMonolithUpdateSubsystem::WriteSwapScript(const FString& StagingDir, const 
 		TEXT("echo  ========================================\r\n")
 		TEXT("echo.\r\n")
 		TEXT("timeout /t 5 > nul\r\n"),
+		// Remove stale backup
 		*WinBackupDir, *WinBackupDir,
-		*PluginParent,
-		*PluginFolderName, *BackupFolderName,
-		*PluginFolderName, *BackupFolderName,
+		// First move attempt (full paths — move supports them unlike ren)
+		*WinPluginDir, *WinBackupDir,
+		// Retry move attempt
+		*WinPluginDir, *WinBackupDir,
+		// xcopy staging -> plugin
 		*WinStagingDir, *WinPluginDir,
-		*BackupFolderName, *PluginFolderName,
+		// Rollback: rmdir partial copy + move backup back
+		*WinPluginDir, *WinPluginDir,
+		*WinBackupDir, *WinPluginDir,
 		// Preserve .git from backup
 		*WinBackupDir, *WinBackupDir, *WinPluginDir,
 		*WinBackupDir, *WinBackupDir, *WinPluginDir,
 		*WinBackupDir, *WinBackupDir, *WinPluginDir,
+		// Cleanup
 		*WinBackupDir,
 		*WinStagingDir
 	);
