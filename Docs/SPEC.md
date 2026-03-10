@@ -1,6 +1,6 @@
 # Monolith — Technical Specification
 
-**Version:** 0.6.0 (Beta)
+**Version:** 0.7.0 (Beta)
 **Wiki:** https://github.com/tumourlove/monolith/wiki
 **Engine:** Unreal Engine 5.7+
 **Platform:** Windows, macOS, Linux
@@ -178,7 +178,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 ### 3.4 MonolithAnimation
 
-**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, AnimGraph, AnimGraphRuntime, BlueprintGraph, AnimationBlueprintLibrary, Json, JsonUtilities
+**Dependencies:** Core, CoreUObject, Engine, MonolithCore, UnrealEd, AnimGraph, AnimGraphRuntime, BlueprintGraph, AnimationBlueprintLibrary, PoseSearch, AnimationModifiers, EditorScriptingUtilities, Json, JsonUtilities
 
 #### Classes
 
@@ -687,7 +687,7 @@ D:\Unreal Projects\Leviathan\Plugins\Monolith\
     MonolithCore/                  (8 source files)
     MonolithBlueprint/             (4 source files)
     MonolithMaterial/              (4 source files)
-    MonolithAnimation/             (4 source files)
+    MonolithAnimation/             (6 source files — includes PoseSearch)
     MonolithNiagara/               (4 source files)
     MonolithEditor/                (4 source files)
     MonolithConfig/                (4 source files)
