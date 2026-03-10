@@ -4,7 +4,7 @@ This project uses the **Monolith** plugin for Unreal Engine MCP integration.
 
 ## Available MCP Tools
 
-Monolith exposes ~14 namespace tools with 177 total actions:
+Monolith exposes 12 MCP tools with 177 total actions:
 
 - `monolith_discover(namespace?)` — List available actions (call this first)
 - `monolith_status()` — Health check, index status, version

@@ -294,7 +294,7 @@ Then use Claude Code or any MCP-compatible client to interact with the tools.
 
 ## Architecture Notes
 
-- **Discovery/dispatch pattern** — Each domain exposes one `{namespace}_query(action, params)` MCP tool. The registry dispatches to the correct handler. This keeps AI context lean (~14 tools instead of ~177).
+- **Discovery/dispatch pattern** — Each domain exposes one `{namespace}_query(action, params)` MCP tool. The registry dispatches to the correct handler. This keeps AI context lean (12 tools instead of 177).
 - **Thread safety** — `FMonolithToolRegistry` releases its lock before executing handlers. DB access uses `FCriticalSection`.
 - **Stateless server** — No session tracking. Every request is independent.
 - **MCP protocol version** — 2025-03-26, Streamable HTTP transport.

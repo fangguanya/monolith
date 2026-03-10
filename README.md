@@ -18,7 +18,7 @@ It works with **Claude Code**, **Cursor**, or any MCP-compatible client. If your
 
 ## Why Monolith?
 
-Most MCP integrations register every action as a separate tool, which floods the AI's context window with tool descriptions. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists what's available. This keeps the tool list small (around a dozen entries) while still exposing over a hundred actions across nine domains.
+Most MCP integrations register every action as a separate tool, which floods the AI's context window with tool descriptions. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists what's available. This keeps the tool list small (12 tools) while still exposing 177 actions across nine domains.
 
 ## Features
 
@@ -191,7 +191,7 @@ Monolith.uplugin
   MonolithSource        — Engine source + API lookup (10 actions)
 ```
 
-**177 actions total across 9 modules, exposed through ~14 namespace tools.**
+**177 actions total across 9 modules, exposed through 12 MCP tools.**
 
 ### Tool Reference
 

@@ -31,4 +31,4 @@ tumourlove and now unified into this single package:
 - `AnimationMCPReader` — 23 UFUNCTIONs for animation asset introspection
 - `NiagaraMCPBridge` — 39 UFUNCTIONs across 7 classes for Niagara system access
 
-**Total: 231 tools consolidated into ~14 namespace endpoints.**
+**Total: 231 tools consolidated into 12 MCP tools.**
