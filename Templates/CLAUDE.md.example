@@ -4,15 +4,16 @@ This project uses the **Monolith** plugin for Unreal Engine MCP integration.
 
 ## Available MCP Tools
 
-Monolith exposes ~14 namespace tools instead of 119 individual tools:
+Monolith exposes ~14 namespace tools with 177 total actions:
 
 - `monolith_discover(namespace?)` — List available actions (call this first)
 - `monolith_status()` — Health check, index status, version
 - `monolith_reindex()` — Trigger full project re-index
-- `blueprint_query(action, params)` — Blueprint graph inspection (5 actions)
-- `material_query(action, params)` — Material editing and creation (14 actions)
-- `animation_query(action, params)` — Animation asset workflows (23 actions)
-- `niagara_query(action, params)` — Niagara particle systems (39 actions)
+- `monolith_update(action)` — Check for / install plugin updates
+- `blueprint_query(action, params)` — Blueprint graph inspection (6 actions)
+- `material_query(action, params)` — Material editing, creation, instances, parameters (25 actions)
+- `animation_query(action, params)` — Animation asset workflows, PoseSearch (67 actions)
+- `niagara_query(action, params)` — Niagara particle systems (41 actions)
 - `editor_query(action, params)` — Build, logs, compile output, crash context (13 actions)
 - `config_query(action, params)` — Config/INI resolution (6 actions)
 - `source_query(action, params)` — Engine source lookup (10 actions)
