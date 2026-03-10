@@ -42,11 +42,11 @@ Monolith has 9 modules, each owning a specific domain:
 | Module | Namespace | Actions | What It Does |
 |--------|-----------|---------|--------------|
 | **MonolithCore** | `monolith` | 4 | HTTP server, tool registry, discovery, settings, auto-updater |
-| **MonolithBlueprint** | `blueprint` | 5 | Blueprint graph reading — topology, variables, execution flow |
-| **MonolithMaterial** | `material` | 14 | Material inspection, graph editing, import/export, validation |
-| **MonolithAnimation** | `animation` | 67 | Montages, blend spaces, ABP state machines, bone tracks, PoseSearch |
-| **MonolithNiagara** | `niagara` | 39 | Particle systems, modules, parameters, renderers, HLSL |
-| **MonolithEditor** | `editor` | 11 | Build triggers, log capture, crash context |
+| **MonolithBlueprint** | `blueprint` | 6 | Blueprint graph reading — topology, variables, execution flow, graph summary |
+| **MonolithMaterial** | `material` | 25 | Material inspection, graph editing, CRUD, instances, parameters, validation |
+| **MonolithAnimation** | `animation` | 67 | Montages, blend spaces, ABP state machines, bone tracks, curves, PoseSearch |
+| **MonolithNiagara** | `niagara` | 41 | Particle systems, modules, parameters, renderers, HLSL |
+| **MonolithEditor** | `editor` | 13 | Build triggers, live compile, log capture, crash context |
 | **MonolithConfig** | `config` | 6 | INI resolution, explain, diff, search |
 | **MonolithIndex** | `project` | 5 | SQLite FTS5 deep project indexer |
 | **MonolithSource** | `source` | 10 | Engine source lookup, call graphs, class hierarchy |
