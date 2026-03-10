@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~219 individual tools down to 12 MCP tools (177 total actions), cutting AI assistant context consumption by ~95%.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~219 individual tools down to 12 MCP tools (172 total actions), cutting AI assistant context consumption by ~95%.
 
 ### What It Replaces
 
@@ -20,7 +20,7 @@ Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate M
 |------------------------|---------|-------------|
 | unreal-blueprint-mcp + BlueprintReader | 6 | MonolithBlueprint |
 | unreal-material-mcp + MaterialMCPReader | 46 | MonolithMaterial |
-| unreal-animation-mcp + AnimationMCPReader | 62 | MonolithAnimation (67 actions) |
+| unreal-animation-mcp + AnimationMCPReader | 62 | MonolithAnimation (62 actions) |
 | unreal-niagara-mcp + NiagaraMCPBridge | 70 | MonolithNiagara |
 | unreal-editor-mcp | 11 | MonolithEditor |
 | unreal-config-mcp | 6 | MonolithConfig |
@@ -37,7 +37,7 @@ Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, settings, auto-updater
   MonolithBlueprint     — Blueprint graph reading (6 actions)
   MonolithMaterial      — Material inspection + graph editing + CRUD (25 actions)
-  MonolithAnimation     — Animation sequences, montages, ABPs, curves, compression, PoseSearch (67 actions)
+  MonolithAnimation     — Animation sequences, montages, ABPs, curves, notifies, skeletons, PoseSearch (62 actions)
   MonolithNiagara       — Niagara particle systems (41 actions)
   MonolithEditor        — Build triggers, live compile, log capture, compile output, crash context (13 actions)
   MonolithConfig        — Config/INI resolution and search (6 actions)
@@ -51,8 +51,8 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 ### MCP Protocol
 
-- **Protocol version:** 2025-03-26
-- **Transport:** Streamable HTTP (POST for JSON-RPC, GET for SSE stub, DELETE for session termination, OPTIONS for CORS)
+- **Protocol version:** Echoes client's requested version; supports both `2024-11-05` and `2025-03-26` (defaults to `2025-03-26`)
+- **Transport:** HTTP with JSON-RPC 2.0 (POST for requests, GET for SSE stub, OPTIONS for CORS). Transport type in `.mcp.json` varies by client: `"http"` for Claude Code, `"streamableHttp"` for Cursor/Cline
 - **Endpoint:** `http://localhost:{port}/mcp` (default port 9316)
 - **Batch support:** Yes (JSON-RPC arrays)
 - **Session management:** None — server is fully stateless (session tracking removed; no per-session state was ever stored)
@@ -84,7 +84,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | Class | Responsibility |
 |-------|---------------|
 | `FMonolithCoreModule` | IModuleInterface. Starts HTTP server, registers core tools, owns `TUniquePtr<FMonolithHttpServer>` |
-| `FMonolithHttpServer` | Embedded MCP HTTP server. Streamable HTTP + JSON-RPC 2.0 dispatch. Fully stateless (no session tracking) |
+| `FMonolithHttpServer` | Embedded MCP HTTP server. JSON-RPC 2.0 dispatch over HTTP. Fully stateless (no session tracking) |
 | `FMonolithToolRegistry` | Central singleton action registry. `TMap<FString, FRegisteredAction>` keyed by "namespace.action". Thread-safe — releases lock before executing handlers |
 | `FMonolithJsonUtils` | Static JSON-RPC 2.0 helpers. Standard error codes (-32700 through -32603). Declares `LogMonolith` category |
 | `FMonolithAssetUtils` | Asset loading with 4-tier fallback: StaticLoadObject(resolved) -> PackageName.ObjectName -> FindObject+_C suffix -> ForEachObjectWithPackage |
@@ -184,123 +184,115 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithAnimationModule` | Registers 67 animation actions (62 animation + 5 PoseSearch) |
+| `FMonolithAnimationModule` | Registers 62 animation actions (57 animation + 5 PoseSearch) |
 | `FMonolithAnimationActions` | Static handlers organized in 15 groups |
 
-#### Actions (67 — namespace: "animation")
+#### Actions (62 — namespace: "animation")
 
-**Curve Operations (7)**
+**Sequence Info (4) — read-only**
 | Action | Description |
 |--------|-------------|
-| `get_curves` | Get all curves in an animation sequence |
-| `add_curve` | Add a curve to an animation sequence |
-| `remove_curve` | Remove a curve from an animation sequence |
-| `set_curve_keys` | Set keys on a curve |
-| `get_curve_keys` | Get all keys from a curve |
-| `rename_curve` | Rename a curve |
-| `get_curve_data` | Get all curves with their keys and metadata |
-
-**Bone Track Inspection (3)**
-| Action | Description |
-|--------|-------------|
-| `get_bone_tracks` | Get all bone tracks with key counts |
-| `get_bone_track_data` | Get position/rotation/scale keys for a bone track |
-| `get_animation_statistics` | Get animation statistics (compressed size, curves, bone tracks, etc.) |
-
-**Sync Markers (3)**
-| Action | Description |
-|--------|-------------|
-| `get_sync_markers` | Get all sync markers |
-| `add_sync_marker` | Add a sync marker at a time |
-| `remove_sync_marker` | Remove a sync marker by name |
-
-**Root Motion (2)**
-| Action | Description |
-|--------|-------------|
-| `get_root_motion_info` | Get root motion settings and totals |
-| `extract_root_motion` | Extract root motion over a time range |
-
-**Animation Compression (2)**
-| Action | Description |
-|--------|-------------|
-| `get_compression_settings` | Get compression codec info |
-| `apply_compression` | Apply compression with optional codec class |
-
-**BlendSpace Operations (5)**
-| Action | Description |
-|--------|-------------|
-| `get_blendspace_info` | Get blend space axis info, dimensions, sample count |
-| `add_blendspace_sample` | Add a sample to a blend space |
-| `remove_blendspace_sample` | Remove a sample by index |
-| `set_blendspace_axis` | Set axis properties (min, max, name, grid divisions) |
-| `get_blendspace_samples` | Get all samples with positions and animations |
-
-**BlendSpace Legacy (2)**
-| Action | Description |
-|--------|-------------|
-| `edit_blendspace_sample` | Edit sample position and optionally its animation (uses delete+re-add workaround) |
-| `delete_blendspace_sample` | Delete a sample by index (legacy alias for remove_blendspace_sample) |
-
-**ABP Graph Reading (7) — read-only**
-| Action | Description |
-|--------|-------------|
-| `get_anim_blueprint_info` | Get ABP target skeleton, parent class, variables |
-| `get_state_machines` | Get all state machines with full topology |
-| `get_state_info` | Detailed info about a state in a state machine |
-| `get_transitions` | All transitions (supports empty machine_name for ALL state machines) |
-| `get_anim_graph_nodes` | Animation nodes with optional graph_name filter |
-| `get_blend_nodes` | Blend nodes in an ABP graph |
-| `get_linked_layers` | Linked animation layers |
-| `get_graphs` | All graphs in an ABP |
-| `get_nodes` | Animation nodes with optional class and graph_name filters |
-
-**Montage Operations (5)**
-| Action | Description |
-|--------|-------------|
-| `get_montage_info` | Get montage sections, slots, blend settings |
-| `add_montage_section` | Add a section to an animation montage |
-| `delete_montage_section` | Delete a section by name |
-| `set_montage_section_link` | Set next section link for a montage section |
-| `get_montage_slots` | Get montage slot and section info |
-
-**Montage Legacy (2)**
-| Action | Description |
-|--------|-------------|
-| `set_section_next` | Set the next section for a montage section (legacy) |
-| `set_section_time` | Set start time of a montage section (legacy) |
-
-**Notify Editing (2)**
-| Action | Description |
-|--------|-------------|
-| `set_notify_time` | Set trigger time of an animation notify |
-| `set_notify_duration` | Set duration of a state animation notify |
+| `get_sequence_info` | Get sequence metadata (duration, frames, root motion, compression, etc.) |
+| `get_sequence_notifies` | Get all notifies on an animation asset (sequence, montage, composite) |
+| `get_bone_track_keys` | Get position/rotation/scale keys for a bone track (with optional frame range) |
+| `get_sequence_curves` | Get float and transform curves on an animation sequence |
 
 **Bone Track Editing (3)**
 | Action | Description |
 |--------|-------------|
 | `set_bone_track_keys` | Set position/rotation/scale keys (JSON arrays) |
 | `add_bone_track` | Add a bone track to an animation sequence |
-| `remove_bone_track` | Remove a bone track (uses `RemoveBoneCurve(FName)` per bone + child traversal) |
+| `remove_bone_track` | Remove a bone track (with optional `include_children`) |
 
-**Skeleton Operations (5)**
+**Notify Operations (6)**
+| Action | Description |
+|--------|-------------|
+| `add_notify` | Add a point notify to an animation asset |
+| `add_notify_state` | Add a state notify (with duration) to an animation asset |
+| `remove_notify` | Remove a notify by index |
+| `set_notify_time` | Set trigger time of an animation notify |
+| `set_notify_duration` | Set duration of a state animation notify |
+| `set_notify_track` | Move a notify to a different track |
+
+**Curve Operations (5)**
+| Action | Description |
+|--------|-------------|
+| `list_curves` | List all animation curves on a sequence (optional `include_keys`) |
+| `add_curve` | Add a float or transform curve to an animation sequence |
+| `remove_curve` | Remove a curve from an animation sequence |
+| `set_curve_keys` | Set keys on a float curve (replaces existing keys) |
+| `get_curve_keys` | Get all keys from a float curve |
+
+**BlendSpace Operations (5)**
+| Action | Description |
+|--------|-------------|
+| `get_blend_space_info` | Get blend space samples and axis settings |
+| `add_blendspace_sample` | Add a sample to a blend space |
+| `edit_blendspace_sample` | Edit sample position and optionally its animation |
+| `delete_blendspace_sample` | Delete a sample by index |
+| `set_blend_space_axis` | Configure axis (name, range, grid divisions, snap, wrap) |
+
+**ABP Graph Reading (8) — read-only**
+| Action | Description |
+|--------|-------------|
+| `get_abp_info` | Get ABP overview (skeleton, graphs, state machines, variables, interfaces) |
+| `get_state_machines` | Get all state machines with full topology |
+| `get_state_info` | Detailed info about a state in a state machine |
+| `get_transitions` | All transitions (supports empty machine_name for ALL state machines) |
+| `get_blend_nodes` | Blend nodes in an ABP graph |
+| `get_linked_layers` | Linked animation layers |
+| `get_graphs` | All graphs in an ABP |
+| `get_nodes` | Animation nodes with optional class and graph_name filters |
+
+**Montage Operations (8)**
+| Action | Description |
+|--------|-------------|
+| `get_montage_info` | Get montage sections, slots, blend settings |
+| `add_montage_section` | Add a section to an animation montage |
+| `delete_montage_section` | Delete a section by index |
+| `set_section_next` | Set the next section for a montage section |
+| `set_section_time` | Set start time of a montage section |
+| `set_montage_blend` | Set blend in/out times and auto blend out |
+| `add_montage_slot` | Add a slot track to a montage |
+| `set_montage_slot` | Rename a slot track by index |
+
+**Skeleton Operations (9)**
 | Action | Description |
 |--------|-------------|
 | `get_skeleton_info` | Skeleton bone hierarchy, virtual bones, and sockets |
-| `add_virtual_bone` | Add a virtual bone to a skeleton |
-| `remove_virtual_bones` | Remove virtual bones (specific names or all) |
-| `get_socket_info` | Get socket details (position, rotation, scale, parent bone) |
-| `add_socket` | Add a socket to a skeleton |
-
-**Skeleton Info (1)**
-| Action | Description |
-|--------|-------------|
 | `get_skeletal_mesh_info` | Mesh info: morph targets, sockets, LODs, materials |
+| `get_skeleton_sockets` | Get sockets from a skeleton or skeletal mesh |
+| `get_skeleton_curves` | Get all registered animation curve names from a skeleton |
+| `add_virtual_bone` | Add a virtual bone to a skeleton |
+| `remove_virtual_bones` | Remove virtual bones (specific names) |
+| `add_socket` | Add a socket to a skeleton |
+| `remove_socket` | Remove a socket from a skeleton |
+| `set_socket_transform` | Set the transform of a skeleton socket |
 
-**Batch & Modifiers (2)**
+**Root Motion (1)**
 | Action | Description |
 |--------|-------------|
-| `batch_get_animation_info` | Get basic info for multiple animations in one call |
-| `run_animation_modifier` | Apply an animation modifier class to an animation |
+| `set_root_motion_settings` | Configure root motion settings (enable, lock mode, force root lock) |
+
+**Asset Creation (3)**
+| Action | Description |
+|--------|-------------|
+| `create_sequence` | Create a new empty animation sequence |
+| `duplicate_sequence` | Duplicate an animation sequence to a new path |
+| `create_montage` | Create a new animation montage with skeleton |
+
+**Anim Modifiers (2)**
+| Action | Description |
+|--------|-------------|
+| `apply_anim_modifier` | Apply an animation modifier class to a sequence |
+| `list_anim_modifiers` | List animation modifiers applied to a sequence |
+
+**Composites (3)**
+| Action | Description |
+|--------|-------------|
+| `get_composite_info` | Get segments and metadata from an animation composite |
+| `add_composite_segment` | Add a segment to an animation composite |
+| `remove_composite_segment` | Remove a segment from an animation composite by index |
 
 **PoseSearch (5)**
 | Action | Description |
@@ -747,7 +739,7 @@ See `TODO.md` for the full list. Key architectural constraints:
 
 - **Niagara HLSL creation stubs** — NiagaraEditor APIs not exported by Epic
 - **6 reimplemented NiagaraEditor helpers** — Same non-export issue
-- **SSE is stub-only** — Single event and close, not full streaming
+- **SSE is stub-only** — GET endpoint returns single event and close, not full streaming
 
 ---
 
@@ -758,12 +750,12 @@ See `TODO.md` for the full list. Key architectural constraints:
 | MonolithCore | monolith | 4 |
 | MonolithBlueprint | blueprint | 6 |
 | MonolithMaterial | material | 25 |
-| MonolithAnimation | animation | 67 |
+| MonolithAnimation | animation | 62 |
 | MonolithNiagara | niagara | 41 |
 | MonolithEditor | editor | 13 |
 | MonolithConfig | config | 6 |
 | MonolithIndex | project | 5 |
 | MonolithSource | source | 10 |
-| **Total** | | **177** |
+| **Total** | | **172** |
 
-**Note:** All skill files now correctly reflect the C++ action counts (177 total). The original Python server had higher counts (~231 tools) due to fragmented action design.
+**Note:** All skill files now correctly reflect the C++ action counts (172 total). The original Python server had higher counts (~231 tools) due to fragmented action design.
