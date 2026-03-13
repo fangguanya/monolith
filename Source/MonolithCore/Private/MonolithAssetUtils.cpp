@@ -47,23 +47,39 @@ UObject* FMonolithAssetUtils::LoadAssetByPath(const FString& AssetPath)
 {
 	FString Resolved = ResolveAssetPath(AssetPath);
 
-	// Try StaticLoadObject first (handles ObjectPath format)
-	UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *Resolved);
-	if (Asset)
-	{
-		return Asset;
-	}
+	// === Asset Registry-first path ===
+	// The Asset Registry reflects the editor's current ground truth.
+	// StaticLoadObject can return stale RF_Standalone ghosts from prior MCP creates
+	// if the disk file was deleted and recreated — the Asset Registry avoids this.
+	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 
-	// Build PackageName.ObjectName format — required for NiagaraSystem and other asset types
+	// Build PackageName.ObjectName for Asset Registry lookup
 	FString PackageName = FPackageName::ObjectPathToPackageName(Resolved);
 	FString ObjectName = FPackageName::ObjectPathToObjectName(Resolved);
 	if (ObjectName.IsEmpty())
 	{
 		ObjectName = FPackageName::GetShortName(PackageName);
 	}
-
-	// Try PackageName.ObjectName format (how UE internally resolves many asset types)
 	FString FullObjectPath = PackageName + TEXT(".") + ObjectName;
+
+	FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(FullObjectPath));
+	if (AssetData.IsValid())
+	{
+		UObject* Asset = AssetData.GetAsset();
+		if (Asset)
+		{
+			return Asset;
+		}
+	}
+
+	// === Fallback: StaticLoadObject ===
+	// For assets not yet in the Asset Registry (e.g. just created this frame)
+	UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *Resolved);
+	if (Asset)
+	{
+		return Asset;
+	}
+
 	Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *FullObjectPath);
 	if (Asset)
 	{
@@ -77,21 +93,18 @@ UObject* FMonolithAssetUtils::LoadAssetByPath(const FString& AssetPath)
 		Asset = FindObject<UObject>(Package, *ObjectName);
 		if (!Asset)
 		{
-			// Try with _C suffix for Blueprint generated classes
 			Asset = FindObject<UObject>(Package, *(ObjectName + TEXT("_C")));
 		}
 		if (!Asset)
 		{
-			// Last resort: iterate package for first non-transient object
-			// Handles assets whose internal name differs from package name
 			ForEachObjectWithPackage(Package, [&Asset](UObject* Obj)
 			{
 				if (!Obj->IsA<UPackage>() && !Obj->HasAnyFlags(RF_Transient))
 				{
 					Asset = Obj;
-					return false; // stop
+					return false;
 				}
-				return true; // continue
+				return true;
 			}, false);
 		}
 	}

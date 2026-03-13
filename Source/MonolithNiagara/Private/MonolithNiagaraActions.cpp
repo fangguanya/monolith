@@ -30,12 +30,16 @@
 #include "EdGraphSchema_Niagara.h"
 #include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
 #include "NiagaraParameterMapHistory.h"
+#include "NiagaraSystemEditorData.h"
+#include "NiagaraEditorUtilities.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
 #include "Materials/MaterialInterface.h"
 #include "Editor.h"
+#include "Misc/PackageName.h"
+#include "UObject/SavePackage.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -396,6 +400,7 @@ UNiagaraNodeFunctionCall* FMonolithNiagaraActions::FindModuleNode(UNiagaraSystem
 		ENiagaraScriptUsage::ParticleSpawnScript, ENiagaraScriptUsage::ParticleUpdateScript,
 	};
 
+	// Pass 1: Walk the ParameterMap chain from each output node (fast path, connected graphs)
 	for (ENiagaraScriptUsage Usage : AllUsages)
 	{
 		UNiagaraNodeOutput* Out = FindOutputNode(System, EmitterHandleId, Usage);
@@ -412,6 +417,32 @@ UNiagaraNodeFunctionCall* FMonolithNiagaraActions::FindModuleNode(UNiagaraSystem
 			}
 		}
 	}
+
+	// Pass 2: Fallback — scan all UNiagaraNodeFunctionCall nodes directly in each graph.
+	// Handles broken/disconnected ParameterMap chains where the chain traversal returns nothing
+	// but the module nodes still exist as orphaned objects in the graph (e.g. after a corrupt
+	// create_system_from_spec that added modules without wiring the chain).
+	TArray<UNiagaraGraph*> VisitedGraphs;
+	for (ENiagaraScriptUsage Usage : AllUsages)
+	{
+		UNiagaraGraph* Graph = GetGraphForUsage(System, EmitterHandleId, Usage);
+		if (!Graph || VisitedGraphs.Contains(Graph)) continue;
+		VisitedGraphs.Add(Graph);
+
+		TArray<UNiagaraNodeFunctionCall*> AllFunctionCalls;
+		Graph->GetNodesOfClass<UNiagaraNodeFunctionCall>(AllFunctionCalls);
+		for (UNiagaraNodeFunctionCall* N : AllFunctionCalls)
+		{
+			if (!N) continue;
+			if ((bHasGuid && N->NodeGuid == TargetGuid) || N->GetFunctionName() == NodeGuidStr)
+			{
+				// Best-effort usage: check which output node this node's script usage matches
+				if (OutUsage) *OutUsage = Usage;
+				return N;
+			}
+		}
+	}
+
 	return nullptr;
 }
 
@@ -916,26 +947,58 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddEmitter(const TSharedPtr
 	int32 HandleCountBefore = System->GetEmitterHandles().Num();
 
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "AddEmitter", "Add Emitter"));
-	System->Modify();
 
-	FName Name = EmitterName.IsEmpty() ? EmitterAsset->GetFName() : FName(*EmitterName);
-	// UE 5.7 FIX: AddEmitterHandle takes FGuid VersionGuid, not FNiagaraAssetVersion
-	FNiagaraEmitterHandle NewHandle = System->AddEmitterHandle(*EmitterAsset, Name, EmitterAsset->GetExposedVersion().VersionGuid);
+	// Use engine's full add-emitter path: AddEmitterHandle + RebuildEmitterNodes + SynchronizeOverviewGraph.
+	// Calling AddEmitterHandle alone leaves the emitter without graph nodes ("Data missing please force a recompile").
+	const FGuid NewHandleId = FNiagaraEditorUtilities::AddEmitterToSystem(
+		*System, *EmitterAsset, EmitterAsset->GetExposedVersion().VersionGuid);
 
 	GEditor->EndTransaction();
 
 	// Validate the emitter was actually added (engine can silently fail)
-	if (System->GetEmitterHandles().Num() <= HandleCountBefore || !NewHandle.GetId().IsValid())
+	if (System->GetEmitterHandles().Num() <= HandleCountBefore || !NewHandleId.IsValid())
 	{
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("Failed to add emitter from '%s'. The asset may not be a valid NiagaraEmitter or may be incompatible."),
 			*EmitterAssetPath));
 	}
 
-	System->RequestCompile(false);
+	// Mark the package dirty so the editor tracks unsaved changes and includes it in autosave.
+	// Modify() alone only handles undo — MarkPackageDirty() is what actually flags the asset for save.
+	System->MarkPackageDirty();
+
+	// Save the package to disk immediately. Without this, the Niagara editor may reload from disk
+	// (which has the old/empty state) and the added emitter will appear to vanish.
+	UPackage* SystemPkg = System->GetPackage();
+	FString PackageFilename;
+	if (SystemPkg && FPackageName::TryConvertLongPackageNameToFilename(SystemPkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
+	{
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.Error = GError;
+		UPackage::SavePackage(SystemPkg, System, *PackageFilename, SaveArgs);
+	}
+
+	// RequestCompile(false) intentionally removed: AddEmitterToSystem already triggers graph rebuild,
+	// and async compile causes a timing race in the spec flow where HandleAddModule runs before
+	// the ParameterMap chain is wired (bHasChainSource == false). The spec flow forces a synchronous
+	// compile via RequestCompile(true) + WaitForCompilationComplete() after each emitter add instead.
+
+	// If a custom name was requested, rename the emitter handle (AddEmitterToSystem auto-generates names)
+	if (!EmitterName.IsEmpty())
+	{
+		for (int32 i = 0; i < System->GetEmitterHandles().Num(); ++i)
+		{
+			if (System->GetEmitterHandles()[i].GetId() == NewHandleId)
+			{
+				System->GetEmitterHandles()[i].SetName(FName(*EmitterName), *System);
+				break;
+			}
+		}
+	}
 
 	TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
-	R->SetStringField(TEXT("handle_id"), NewHandle.GetId().ToString());
+	R->SetStringField(TEXT("handle_id"), NewHandleId.ToString());
 	return SuccessObj(R);
 }
 
@@ -1144,6 +1207,18 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystem(const TSharedP
 
 	FAssetRegistryModule::AssetCreated(NS);
 	Pkg->MarkPackageDirty();
+
+	// Save to disk immediately so the .uasset file exists. Without this, the Niagara editor will
+	// either fail to open the asset or reload from a missing disk file and show an empty system.
+	FString PackageFilename;
+	if (FPackageName::TryConvertLongPackageNameToFilename(Pkg->GetName(), PackageFilename, FPackageName::GetAssetPackageExtension()))
+	{
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.Error = GError;
+		UPackage::SavePackage(Pkg, NS, *PackageFilename, SaveArgs);
+	}
+
 	return SuccessStr(NS->GetPathName());
 }
 
@@ -1508,30 +1583,48 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 	UNiagaraSystem* System = LoadSystem(SystemPath);
 	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
 
-	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleNodeGuid);
+	ENiagaraScriptUsage FoundUsage = ENiagaraScriptUsage::ParticleUpdateScript;
+	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleNodeGuid, &FoundUsage);
 	if (!MN) return FMonolithActionResult::Error(TEXT("Module node not found"));
 
+	// Use the engine's full input enumeration (matches HandleGetModuleInputs)
 	TArray<FNiagaraVariable> Inputs;
-	MonolithNiagaraHelpers::GetStackFunctionInputs(*MN, Inputs);
+	int32 EmitterIdx = FindEmitterHandleIndex(System, EmitterHandleId);
+	if (EmitterIdx != INDEX_NONE)
+	{
+		FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[EmitterIdx].GetInstance();
+		FCompileConstantResolver Resolver(VE, FoundUsage);
+		FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, Inputs, Resolver,
+			FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+	}
+	else
+	{
+		FCompileConstantResolver Resolver(System, FoundUsage);
+		FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, Inputs, Resolver,
+			FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+	}
 
+	// Match input by short name (strip Module. prefix for comparison)
 	FNiagaraTypeDefinition InputType;
 	bool bInputFound = false;
+	FName MatchedFullName;
 	for (const FNiagaraVariable& In : Inputs)
 	{
-		if (In.GetName() == FName(*InputName)) { InputType = In.GetType(); bInputFound = true; break; }
+		FName ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName());
+		if (ShortName == FName(*InputName)) { InputType = In.GetType(); MatchedFullName = In.GetName(); bInputFound = true; break; }
 	}
 
 	if (!bInputFound)
 	{
 		TArray<FString> ValidNames;
-		for (const FNiagaraVariable& In : Inputs) { ValidNames.Add(In.GetName().ToString()); }
+		for (const FNiagaraVariable& In : Inputs) { ValidNames.Add(MonolithNiagaraHelpers::StripModulePrefix(In.GetName()).ToString()); }
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("Input '%s' not found on module. Valid inputs: [%s]"),
 			*InputName, *FString::Join(ValidNames, TEXT(", "))));
 	}
 
 	FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
-		FNiagaraParameterHandle(FName(*InputName)), MN);
+		FNiagaraParameterHandle(MatchedFullName), MN);
 
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetModIn", "Set Module Input"));
 	System->Modify();
@@ -1594,30 +1687,48 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputBinding(const
 	UNiagaraSystem* System = LoadSystem(SystemPath);
 	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
 
-	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleNodeGuid);
+	ENiagaraScriptUsage FoundUsage = ENiagaraScriptUsage::ParticleUpdateScript;
+	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleNodeGuid, &FoundUsage);
 	if (!MN) return FMonolithActionResult::Error(TEXT("Module node not found"));
 
+	// Use the engine's full input enumeration (matches HandleGetModuleInputs)
 	TArray<FNiagaraVariable> Inputs;
-	MonolithNiagaraHelpers::GetStackFunctionInputs(*MN, Inputs);
+	int32 EmitterIdx = FindEmitterHandleIndex(System, EmitterHandleId);
+	if (EmitterIdx != INDEX_NONE)
+	{
+		FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[EmitterIdx].GetInstance();
+		FCompileConstantResolver Resolver(VE, FoundUsage);
+		FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, Inputs, Resolver,
+			FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+	}
+	else
+	{
+		FCompileConstantResolver Resolver(System, FoundUsage);
+		FNiagaraStackGraphUtilities::GetStackFunctionInputs(*MN, Inputs, Resolver,
+			FNiagaraStackGraphUtilities::ENiagaraGetStackFunctionInputPinsOptions::ModuleInputsOnly, false);
+	}
 
+	// Match input by short name (strip Module. prefix for comparison)
 	FNiagaraTypeDefinition InputType;
 	bool bInputFound = false;
+	FName MatchedFullName;
 	for (const FNiagaraVariable& In : Inputs)
 	{
-		if (In.GetName() == FName(*InputName)) { InputType = In.GetType(); bInputFound = true; break; }
+		FName ShortName = MonolithNiagaraHelpers::StripModulePrefix(In.GetName());
+		if (ShortName == FName(*InputName)) { InputType = In.GetType(); MatchedFullName = In.GetName(); bInputFound = true; break; }
 	}
 
 	if (!bInputFound)
 	{
 		TArray<FString> ValidNames;
-		for (const FNiagaraVariable& In : Inputs) { ValidNames.Add(In.GetName().ToString()); }
+		for (const FNiagaraVariable& In : Inputs) { ValidNames.Add(MonolithNiagaraHelpers::StripModulePrefix(In.GetName()).ToString()); }
 		return FMonolithActionResult::Error(FString::Printf(
 			TEXT("Input '%s' not found on module. Valid inputs: [%s]"),
 			*InputName, *FString::Join(ValidNames, TEXT(", "))));
 	}
 
 	FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
-		FNiagaraParameterHandle(FName(*InputName)), MN);
+		FNiagaraParameterHandle(MatchedFullName), MN);
 
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "SetModBind", "Set Module Binding"));
 	System->Modify();
@@ -2579,6 +2690,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 
 	FString SystemPath = CreateResult.Result.IsValid() ? CreateResult.Result->GetStringField(TEXT("result")) : FString();
 	int32 FailCount = 0;
+	TArray<FString> FailedOps;
 
 	// Add user parameters
 	if (Spec->HasField(TEXT("user_parameters")))
@@ -2592,7 +2704,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 			AP->SetStringField(TEXT("name"), PO->GetStringField(TEXT("name")));
 			AP->SetStringField(TEXT("type"), PO->GetStringField(TEXT("type")));
 			if (PO->HasField(TEXT("default"))) AP->SetField(TEXT("default"), PO->TryGetField(TEXT("default")));
-			if (!HandleAddUserParameter(AP).bSuccess) FailCount++;
+			FMonolithActionResult AUP = HandleAddUserParameter(AP);
+			if (!AUP.bSuccess) { FailedOps.Add(FString::Printf(TEXT("add_user_parameter: %s"), *AUP.ErrorMessage)); FailCount++; }
 		}
 	}
 
@@ -2609,13 +2722,23 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 			AEP->SetStringField(TEXT("emitter_asset"), EO->GetStringField(TEXT("asset")));
 			if (EO->HasField(TEXT("name"))) AEP->SetStringField(TEXT("name"), EO->GetStringField(TEXT("name")));
 			FMonolithActionResult AER = HandleAddEmitter(AEP);
-			if (!AER.bSuccess) { FailCount++; continue; }
+			if (!AER.bSuccess) { FailedOps.Add(FString::Printf(TEXT("add_emitter: %s"), *AER.ErrorMessage)); FailCount++; continue; }
 
 			// Parse handle_id from result
 			FString EmitterId;
 			if (AER.Result.IsValid())
 				EmitterId = AER.Result->GetStringField(TEXT("handle_id"));
 			if (EmitterId.IsEmpty()) continue;
+
+			// Force synchronous compile so the stack graph is fully wired before adding modules.
+			// AddEmitterToSystem calls RebuildEmitterNodes, but the graph may not be fully initialized
+			// until a compile pass runs. Modules need the ParameterMap chain to be complete.
+			UNiagaraSystem* SpecSystem = LoadSystem(SystemPath);
+			if (SpecSystem)
+			{
+				SpecSystem->RequestCompile(true);
+				SpecSystem->WaitForCompilationComplete();
+			}
 
 			// Emitter properties
 			if (EO->HasField(TEXT("properties")))
@@ -2628,7 +2751,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 					SP->SetStringField(TEXT("emitter"), EmitterId);
 					SP->SetStringField(TEXT("property"), P.Key);
 					SP->SetField(TEXT("value"), P.Value);
-					if (!HandleSetEmitterProperty(SP).bSuccess) FailCount++;
+					FMonolithActionResult EPR = HandleSetEmitterProperty(SP);
+					if (!EPR.bSuccess) { FailedOps.Add(FString::Printf(TEXT("set_emitter_property[%s]: %s"), *P.Key, *EPR.ErrorMessage)); FailCount++; }
 				}
 			}
 
@@ -2647,7 +2771,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 					AMP->SetStringField(TEXT("module_script"), MO->GetStringField(TEXT("script")));
 					AMP->SetNumberField(TEXT("index"), MO->HasField(TEXT("index")) ? MO->GetNumberField(TEXT("index")) : MI);
 					FMonolithActionResult AMR = HandleAddModule(AMP);
-					if (!AMR.bSuccess) { FailCount++; continue; }
+					if (!AMR.bSuccess) { FailedOps.Add(FString::Printf(TEXT("add_module[%s]: %s"), *MO->GetStringField(TEXT("script")), *AMR.ErrorMessage)); FailCount++; continue; }
 
 					FString NodeGuid;
 					if (AMR.Result.IsValid())
@@ -2665,7 +2789,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 							SIP->SetStringField(TEXT("module_node"), NodeGuid);
 							SIP->SetStringField(TEXT("input"), IP.Key);
 							SIP->SetField(TEXT("value"), IP.Value);
-							if (!HandleSetModuleInputValue(SIP).bSuccess) FailCount++;
+							FMonolithActionResult SIVR = HandleSetModuleInputValue(SIP);
+						if (!SIVR.bSuccess) { FailedOps.Add(FString::Printf(TEXT("set_module_input[%s]: %s"), *IP.Key, *SIVR.ErrorMessage)); FailCount++; }
 						}
 					}
 					if (MO->HasField(TEXT("bindings")))
@@ -2679,7 +2804,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 							SBP->SetStringField(TEXT("module_node"), NodeGuid);
 							SBP->SetStringField(TEXT("input"), BP2.Key);
 							SBP->SetStringField(TEXT("binding"), BP2.Value->AsString());
-							if (!HandleSetModuleInputBinding(SBP).bSuccess) FailCount++;
+							FMonolithActionResult SIBR = HandleSetModuleInputBinding(SBP);
+						if (!SIBR.bSuccess) { FailedOps.Add(FString::Printf(TEXT("set_module_binding[%s]: %s"), *BP2.Key, *SIBR.ErrorMessage)); FailCount++; }
 						}
 					}
 				}
@@ -2697,7 +2823,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 					ARP->SetStringField(TEXT("emitter"), EmitterId);
 					ARP->SetStringField(TEXT("class"), RO->GetStringField(TEXT("class")));
 					FMonolithActionResult ARR = HandleAddRenderer(ARP);
-					if (!ARR.bSuccess) { FailCount++; continue; }
+					if (!ARR.bSuccess) { FailedOps.Add(FString::Printf(TEXT("add_renderer[%s]: %s"), *RO->GetStringField(TEXT("class")), *ARR.ErrorMessage)); FailCount++; continue; }
 
 					int32 RIdx = -1;
 					if (ARR.Result.IsValid())
@@ -2711,7 +2837,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 						SMP->SetStringField(TEXT("emitter"), EmitterId);
 						SMP->SetNumberField(TEXT("renderer_index"), RIdx);
 						SMP->SetStringField(TEXT("material"), RO->GetStringField(TEXT("material")));
-						if (!HandleSetRendererMaterial(SMP).bSuccess) FailCount++;
+						FMonolithActionResult SRMR = HandleSetRendererMaterial(SMP);
+					if (!SRMR.bSuccess) { FailedOps.Add(FString::Printf(TEXT("set_renderer_material: %s"), *SRMR.ErrorMessage)); FailCount++; }
 					}
 					if (RO->HasField(TEXT("properties")))
 					{
@@ -2724,7 +2851,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 							SRP->SetNumberField(TEXT("renderer_index"), RIdx);
 							SRP->SetStringField(TEXT("property"), RP.Key);
 							SRP->SetField(TEXT("value"), RP.Value);
-							if (!HandleSetRendererProperty(SRP).bSuccess) FailCount++;
+							FMonolithActionResult SRPR = HandleSetRendererProperty(SRP);
+						if (!SRPR.bSuccess) { FailedOps.Add(FString::Printf(TEXT("set_renderer_property[%s]: %s"), *RP.Key, *SRPR.ErrorMessage)); FailCount++; }
 						}
 					}
 				}
@@ -2741,6 +2869,13 @@ FMonolithActionResult FMonolithNiagaraActions::HandleCreateSystemFromSpec(const 
 	Final->SetBoolField(TEXT("success"), FailCount == 0);
 	Final->SetStringField(TEXT("system_path"), SystemPath);
 	Final->SetNumberField(TEXT("failed_steps"), FailCount);
+	if (FailedOps.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> ErrArr;
+		for (const FString& E : FailedOps)
+			ErrArr.Add(MakeShared<FJsonValueString>(E));
+		Final->SetArrayField(TEXT("errors"), ErrArr);
+	}
 	return SuccessObj(Final);
 }
 

@@ -1,6 +1,6 @@
 # Monolith — TODO
 
-Last updated: 2026-03-11
+Last updated: 2026-03-13
 
 ---
 
@@ -13,6 +13,13 @@ None! All critical bugs resolved.
 ### Moderate
 
 None! All moderate bugs resolved.
+
+### Recently Fixed
+
+- [x] **Niagara `create_system` + `add_emitter` — emitters don't persist** — FIXED (2026-03-13). Replaced raw `System->AddEmitterHandle()` with `FNiagaraEditorUtilities::AddEmitterToSystem()` which calls `RebuildEmitterNodes` + `SynchronizeOverviewGraphWithSystem` after adding the handle. Also added `SavePackage` call in both `HandleCreateSystem` and `HandleAddEmitter`. Custom emitter names applied post-add via `SetName()`.
+- [x] **Niagara `create_system_from_spec` — fails with `failed_steps:1`** — FIXED (2026-03-13). Added synchronous `RequestCompile(true)` + `WaitForCompilationComplete()` after each emitter add in the spec flow, before modules are added. Removed redundant async `RequestCompile(false)` from `HandleAddEmitter`. Also added error message capture — failed sub-operations now report in an `"errors"` array instead of silent `FailCount++`.
+- [x] **All MCP tools return stale in-memory objects after asset recreate** — FIXED (2026-03-13). `LoadAssetByPath` now queries `IAssetRegistry::GetAssetByObjectPath()` + `FAssetData::GetAsset()` first (reflects editor ground truth), falling back to `StaticLoadObject` only if the Asset Registry has no record. Prevents stale `RF_Standalone` ghosts from shadowing recreated assets.
+- [x] **Niagara `set_module_input_value` — namespace warnings on compile** — FIXED (2026-03-13). `MatchedFullName` was assigned the stripped short name instead of the full `Module.`-prefixed name from `In.GetName()`. Same fix applied to `HandleSetModuleInputBinding`. Both now pass the full name to `FNiagaraParameterHandle::CreateAliasedModuleParameterHandle`.
 
 ### Minor
 
@@ -200,3 +207,5 @@ Priority features identified for future waves:
 - [x] **`delete_montage_section` allows deleting last section** — FIXED (2026-03-10). Added guard: if montage has only 1 section remaining, returns error "Cannot delete the last remaining montage section".
 - [x] **`add_blendspace_sample` generic error on skeleton mismatch** — FIXED (2026-03-10). Added skeleton comparison before adding sample, returns descriptive error naming both skeletons when they don't match.
 - [x] **Animation Waves 1-7: 39 new actions** — IMPLEMENTED (2026-03-10). Total animation module: 62 actions + 5 PoseSearch = 67. Waves: 8 read actions, 4 notify CRUD, 5 curve CRUD, 6 skeleton+blendspace, 6 creation+montage, 5 PoseSearch, 5 modifiers+composites. Build errors fixed: BlendParameters private, GetTargetSkeleton removed, UMirrorDataTable forward-decl, GetBoneAnimationTracks deprecated, OpenBracket FText.
+- [x] **Blueprint module upgrade: 6 → 46 actions** — IMPLEMENTED (2026-03-13). Added 40 new write actions across 5 categories: Variable CRUD (7), Component CRUD (6), Graph Management (9), Node & Pin Operations (6), Compile & Create (5). Also expanded Read Actions to 13 (added get_components, get_component_details, get_functions, get_event_dispatchers, get_parent_class, get_interfaces, get_construction_script). Total plugin actions: 177 → 217.
+- [x] **Offline CLI (`monolith_offline.py`)** — IMPLEMENTED (2026-03-13). Pure Python (stdlib only) CLI that queries `EngineSource.db` and `ProjectIndex.db` directly without the editor running. 14 actions across 2 namespaces: `source` (9 actions, mirrors `source_query`) and `project` (5 actions, mirrors `project_query`). Read-only, zero footprint, zero dependencies. Fallback for when MCP/editor is unavailable. Location: `Saved/monolith_offline.py`.
