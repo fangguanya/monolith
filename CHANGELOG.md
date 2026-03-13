@@ -4,6 +4,12 @@ All notable changes to Monolith will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.2] - 2026-03-13
+
+### Fixed
+
+- **Niagara** — `set_module_input_value`, `set_module_input_binding`, and `set_curve_value` silently defaulted to `GetFloatDef()` when input name didn't match any module input, creating orphaned override entries in the parameter map that cannot be removed. Now returns an error with the list of valid input names. Common trigger: CamelCase names vs spaced names (e.g. `LifetimeMin` vs `Lifetime Min`). (Thanks [@playtabegg](https://github.com/playtabegg) — [#2](https://github.com/tumourlove/monolith/pull/2))
+
 ## [0.7.1] - 2026-03-11
 
 Niagara write testing: all 41 actions verified. 12 bugs found and fixed, plus a major improvement to `get_module_inputs`.
