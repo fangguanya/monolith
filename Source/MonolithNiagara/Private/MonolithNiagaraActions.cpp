@@ -1514,10 +1514,20 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputValue(const T
 	TArray<FNiagaraVariable> Inputs;
 	MonolithNiagaraHelpers::GetStackFunctionInputs(*MN, Inputs);
 
-	FNiagaraTypeDefinition InputType = FNiagaraTypeDefinition::GetFloatDef();
+	FNiagaraTypeDefinition InputType;
+	bool bInputFound = false;
 	for (const FNiagaraVariable& In : Inputs)
 	{
-		if (In.GetName() == FName(*InputName)) { InputType = In.GetType(); break; }
+		if (In.GetName() == FName(*InputName)) { InputType = In.GetType(); bInputFound = true; break; }
+	}
+
+	if (!bInputFound)
+	{
+		TArray<FString> ValidNames;
+		for (const FNiagaraVariable& In : Inputs) { ValidNames.Add(In.GetName().ToString()); }
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Input '%s' not found on module. Valid inputs: [%s]"),
+			*InputName, *FString::Join(ValidNames, TEXT(", "))));
 	}
 
 	FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
@@ -1590,10 +1600,20 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputBinding(const
 	TArray<FNiagaraVariable> Inputs;
 	MonolithNiagaraHelpers::GetStackFunctionInputs(*MN, Inputs);
 
-	FNiagaraTypeDefinition InputType = FNiagaraTypeDefinition::GetFloatDef();
+	FNiagaraTypeDefinition InputType;
+	bool bInputFound = false;
 	for (const FNiagaraVariable& In : Inputs)
 	{
-		if (In.GetName() == FName(*InputName)) { InputType = In.GetType(); break; }
+		if (In.GetName() == FName(*InputName)) { InputType = In.GetType(); bInputFound = true; break; }
+	}
+
+	if (!bInputFound)
+	{
+		TArray<FString> ValidNames;
+		for (const FNiagaraVariable& In : Inputs) { ValidNames.Add(In.GetName().ToString()); }
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Input '%s' not found on module. Valid inputs: [%s]"),
+			*InputName, *FString::Join(ValidNames, TEXT(", "))));
 	}
 
 	FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
@@ -2126,13 +2146,23 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetCurveValue(const TShared
 	UNiagaraNodeFunctionCall* MN = FindModuleNode(System, EmitterHandleId, ModuleName);
 	if (!MN) return FMonolithActionResult::Error(TEXT("Module not found"));
 
-	// Find input type
+	// Find input type — validate input exists before proceeding
 	TArray<FNiagaraVariable> Inputs;
 	MonolithNiagaraHelpers::GetStackFunctionInputs(*MN, Inputs);
-	FNiagaraTypeDefinition InputType = FNiagaraTypeDefinition::GetFloatDef();
+	FNiagaraTypeDefinition InputType;
+	bool bInputFound = false;
 	for (const FNiagaraVariable& In : Inputs)
 	{
-		if (In.GetName() == FName(*InputName)) { InputType = In.GetType(); break; }
+		if (In.GetName() == FName(*InputName)) { InputType = In.GetType(); bInputFound = true; break; }
+	}
+
+	if (!bInputFound)
+	{
+		TArray<FString> ValidNames;
+		for (const FNiagaraVariable& In : Inputs) { ValidNames.Add(In.GetName().ToString()); }
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Input '%s' not found on module '%s'. Valid inputs: [%s]"),
+			*InputName, *ModuleName, *FString::Join(ValidNames, TEXT(", "))));
 	}
 
 	FNiagaraParameterHandle PH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
