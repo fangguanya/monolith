@@ -1,5 +1,10 @@
 #include "MonolithBlueprintModule.h"
 #include "MonolithBlueprintActions.h"
+#include "MonolithBlueprintVariableActions.h"
+#include "MonolithBlueprintComponentActions.h"
+#include "MonolithBlueprintGraphActions.h"
+#include "MonolithBlueprintNodeActions.h"
+#include "MonolithBlueprintCompileActions.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
@@ -10,8 +15,14 @@ void FMonolithBlueprintModule::StartupModule()
 {
 	if (!GetDefault<UMonolithSettings>()->bEnableBlueprint) return;
 
+	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
 	FMonolithBlueprintActions::RegisterActions();
-	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (6 actions)"));
+	FMonolithBlueprintVariableActions::RegisterActions(Registry);
+	FMonolithBlueprintComponentActions::RegisterActions(Registry);
+	FMonolithBlueprintGraphActions::RegisterActions(Registry);
+	FMonolithBlueprintNodeActions::RegisterActions(Registry);
+	FMonolithBlueprintCompileActions::RegisterActions(Registry);
+	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (46 actions)"));
 }
 
 void FMonolithBlueprintModule::ShutdownModule()

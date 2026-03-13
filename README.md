@@ -18,11 +18,11 @@ It works with **Claude Code**, **Cursor**, or any MCP-compatible client. If your
 
 ## Why Monolith?
 
-Most MCP integrations register every action as a separate tool, which floods the AI's context window with tool descriptions. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists what's available. This keeps the tool list small (12 tools) while still exposing 177 actions across nine domains.
+Most MCP integrations register every action as a separate tool, which floods the AI's context window with tool descriptions. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists what's available. This keeps the tool list small (12 tools) while still exposing 212 actions across nine domains.
 
 ## Features
 
-- **Full Blueprint inspection** — Graph topology, variables, execution flow, node search
+- **Full Blueprint read/write/CRUD** — Create Blueprints, edit variables/components/functions/nodes, compile and validate
 - **Material graph editing** — Read, build, and validate material graphs with preview support
 - **Animation coverage** — Montages, blend spaces, ABP state machines, skeletons, bone tracks
 - **Niagara particle systems** — Create and edit systems, emitters, modules, parameters, renderers, and HLSL
@@ -181,9 +181,9 @@ cp -r Plugins/Monolith/Skills/* ~/.claude/skills/
 ```
 Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, auto-updater (4 actions)
-  MonolithBlueprint     — Blueprint graph reading (6 actions)
+  MonolithBlueprint     — Blueprint read/write, variable/component/graph CRUD, node operations, compile (46 actions)
   MonolithMaterial      — Material inspection + graph editing + CRUD (25 actions)
-  MonolithAnimation     — Animation sequences, montages, ABPs, PoseSearch (67 actions)
+  MonolithAnimation     — Animation sequences, montages, ABPs, PoseSearch (62 actions)
   MonolithNiagara       — Niagara particle systems (41 actions)
   MonolithEditor        — Build triggers, log capture, compile output, crash context (13 actions)
   MonolithConfig        — Config/INI resolution and search (6 actions)
@@ -191,7 +191,7 @@ Monolith.uplugin
   MonolithSource        — Engine source + API lookup (10 actions)
 ```
 
-**177 actions total across 9 modules, exposed through 12 MCP tools.**
+**212 actions total across 9 modules, exposed through 12 MCP tools.**
 
 ### Tool Reference
 
@@ -201,9 +201,9 @@ Monolith.uplugin
 | `monolith` | `monolith_status` | — | Server health, version, index status |
 | `monolith` | `monolith_reindex` | — | Trigger full project re-index |
 | `monolith` | `monolith_update` | — | Check or install updates |
-| `blueprint` | `blueprint_query` | 6 | Graph topology, variables, execution flow, node search, graph summary |
+| `blueprint` | `blueprint_query` | 46 | Full Blueprint CRUD — read/write graphs, variables, components, functions, nodes, compile |
 | `material` | `material_query` | 25 | Inspection, editing, graph building, previews, validation, CRUD |
-| `animation` | `animation_query` | 67 | Montages, blend spaces, ABPs, skeletons, bone tracks, PoseSearch |
+| `animation` | `animation_query` | 62 | Montages, blend spaces, ABPs, skeletons, bone tracks, PoseSearch |
 | `niagara` | `niagara_query` | 41 | Systems, emitters, modules, parameters, renderers, HLSL |
 | `editor` | `editor_query` | 13 | Build triggers, error logs, compile output, crash context |
 | `config` | `config_query` | 6 | INI resolution, explain, diff, search |
@@ -212,7 +212,7 @@ Monolith.uplugin
 
 ### What Can the AI Actually Do?
 
-**Blueprint** — Read any Blueprint's graph structure, trace execution flow between nodes, list variables with defaults, search for specific node types, and get a lightweight summary. Useful for understanding existing logic, auditing complexity, or planning a Blueprint-to-C++ migration.
+**Blueprint** — Full read/write access to every aspect of a Blueprint asset. Read graph topology, trace execution flow, list variables and components, and inspect functions and interfaces. Create new Blueprints from any parent class, add/remove/rename variables and components, create functions/macros/event dispatchers, add/wire/move nodes, set pin defaults, implement interfaces, reparent Blueprints, compile and validate. The AI can build a complete Blueprint from a text description or surgically modify an existing one.
 
 **Material** — Create materials and material instances from scratch, add and connect expression nodes, set parameters (scalars, vectors, textures), build full PBR graphs programmatically, recompile, validate for errors, and inspect compiled shader stats. The AI can build a complete material from a text description.
 
@@ -276,7 +276,7 @@ Monolith bundles 9 Claude Code skills in `Skills/` for domain-specific workflows
 
 | Skill | Description |
 |-------|-------------|
-| `unreal-blueprints` | Graph reading, variable inspection, execution flow |
+| `unreal-blueprints` | Full Blueprint CRUD — read, create, edit variables/components/functions/nodes, compile |
 | `unreal-materials` | PBR setup, graph building, validation |
 | `unreal-animation` | Montages, ABP state machines, blend spaces |
 | `unreal-niagara` | Particle system creation, HLSL modules, scalability |

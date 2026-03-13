@@ -498,8 +498,32 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsCall(const TSharedPtr<FJ
 		}
 
 		// Extract nested params if present, then merge in any top-level extras
+		// NOTE: Claude Code sends "params" as a JSON-encoded string, not a nested object.
+		// We must handle both cases.
 		const TSharedPtr<FJsonObject>* NestedParams = nullptr;
+		TSharedPtr<FJsonObject> ParsedParamsObj; // lifetime holder for string-parsed params
+		bool bHasNestedParams = false;
+
 		if (Arguments->TryGetObjectField(TEXT("params"), NestedParams) && NestedParams)
+		{
+			bHasNestedParams = true;
+		}
+		else
+		{
+			// Try parsing "params" as a JSON string (Claude Code serializes objects to strings)
+			FString ParamsStr;
+			if (Arguments->TryGetStringField(TEXT("params"), ParamsStr) && !ParamsStr.IsEmpty())
+			{
+				TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ParamsStr);
+				if (FJsonSerializer::Deserialize(Reader, ParsedParamsObj) && ParsedParamsObj.IsValid())
+				{
+					NestedParams = &ParsedParamsObj;
+					bHasNestedParams = true;
+				}
+			}
+		}
+
+		if (bHasNestedParams && NestedParams)
 		{
 			Arguments = MakeShared<FJsonObject>();
 			// Start with top-level extras (lower priority)

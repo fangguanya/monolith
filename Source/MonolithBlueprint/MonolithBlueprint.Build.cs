@@ -18,6 +18,11 @@ public class MonolithBlueprint : ModuleRules
 			"MonolithCore",
 			"UnrealEd",
 			"BlueprintGraph",
+			"BlueprintEditorLibrary",
+			"SubobjectDataInterface",
+			"Kismet",
+			"KismetCompiler",
+			"EditorScriptingUtilities",
 			"Json",
 			"JsonUtilities"
 		});

@@ -12,13 +12,13 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~219 individual tools down to 12 MCP tools (172 total actions), cutting AI assistant context consumption by ~95%.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~219 individual tools down to 12 MCP tools (217 total actions), cutting AI assistant context consumption by ~95%.
 
 ### What It Replaces
 
 | Original Server/Plugin | Actions | Replaced By |
 |------------------------|---------|-------------|
-| unreal-blueprint-mcp + BlueprintReader | 6 | MonolithBlueprint |
+| unreal-blueprint-mcp + BlueprintReader | 46 | MonolithBlueprint |
 | unreal-material-mcp + MaterialMCPReader | 46 | MonolithMaterial |
 | unreal-animation-mcp + AnimationMCPReader | 62 | MonolithAnimation (62 actions) |
 | unreal-niagara-mcp + NiagaraMCPBridge | 70 | MonolithNiagara |
@@ -35,7 +35,7 @@ Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate M
 ```
 Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, settings, auto-updater
-  MonolithBlueprint     — Blueprint graph reading (6 actions)
+  MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile (46 actions)
   MonolithMaterial      — Material inspection + graph editing + CRUD (25 actions)
   MonolithAnimation     — Animation sequences, montages, ABPs, curves, notifies, skeletons, PoseSearch (62 actions)
   MonolithNiagara       — Niagara particle systems (41 actions)
@@ -111,12 +111,13 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers 6 blueprint actions |
+| `FMonolithBlueprintModule` | Registers 46 blueprint actions |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
-#### Actions (6 — namespace: "blueprint")
+#### Actions (46 — namespace: "blueprint")
 
+**Read Actions (13)**
 | Action | Params | Description |
 |--------|--------|-------------|
 | `list_graphs` | `asset_path` | List all graphs with name/type/node_count. Graph types: event_graph, function, macro, delegate_signature |
@@ -125,6 +126,66 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | `get_variables` | `asset_path` | All NewVariables: name, type (with container prefix), default (from CDO), category, flags (editable, read_only, expose_on_spawn, replicated, transient) |
 | `get_execution_flow` | `asset_path`, `entry_point` | Linearized exec trace from entry point. Handles branching (multiple exec outputs). MaxDepth=100 |
 | `search_nodes` | `asset_path`, `query` | Case-insensitive search by title, class name, or function name |
+| `get_components` | `asset_path` | List all components in the component hierarchy |
+| `get_component_details` | `asset_path`, `component_name` | Full property reflection for a named component |
+| `get_functions` | `asset_path` | List all functions with signatures, access, and purity flags |
+| `get_event_dispatchers` | `asset_path` | List all event dispatchers with parameter signatures |
+| `get_parent_class` | `asset_path` | Return the parent class of the Blueprint |
+| `get_interfaces` | `asset_path` | List all implemented interfaces |
+| `get_construction_script` | `asset_path` | Get the construction script graph |
+
+**Variable CRUD (7)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `add_variable` | `asset_path`, `variable_name`, `variable_type` | Add a new variable to the Blueprint |
+| `remove_variable` | `asset_path`, `variable_name` | Remove a variable by name |
+| `rename_variable` | `asset_path`, `old_name`, `new_name` | Rename a variable |
+| `set_variable_type` | `asset_path`, `variable_name`, `variable_type` | Change a variable's type |
+| `set_variable_defaults` | `asset_path`, `variable_name`, `default_value` | Set a variable's default value |
+| `add_local_variable` | `asset_path`, `function_name`, `variable_name`, `variable_type` | Add a local variable inside a function graph |
+| `remove_local_variable` | `asset_path`, `function_name`, `variable_name` | Remove a local variable from a function graph |
+
+**Component CRUD (6)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `add_component` | `asset_path`, `component_class`, `component_name` | Add a component to the Blueprint |
+| `remove_component` | `asset_path`, `component_name` | Remove a component by name |
+| `rename_component` | `asset_path`, `old_name`, `new_name` | Rename a component |
+| `reparent_component` | `asset_path`, `component_name`, `new_parent` | Change a component's parent in the hierarchy |
+| `set_component_property` | `asset_path`, `component_name`, `property_name`, `value` | Set a property on a component via reflection |
+| `duplicate_component` | `asset_path`, `component_name`, `new_name` | Duplicate a component with all its settings |
+
+**Graph Management (9)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `add_function` | `asset_path`, `function_name` | Add a new function graph |
+| `remove_function` | `asset_path`, `function_name` | Remove a function graph |
+| `rename_function` | `asset_path`, `old_name`, `new_name` | Rename a function graph |
+| `add_macro` | `asset_path`, `macro_name` | Add a new macro graph |
+| `add_event_dispatcher` | `asset_path`, `dispatcher_name` | Add a new event dispatcher |
+| `set_function_params` | `asset_path`, `function_name`, `params` | Set input/output parameters on a function |
+| `implement_interface` | `asset_path`, `interface_class` | Add an interface to the Blueprint |
+| `remove_interface` | `asset_path`, `interface_class` | Remove an interface from the Blueprint |
+| `reparent_blueprint` | `asset_path`, `new_parent_class` | Change the Blueprint's parent class |
+
+**Node & Pin Operations (6)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `add_node` | `asset_path`, `graph_name`, `node_class`, `position` | Add a node to a graph |
+| `remove_node` | `asset_path`, `graph_name`, `node_id` | Remove a node by ID |
+| `connect_pins` | `asset_path`, `graph_name`, `source_node`, `source_pin`, `target_node`, `target_pin` | Connect two pins |
+| `disconnect_pins` | `asset_path`, `graph_name`, `source_node`, `source_pin`, `target_node`, `target_pin` | Disconnect two pins |
+| `set_pin_default` | `asset_path`, `graph_name`, `node_id`, `pin_name`, `default_value` | Set a pin's default value |
+| `set_node_position` | `asset_path`, `graph_name`, `node_id`, `x`, `y` | Set a node's position in the graph |
+
+**Compile & Create (5)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `compile_blueprint` | `asset_path` | Compile the Blueprint and return errors/warnings |
+| `validate_blueprint` | `asset_path` | Validate Blueprint without full compile — checks for broken references and missing overrides |
+| `create_blueprint` | `save_path`, `parent_class` | Create a new Blueprint asset |
+| `duplicate_blueprint` | `asset_path`, `new_path` | Duplicate a Blueprint asset to a new path |
+| `get_dependencies` | `asset_path` | List all hard and soft asset dependencies |
 
 ---
 
@@ -589,12 +650,64 @@ All marked with "UE 5.7 FIX" comments:
 
 ---
 
-## 5. Skills (9 bundled)
+## 5. Offline CLI
+
+**Location:** `Saved/monolith_offline.py`
+**Dependencies:** Python stdlib only (sqlite3, argparse, json, re, pathlib) — no pip installs required
+**Python version:** 3.8+
+
+A companion CLI that queries `EngineSource.db` and `ProjectIndex.db` directly without the Unreal Editor running. Intended as a fallback when MCP is unavailable (editor down, CI environments, quick terminal lookups).
+
+**Scope:** Read/query operations only. Write operations require the editor and MCP.
+
+### Usage
+
+```
+python Saved/monolith_offline.py <namespace> <action> [args...]
+```
+
+### Namespaces and Actions
+
+**Source (9 actions)** — mirrors `source_query` MCP tool:
+
+| Action | Positional | Key Options | Description |
+|--------|-----------|-------------|-------------|
+| `search_source` | `query` | `--limit`, `--module`, `--kind` | FTS across symbols + source lines, BM25 ranked |
+| `read_source` | `symbol` | `--max-lines`, `--members-only`, `--no-header` | Source for a class/function/struct; FTS fallback on no exact match |
+| `find_references` | `symbol` | `--ref-kind`, `--limit` | All usage sites |
+| `find_callers` | `symbol` | `--limit` | Functions that call the given function |
+| `find_callees` | `symbol` | `--limit` | Functions called by the given function |
+| `get_class_hierarchy` | `symbol` | `--direction up\|down\|both`, `--depth` | Inheritance tree traversal |
+| `get_module_info` | `module_name` | — | File count, symbol counts by kind, key classes |
+| `get_symbol_context` | `symbol` | `--context-lines` | Definition with surrounding context |
+| `read_file` | `file_path` | `--start`, `--end` | Read source lines; resolves via absolute path → DB exact → DB suffix match |
+
+**Project (5 actions)** — mirrors `project_query` MCP tool:
+
+| Action | Positional | Key Options | Description |
+|--------|-----------|-------------|-------------|
+| `search` | `query` | `--limit` | FTS across assets FTS + nodes FTS, BM25 ranked |
+| `find_by_type` | `asset_class` | `--limit`, `--offset` | Filter assets by class with pagination |
+| `find_references` | `asset_path` | — | Bidirectional: depends_on + referenced_by |
+| `get_stats` | — | — | Row counts for all tables + top 20 asset class breakdown |
+| `get_asset_details` | `asset_path` | — | Nodes, variables, parameters for one asset |
+
+### Implementation Notes
+
+- Opens DBs with `PRAGMA query_only=ON` + `PRAGMA journal_mode=DELETE`. The DELETE journal mode override is mandatory — WAL mode silently returns 0 rows on Windows when opened in any read-only mode (same bug that affected the C++ module; see CLAUDE.md Key Lessons).
+- FTS escaping mirrors `EscapeFTS()` in C++: `::` replaced with space, non-word chars stripped, each token wrapped as `"token"*` for prefix match.
+- `read_source` defaults to `--header` (includes `.h` declarations). Pass `--no-header` to skip header files.
+- `read_file` with `--end 0` (default) reads 200 lines from `--start`.
+- Source output is plain text. Project output is JSON.
+
+---
+
+## 6. Skills (9 bundled)
 
 | Skill | Trigger Words | Entry Point | Actions |
 |-------|--------------|-------------|---------|
 | unreal-animation | animation, montage, ABP, blend space, notify, curves, compression, PoseSearch | `animation_query()` | 67 |
-| unreal-blueprints | Blueprint, BP, event graph, node, variable | `blueprint_query()` | 6 |
+| unreal-blueprints | Blueprint, BP, event graph, node, variable | `blueprint_query()` | 46 |
 | unreal-build | build, compile, Live Coding, hot reload, rebuild | `editor_query()` | 13 |
 | unreal-cpp | C++, header, include, UCLASS, Build.cs, linker error | `source_query()` + `config_query()` | 10+6 |
 | unreal-debugging | build error, crash, log, debug, stack trace | `editor_query()` | 13 |
@@ -607,7 +720,7 @@ All skills follow a common structure: YAML frontmatter, Discovery section, Asset
 
 ---
 
-## 6. Configuration
+## 7. Configuration
 
 **Settings location:** Editor Preferences > Plugins > Monolith
 **Config file:** `Config/MonolithSettings.ini` section `[/Script/MonolithCore.MonolithSettings]`
@@ -633,7 +746,7 @@ All skills follow a common structure: YAML frontmatter, Discovery section, Asset
 
 ---
 
-## 7. Templates
+## 8. Templates
 
 | File | Purpose |
 |------|---------|
@@ -642,7 +755,7 @@ All skills follow a common structure: YAML frontmatter, Discovery section, Asset
 
 ---
 
-## 8. File Structure
+## 9. File Structure
 
 ```
 YourProject/Plugins/Monolith/
@@ -691,11 +804,14 @@ YourProject/Plugins/Monolith/
     MonolithSource/                (8 source files)
   Saved/
     .gitkeep
+    monolith_offline.py              (Offline CLI — query DBs without the editor)
+    EngineSource.db                  (Engine source index, ~1.8GB — not in git)
+    ProjectIndex.db                  (Project asset index — not in git)
 ```
 
 ---
 
-## 9. Deployment
+## 10. Deployment
 
 ### Development & Release Workflow
 
@@ -737,7 +853,7 @@ This folder is both the working copy and the git repo (`git@github.com:tumourlov
 
 ---
 
-## 10. Known Issues & Workarounds
+## 11. Known Issues & Workarounds
 
 See `TODO.md` for the full list. Key architectural constraints:
 
@@ -747,12 +863,12 @@ See `TODO.md` for the full list. Key architectural constraints:
 
 ---
 
-## 11. Action Count Summary
+## 12. Action Count Summary
 
 | Module | Namespace | Actions |
 |--------|-----------|---------|
 | MonolithCore | monolith | 4 |
-| MonolithBlueprint | blueprint | 6 |
+| MonolithBlueprint | blueprint | 46 |
 | MonolithMaterial | material | 25 |
 | MonolithAnimation | animation | 62 |
 | MonolithNiagara | niagara | 41 |
@@ -760,6 +876,6 @@ See `TODO.md` for the full list. Key architectural constraints:
 | MonolithConfig | config | 6 |
 | MonolithIndex | project | 5 |
 | MonolithSource | source | 10 |
-| **Total** | | **172** |
+| **Total** | | **217** |
 
-**Note:** All skill files now correctly reflect the C++ action counts (172 total). The original Python server had higher counts (~231 tools) due to fragmented action design.
+**Note:** All skill files now correctly reflect the C++ action counts (217 total). The original Python server had higher counts (~231 tools) due to fragmented action design.

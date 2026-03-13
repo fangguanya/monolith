@@ -26,6 +26,14 @@
 		{
 			"Name": "EnhancedInput",
 			"Enabled": true
+		},
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		},
+		{
+			"Name": "PoseSearch",
+			"Enabled": true
 		}
 	],
 	"Modules": [

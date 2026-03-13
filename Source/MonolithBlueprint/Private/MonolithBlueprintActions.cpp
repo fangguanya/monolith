@@ -1,338 +1,13 @@
 #include "MonolithBlueprintActions.h"
+#include "MonolithBlueprintInternal.h"
 #include "MonolithJsonUtils.h"
-#include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
-#include "Engine/Blueprint.h"
-#include "EdGraph/EdGraph.h"
-#include "EdGraph/EdGraphNode.h"
-#include "EdGraph/EdGraphPin.h"
-#include "EdGraphSchema_K2.h"
-#include "K2Node_CallFunction.h"
-#include "K2Node_Event.h"
-#include "K2Node_IfThenElse.h"
-#include "K2Node_Variable.h"
-#include "K2Node_FunctionEntry.h"
-#include "K2Node_FunctionResult.h"
-#include "K2Node_MacroInstance.h"
-#include "EdGraphNode_Comment.h"
-#include "Dom/JsonObject.h"
-#include "Dom/JsonValue.h"
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
-
-// --- Internal helpers ---
-
-namespace MonolithBlueprintInternal
-{
-	void AddGraphArray(
-		TArray<TSharedPtr<FJsonValue>>& OutArr,
-		const TArray<TObjectPtr<UEdGraph>>& Graphs,
-		const FString& Type)
-	{
-		for (const auto& Graph : Graphs)
-		{
-			if (!Graph) continue;
-			TSharedPtr<FJsonObject> GObj = MakeShared<FJsonObject>();
-			GObj->SetStringField(TEXT("name"), Graph->GetName());
-			GObj->SetStringField(TEXT("type"), Type);
-			GObj->SetNumberField(TEXT("node_count"), Graph->Nodes.Num());
-			OutArr.Add(MakeShared<FJsonValueObject>(GObj));
-		}
-	}
-
-	UEdGraph* FindGraphByName(UBlueprint* BP, const FString& GraphName)
-	{
-		if (GraphName.IsEmpty() && BP->UbergraphPages.Num() > 0)
-		{
-			return BP->UbergraphPages[0];
-		}
-
-		auto SearchArray = [&](const TArray<TObjectPtr<UEdGraph>>& Arr) -> UEdGraph*
-		{
-			for (const auto& G : Arr)
-			{
-				if (G && G->GetName() == GraphName) return G;
-			}
-			return nullptr;
-		};
-
-		if (UEdGraph* G = SearchArray(BP->UbergraphPages)) return G;
-		if (UEdGraph* G = SearchArray(BP->FunctionGraphs)) return G;
-		if (UEdGraph* G = SearchArray(BP->MacroGraphs)) return G;
-		if (UEdGraph* G = SearchArray(BP->DelegateSignatureGraphs)) return G;
-		return nullptr;
-	}
-
-	FString PinTypeToString(const FEdGraphPinType& PinType)
-	{
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
-			return TEXT("exec");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean)
-			return TEXT("bool");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Int)
-			return TEXT("int");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Int64)
-			return TEXT("int64");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Real)
-			return PinType.PinSubCategory == TEXT("double") ? TEXT("double") : TEXT("float");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_String)
-			return TEXT("string");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Name)
-			return TEXT("name");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Text)
-			return TEXT("text");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Byte)
-			return TEXT("byte");
-
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Object ||
-			PinType.PinCategory == UEdGraphSchema_K2::PC_Class ||
-			PinType.PinCategory == UEdGraphSchema_K2::PC_SoftObject ||
-			PinType.PinCategory == UEdGraphSchema_K2::PC_SoftClass ||
-			PinType.PinCategory == UEdGraphSchema_K2::PC_Interface)
-		{
-			FString TypeName = PinType.PinCategory.ToString();
-			if (PinType.PinSubCategoryObject.IsValid())
-			{
-				TypeName += TEXT(":") + PinType.PinSubCategoryObject->GetName();
-			}
-			return TypeName;
-		}
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Struct)
-		{
-			if (PinType.PinSubCategoryObject.IsValid())
-			{
-				return TEXT("struct:") + PinType.PinSubCategoryObject->GetName();
-			}
-			return TEXT("struct");
-		}
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Enum)
-		{
-			if (PinType.PinSubCategoryObject.IsValid())
-			{
-				return TEXT("enum:") + PinType.PinSubCategoryObject->GetName();
-			}
-			return TEXT("enum");
-		}
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard)
-			return TEXT("wildcard");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_Delegate)
-			return TEXT("delegate");
-		if (PinType.PinCategory == UEdGraphSchema_K2::PC_MCDelegate)
-			return TEXT("multicast_delegate");
-
-		return PinType.PinCategory.ToString();
-	}
-
-	FString ContainerPrefix(const FEdGraphPinType& PinType)
-	{
-		switch (PinType.ContainerType)
-		{
-		case EPinContainerType::Array: return TEXT("array:");
-		case EPinContainerType::Set: return TEXT("set:");
-		case EPinContainerType::Map: return TEXT("map:");
-		default: return TEXT("");
-		}
-	}
-
-	TSharedPtr<FJsonObject> SerializePin(const UEdGraphPin* Pin)
-	{
-		TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
-		PinObj->SetStringField(TEXT("id"), Pin->PinId.ToString());
-		PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
-		PinObj->SetStringField(TEXT("direction"),
-			Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
-		PinObj->SetStringField(TEXT("type"),
-			ContainerPrefix(Pin->PinType) + PinTypeToString(Pin->PinType));
-
-		if (!Pin->DefaultValue.IsEmpty())
-		{
-			PinObj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
-		}
-		if (Pin->DefaultObject)
-		{
-			PinObj->SetStringField(TEXT("default_object"), Pin->DefaultObject->GetPathName());
-		}
-
-		TArray<TSharedPtr<FJsonValue>> ConnArr;
-		for (const UEdGraphPin* Linked : Pin->LinkedTo)
-		{
-			if (!Linked || !Linked->GetOwningNode()) continue;
-			FString ConnId = FString::Printf(TEXT("%s.%s"),
-				*Linked->GetOwningNode()->GetName(),
-				*Linked->PinName.ToString());
-			ConnArr.Add(MakeShared<FJsonValueString>(ConnId));
-		}
-		PinObj->SetArrayField(TEXT("connected_to"), ConnArr);
-		return PinObj;
-	}
-
-	TSharedPtr<FJsonObject> SerializeNode(UEdGraphNode* Node)
-	{
-		TSharedPtr<FJsonObject> NObj = MakeShared<FJsonObject>();
-		NObj->SetStringField(TEXT("id"), Node->GetName());
-		NObj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
-		NObj->SetStringField(TEXT("title"),
-			Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
-
-		TArray<TSharedPtr<FJsonValue>> PosArr;
-		PosArr.Add(MakeShared<FJsonValueNumber>(Node->NodePosX));
-		PosArr.Add(MakeShared<FJsonValueNumber>(Node->NodePosY));
-		NObj->SetArrayField(TEXT("pos"), PosArr);
-
-		if (!Node->NodeComment.IsEmpty())
-		{
-			NObj->SetStringField(TEXT("comment"), Node->NodeComment);
-		}
-
-		if (UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node))
-		{
-			NObj->SetStringField(TEXT("function"),
-				CallNode->FunctionReference.GetMemberName().ToString());
-			if (UClass* OwnerClass = CallNode->FunctionReference.GetMemberParentClass())
-			{
-				NObj->SetStringField(TEXT("function_class"), OwnerClass->GetName());
-			}
-		}
-		else if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
-		{
-			NObj->SetStringField(TEXT("event_name"),
-				EventNode->EventReference.GetMemberName().ToString());
-			if (EventNode->CustomFunctionName != NAME_None)
-			{
-				NObj->SetStringField(TEXT("custom_name"),
-					EventNode->CustomFunctionName.ToString());
-			}
-		}
-		else if (UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(Node))
-		{
-			if (MacroNode->GetMacroGraph())
-			{
-				NObj->SetStringField(TEXT("macro_name"),
-					MacroNode->GetMacroGraph()->GetName());
-			}
-		}
-
-		TArray<TSharedPtr<FJsonValue>> PinsArr;
-		for (const UEdGraphPin* Pin : Node->Pins)
-		{
-			if (!Pin || Pin->bHidden) continue;
-			PinsArr.Add(MakeShared<FJsonValueObject>(SerializePin(Pin)));
-		}
-		NObj->SetArrayField(TEXT("pins"), PinsArr);
-
-		return NObj;
-	}
-
-	TSharedPtr<FJsonObject> TraceExecFlow(
-		UEdGraphNode* Node,
-		TSet<UEdGraphNode*>& Visited,
-		int32 MaxDepth = 100)
-	{
-		if (!Node || Visited.Contains(Node) || MaxDepth <= 0)
-		{
-			return nullptr;
-		}
-		Visited.Add(Node);
-
-		TSharedPtr<FJsonObject> FlowObj = MakeShared<FJsonObject>();
-		FlowObj->SetStringField(TEXT("node"),
-			Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
-		FlowObj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
-
-		TArray<UEdGraphPin*> ExecOutputs;
-		for (UEdGraphPin* Pin : Node->Pins)
-		{
-			if (Pin && Pin->Direction == EGPD_Output &&
-				Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec &&
-				!Pin->bHidden)
-			{
-				ExecOutputs.Add(Pin);
-			}
-		}
-
-		if (ExecOutputs.Num() == 1 && ExecOutputs[0]->LinkedTo.Num() > 0)
-		{
-			TArray<TSharedPtr<FJsonValue>> ThenArr;
-			for (UEdGraphPin* Linked : ExecOutputs[0]->LinkedTo)
-			{
-				if (!Linked || !Linked->GetOwningNode()) continue;
-				TSharedPtr<FJsonObject> Next = TraceExecFlow(
-					Linked->GetOwningNode(), Visited, MaxDepth - 1);
-				if (Next)
-				{
-					ThenArr.Add(MakeShared<FJsonValueObject>(Next));
-				}
-			}
-			if (ThenArr.Num() > 0)
-			{
-				FlowObj->SetArrayField(TEXT("then"), ThenArr);
-			}
-		}
-		else if (ExecOutputs.Num() > 1)
-		{
-			TSharedPtr<FJsonObject> BranchesObj = MakeShared<FJsonObject>();
-			for (UEdGraphPin* ExecPin : ExecOutputs)
-			{
-				TArray<TSharedPtr<FJsonValue>> BranchArr;
-				for (UEdGraphPin* Linked : ExecPin->LinkedTo)
-				{
-					if (!Linked || !Linked->GetOwningNode()) continue;
-					TSet<UEdGraphNode*> BranchVisited = Visited;
-					TSharedPtr<FJsonObject> Next = TraceExecFlow(
-						Linked->GetOwningNode(), BranchVisited, MaxDepth - 1);
-					if (Next)
-					{
-						BranchArr.Add(MakeShared<FJsonValueObject>(Next));
-					}
-				}
-				BranchesObj->SetArrayField(ExecPin->PinName.ToString(), BranchArr);
-			}
-			FlowObj->SetObjectField(TEXT("branches"), BranchesObj);
-		}
-
-		return FlowObj;
-	}
-
-	UEdGraphNode* FindEntryNode(UEdGraph* Graph, const FString& EntryPoint)
-	{
-		// Pass 1: Check event and function entry nodes specifically
-		for (UEdGraphNode* Node : Graph->Nodes)
-		{
-			if (!Node) continue;
-			if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
-			{
-				FString EventName = EventNode->EventReference.GetMemberName().ToString();
-				if (EventName == EntryPoint || EventNode->GetName() == EntryPoint)
-					return Node;
-				if (EventNode->CustomFunctionName != NAME_None &&
-					EventNode->CustomFunctionName.ToString() == EntryPoint)
-					return Node;
-				FString DisplayTitle = EventNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
-				if (DisplayTitle.Contains(EntryPoint))
-					return Node;
-			}
-			if (UK2Node_FunctionEntry* FuncEntry = Cast<UK2Node_FunctionEntry>(Node))
-			{
-				if (Graph->GetName() == EntryPoint)
-					return Node;
-			}
-		}
-
-		// Pass 2: Fuzzy fallback — skip comments and already-checked types
-		for (UEdGraphNode* Node : Graph->Nodes)
-		{
-			if (!Node) continue;
-			if (Cast<UK2Node_Event>(Node) || Cast<UK2Node_FunctionEntry>(Node))
-				continue;
-			if (Cast<UEdGraphNode_Comment>(Node))
-				continue;
-			FString Title = Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
-			if (Title.Contains(EntryPoint))
-				return Node;
-		}
-		return nullptr;
-	}
-}
+#include "Engine/SimpleConstructionScript.h"
+#include "Engine/SCS_Node.h"
+#include "Components/SceneComponent.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 
 // --- Registration ---
 
@@ -386,18 +61,63 @@ void FMonolithBlueprintActions::RegisterActions()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
 			.Required(TEXT("query"), TEXT("string"), TEXT("Search string to match against node titles and function names"))
 			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_components"),
+		TEXT("Get component hierarchy for a Blueprint — names, classes, parent-child tree, attach sockets"),
+		FMonolithActionHandler::CreateStatic(&HandleGetComponents),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_component_details"),
+		TEXT("Get full property dump for a specific component in a Blueprint"),
+		FMonolithActionHandler::CreateStatic(&HandleGetComponentDetails),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Required(TEXT("component_name"), TEXT("string"), TEXT("Component variable name"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_functions"),
+		TEXT("Get all Blueprint-defined functions with inputs, outputs, metadata, and flags"),
+		FMonolithActionHandler::CreateStatic(&HandleGetFunctions),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_event_dispatchers"),
+		TEXT("Get all event dispatchers (multicast delegates) defined in a Blueprint with their signature pins"),
+		FMonolithActionHandler::CreateStatic(&HandleGetEventDispatchers),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_parent_class"),
+		TEXT("Get parent class info, Blueprint type, and class flags for a Blueprint"),
+		FMonolithActionHandler::CreateStatic(&HandleGetParentClass),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_interfaces"),
+		TEXT("Get all interfaces implemented by a Blueprint"),
+		FMonolithActionHandler::CreateStatic(&HandleGetInterfaces),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_construction_script"),
+		TEXT("Get all nodes in the Construction Script graph"),
+		FMonolithActionHandler::CreateStatic(&HandleGetConstructionScript),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Build());
 }
 
 // --- Shared helper ---
 
 UBlueprint* FMonolithBlueprintActions::LoadBlueprint(const TSharedPtr<FJsonObject>& Params, FString& OutAssetPath)
 {
-	OutAssetPath = Params->GetStringField(TEXT("asset_path"));
-	if (OutAssetPath.IsEmpty())
-	{
-		return nullptr;
-	}
-	return FMonolithAssetUtils::LoadAssetByPath<UBlueprint>(OutAssetPath);
+	return MonolithBlueprintInternal::LoadBlueprintFromParams(Params, OutAssetPath);
 }
 
 // --- list_graphs ---
@@ -771,6 +491,531 @@ FMonolithActionResult FMonolithBlueprintActions::HandleSearchNodes(const TShared
 	Root->SetStringField(TEXT("query"), Query);
 	Root->SetNumberField(TEXT("match_count"), Results.Num());
 	Root->SetArrayField(TEXT("results"), Results);
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// --- get_components ---
+
+namespace
+{
+	// Forward declaration for recursive serialization
+	TSharedPtr<FJsonObject> SerializeSCSNode(USCS_Node* Node);
+
+	TSharedPtr<FJsonObject> SerializeSCSNode(USCS_Node* Node)
+	{
+		if (!Node) return nullptr;
+
+		TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+
+		FString VarName = Node->GetVariableName().ToString();
+		Obj->SetStringField(TEXT("variable_name"), VarName);
+		Obj->SetStringField(TEXT("name"), VarName);
+
+		if (Node->ComponentClass)
+		{
+			Obj->SetStringField(TEXT("class"), Node->ComponentClass->GetName());
+			Obj->SetBoolField(TEXT("is_scene_component"),
+				Node->ComponentClass->IsChildOf(USceneComponent::StaticClass()));
+		}
+		else
+		{
+			Obj->SetStringField(TEXT("class"), TEXT("unknown"));
+			Obj->SetBoolField(TEXT("is_scene_component"), false);
+		}
+
+		Obj->SetBoolField(TEXT("is_root"), Node->IsRootNode());
+
+		FName AttachSocket = Node->AttachToName;
+		if (!AttachSocket.IsNone())
+		{
+			Obj->SetStringField(TEXT("attach_to"), AttachSocket.ToString());
+		}
+
+		// Serialize children recursively
+		TArray<TSharedPtr<FJsonValue>> ChildrenArr;
+		for (USCS_Node* Child : Node->GetChildNodes())
+		{
+			TSharedPtr<FJsonObject> ChildObj = SerializeSCSNode(Child);
+			if (ChildObj)
+			{
+				ChildrenArr.Add(MakeShared<FJsonValueObject>(ChildObj));
+			}
+		}
+		Obj->SetArrayField(TEXT("children"), ChildrenArr);
+
+		return Obj;
+	}
+} // anonymous namespace
+
+FMonolithActionResult FMonolithBlueprintActions::HandleGetComponents(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+
+	TArray<TSharedPtr<FJsonValue>> ComponentsArr;
+	int32 ComponentCount = 0;
+
+	USimpleConstructionScript* SCS = BP->SimpleConstructionScript;
+	if (SCS)
+	{
+		// Walk root nodes — each represents a top-level component
+		for (USCS_Node* RootNode : SCS->GetRootNodes())
+		{
+			if (!RootNode) continue;
+			TSharedPtr<FJsonObject> NodeObj = SerializeSCSNode(RootNode);
+			if (NodeObj)
+			{
+				ComponentsArr.Add(MakeShared<FJsonValueObject>(NodeObj));
+			}
+		}
+
+		// Count all nodes (flat) for the component_count field
+		TArray<USCS_Node*> AllNodes = SCS->GetAllNodes();
+		ComponentCount = AllNodes.Num();
+	}
+
+	// Also surface inherited native components from the parent class chain
+	TArray<TSharedPtr<FJsonValue>> NativeComponentsArr;
+	if (BP->ParentClass && BP->ParentClass->IsChildOf(AActor::StaticClass()))
+	{
+		AActor* CDO = Cast<AActor>(BP->ParentClass->GetDefaultObject(false));
+		if (CDO)
+		{
+			TArray<UActorComponent*> NativeComps;
+			CDO->GetComponents(NativeComps);
+			for (UActorComponent* Comp : NativeComps)
+			{
+				if (!Comp) continue;
+				TSharedPtr<FJsonObject> NObj = MakeShared<FJsonObject>();
+				NObj->SetStringField(TEXT("name"), Comp->GetName());
+				NObj->SetStringField(TEXT("variable_name"), Comp->GetName());
+				NObj->SetStringField(TEXT("class"), Comp->GetClass()->GetName());
+				NObj->SetBoolField(TEXT("is_scene_component"), Comp->IsA(USceneComponent::StaticClass()));
+				NObj->SetBoolField(TEXT("is_native"), true);
+
+				if (USceneComponent* SceneComp = Cast<USceneComponent>(Comp))
+				{
+					if (USceneComponent* AttachParent = SceneComp->GetAttachParent())
+					{
+						NObj->SetStringField(TEXT("parent"), AttachParent->GetName());
+					}
+					NObj->SetBoolField(TEXT("is_root"), SceneComp->GetAttachParent() == nullptr);
+				}
+				NativeComponentsArr.Add(MakeShared<FJsonValueObject>(NObj));
+			}
+		}
+	}
+
+	Root->SetArrayField(TEXT("components"), ComponentsArr);
+	Root->SetNumberField(TEXT("component_count"), ComponentCount);
+	if (NativeComponentsArr.Num() > 0)
+	{
+		Root->SetArrayField(TEXT("inherited_native_components"), NativeComponentsArr);
+	}
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// --- get_component_details ---
+
+FMonolithActionResult FMonolithBlueprintActions::HandleGetComponentDetails(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString ComponentName = Params->GetStringField(TEXT("component_name"));
+	if (ComponentName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: component_name"));
+	}
+
+	USimpleConstructionScript* SCS = BP->SimpleConstructionScript;
+	if (!SCS)
+	{
+		return FMonolithActionResult::Error(TEXT("Blueprint has no SimpleConstructionScript (not an Actor Blueprint?)"));
+	}
+
+	USCS_Node* Node = SCS->FindSCSNode(FName(*ComponentName));
+	if (!Node)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Component not found: %s"), *ComponentName));
+	}
+
+	UActorComponent* Template = Node->ComponentTemplate;
+	if (!Template)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Component template is null for: %s"), *ComponentName));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("component_name"), ComponentName);
+	Root->SetStringField(TEXT("class"), Template->GetClass()->GetName());
+	Root->SetBoolField(TEXT("is_scene_component"), Template->IsA(USceneComponent::StaticClass()));
+
+	// For USceneComponent, include transform explicitly
+	if (USceneComponent* SceneTemplate = Cast<USceneComponent>(Template))
+	{
+		TSharedPtr<FJsonObject> TransformObj = MakeShared<FJsonObject>();
+
+		FVector Loc = SceneTemplate->GetRelativeLocation();
+		TSharedPtr<FJsonObject> LocObj = MakeShared<FJsonObject>();
+		LocObj->SetNumberField(TEXT("x"), Loc.X);
+		LocObj->SetNumberField(TEXT("y"), Loc.Y);
+		LocObj->SetNumberField(TEXT("z"), Loc.Z);
+		TransformObj->SetObjectField(TEXT("relative_location"), LocObj);
+
+		FRotator Rot = SceneTemplate->GetRelativeRotation();
+		TSharedPtr<FJsonObject> RotObj = MakeShared<FJsonObject>();
+		RotObj->SetNumberField(TEXT("pitch"), Rot.Pitch);
+		RotObj->SetNumberField(TEXT("yaw"), Rot.Yaw);
+		RotObj->SetNumberField(TEXT("roll"), Rot.Roll);
+		TransformObj->SetObjectField(TEXT("relative_rotation"), RotObj);
+
+		FVector Scale = SceneTemplate->GetRelativeScale3D();
+		TSharedPtr<FJsonObject> ScaleObj = MakeShared<FJsonObject>();
+		ScaleObj->SetNumberField(TEXT("x"), Scale.X);
+		ScaleObj->SetNumberField(TEXT("y"), Scale.Y);
+		ScaleObj->SetNumberField(TEXT("z"), Scale.Z);
+		TransformObj->SetObjectField(TEXT("relative_scale"), ScaleObj);
+
+		Root->SetObjectField(TEXT("transform"), TransformObj);
+	}
+
+	// Iterate properties via reflection — include CPF_Edit or CPF_BlueprintVisible
+	TArray<TSharedPtr<FJsonValue>> PropsArr;
+	UClass* ComponentClass = Template->GetClass();
+
+	// Walk class hierarchy, stop at UActorComponent (don't dump UObject internals)
+	for (TFieldIterator<FProperty> PropIt(ComponentClass); PropIt; ++PropIt)
+	{
+		FProperty* Prop = *PropIt;
+		if (!Prop) continue;
+
+		// Only expose editor-visible or Blueprint-accessible properties
+		if (!(Prop->PropertyFlags & (CPF_Edit | CPF_BlueprintVisible))) continue;
+
+		// Skip properties that belong to UObject itself (too low-level / internal)
+		if (Prop->GetOwnerClass() == UObject::StaticClass()) continue;
+
+		FString ValueStr;
+		const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Template);
+		Prop->ExportTextItem_Direct(ValueStr, ValuePtr, nullptr, Template, PPF_None);
+
+		TSharedPtr<FJsonObject> PropObj = MakeShared<FJsonObject>();
+		PropObj->SetStringField(TEXT("name"), Prop->GetName());
+		PropObj->SetStringField(TEXT("type"), Prop->GetCPPType());
+		PropObj->SetStringField(TEXT("value"), ValueStr);
+
+		// Include the category metadata if present
+		FString Category = Prop->GetMetaData(TEXT("Category"));
+		if (!Category.IsEmpty())
+		{
+			PropObj->SetStringField(TEXT("category"), Category);
+		}
+
+		PropsArr.Add(MakeShared<FJsonValueObject>(PropObj));
+	}
+
+	Root->SetArrayField(TEXT("properties"), PropsArr);
+	Root->SetNumberField(TEXT("property_count"), PropsArr.Num());
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// --- get_functions ---
+
+FMonolithActionResult FMonolithBlueprintActions::HandleGetFunctions(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> FuncsArr;
+
+	for (UEdGraph* Graph : BP->FunctionGraphs)
+	{
+		if (!Graph) continue;
+
+		TSharedPtr<FJsonObject> FObj = MakeShared<FJsonObject>();
+		FObj->SetStringField(TEXT("name"), Graph->GetName());
+
+		// Find entry node for metadata and input pins
+		UK2Node_FunctionEntry* EntryNode = nullptr;
+		UK2Node_FunctionResult* ResultNode = nullptr;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!EntryNode) EntryNode = Cast<UK2Node_FunctionEntry>(Node);
+			if (!ResultNode) ResultNode = Cast<UK2Node_FunctionResult>(Node);
+			if (EntryNode && ResultNode) break;
+		}
+
+		// Flags from entry node metadata
+		if (EntryNode)
+		{
+			const uint32 ExtraFlags = EntryNode->GetFunctionFlags();
+			FObj->SetBoolField(TEXT("is_pure"), (ExtraFlags & FUNC_BlueprintPure) != 0);
+			FObj->SetBoolField(TEXT("is_const"), (ExtraFlags & FUNC_Const) != 0);
+			FObj->SetBoolField(TEXT("is_static"), (ExtraFlags & FUNC_Static) != 0);
+			FObj->SetBoolField(TEXT("call_in_editor"), EntryNode->MetaData.bCallInEditor);
+			FObj->SetStringField(TEXT("category"), EntryNode->MetaData.Category.ToString());
+			FObj->SetStringField(TEXT("description"), EntryNode->MetaData.ToolTip.ToString());
+			FObj->SetStringField(TEXT("access_specifier"),
+				(ExtraFlags & FUNC_Protected) ? TEXT("Protected") :
+				(ExtraFlags & FUNC_Private)   ? TEXT("Private")   : TEXT("Public"));
+
+			// Inputs: output pins on the entry node (excluding exec)
+			TArray<TSharedPtr<FJsonValue>> InputsArr;
+			for (const UEdGraphPin* Pin : EntryNode->Pins)
+			{
+				if (!Pin || Pin->bHidden) continue;
+				if (Pin->Direction != EGPD_Output) continue;
+				if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+				TSharedPtr<FJsonObject> PObj = MakeShared<FJsonObject>();
+				PObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+				PObj->SetStringField(TEXT("type"),
+					MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
+					MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+				InputsArr.Add(MakeShared<FJsonValueObject>(PObj));
+			}
+			FObj->SetArrayField(TEXT("inputs"), InputsArr);
+		}
+		else
+		{
+			FObj->SetBoolField(TEXT("is_pure"), false);
+			FObj->SetBoolField(TEXT("is_const"), false);
+			FObj->SetBoolField(TEXT("is_static"), false);
+			FObj->SetBoolField(TEXT("call_in_editor"), false);
+			FObj->SetStringField(TEXT("category"), TEXT(""));
+			FObj->SetStringField(TEXT("description"), TEXT(""));
+			FObj->SetStringField(TEXT("access_specifier"), TEXT("Public"));
+			FObj->SetArrayField(TEXT("inputs"), TArray<TSharedPtr<FJsonValue>>());
+		}
+
+		// Outputs: input pins on the result node (excluding exec)
+		TArray<TSharedPtr<FJsonValue>> OutputsArr;
+		if (ResultNode)
+		{
+			for (const UEdGraphPin* Pin : ResultNode->Pins)
+			{
+				if (!Pin || Pin->bHidden) continue;
+				if (Pin->Direction != EGPD_Input) continue;
+				if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+				TSharedPtr<FJsonObject> PObj = MakeShared<FJsonObject>();
+				PObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+				PObj->SetStringField(TEXT("type"),
+					MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
+					MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+				OutputsArr.Add(MakeShared<FJsonValueObject>(PObj));
+			}
+		}
+		FObj->SetArrayField(TEXT("outputs"), OutputsArr);
+
+		FuncsArr.Add(MakeShared<FJsonValueObject>(FObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetArrayField(TEXT("functions"), FuncsArr);
+	Root->SetNumberField(TEXT("function_count"), FuncsArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// --- get_event_dispatchers ---
+
+FMonolithActionResult FMonolithBlueprintActions::HandleGetEventDispatchers(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> DispatchersArr;
+
+	for (UEdGraph* Graph : BP->DelegateSignatureGraphs)
+	{
+		if (!Graph) continue;
+
+		TSharedPtr<FJsonObject> DObj = MakeShared<FJsonObject>();
+
+		// Strip the "_Signature" suffix that UE appends to delegate graph names
+		FString RawName = Graph->GetName();
+		FString DisplayName = RawName;
+		if (DisplayName.EndsWith(TEXT("_Signature")))
+		{
+			DisplayName.LeftChopInline(10, EAllowShrinking::No);
+		}
+		DObj->SetStringField(TEXT("name"), DisplayName);
+
+		// Signature pins from the entry node (excluding exec)
+		TArray<TSharedPtr<FJsonValue>> PinsArr;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			UK2Node_FunctionEntry* EntryNode = Cast<UK2Node_FunctionEntry>(Node);
+			if (!EntryNode) continue;
+
+			for (const UEdGraphPin* Pin : EntryNode->Pins)
+			{
+				if (!Pin || Pin->bHidden) continue;
+				if (Pin->Direction != EGPD_Output) continue;
+				if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+				TSharedPtr<FJsonObject> PObj = MakeShared<FJsonObject>();
+				PObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+				PObj->SetStringField(TEXT("type"),
+					MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
+					MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+				PinsArr.Add(MakeShared<FJsonValueObject>(PObj));
+			}
+			break; // only one entry node per graph
+		}
+		DObj->SetArrayField(TEXT("signature_pins"), PinsArr);
+		DispatchersArr.Add(MakeShared<FJsonValueObject>(DObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetArrayField(TEXT("event_dispatchers"), DispatchersArr);
+	Root->SetNumberField(TEXT("count"), DispatchersArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// --- get_parent_class ---
+
+FMonolithActionResult FMonolithBlueprintActions::HandleGetParentClass(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+
+	// Parent class info
+	if (BP->ParentClass)
+	{
+		TSharedPtr<FJsonObject> ParentObj = MakeShared<FJsonObject>();
+		ParentObj->SetStringField(TEXT("name"), BP->ParentClass->GetName());
+		ParentObj->SetStringField(TEXT("path"), BP->ParentClass->GetPathName());
+		Root->SetObjectField(TEXT("parent_class"), ParentObj);
+	}
+
+	// Blueprint type
+	FString BPTypeStr;
+	switch (BP->BlueprintType)
+	{
+	case BPTYPE_Normal:          BPTypeStr = TEXT("Normal"); break;
+	case BPTYPE_Const:           BPTypeStr = TEXT("Const"); break;
+	case BPTYPE_MacroLibrary:    BPTypeStr = TEXT("MacroLibrary"); break;
+	case BPTYPE_Interface:       BPTypeStr = TEXT("Interface"); break;
+	case BPTYPE_LevelScript:     BPTypeStr = TEXT("LevelScript"); break;
+	case BPTYPE_FunctionLibrary: BPTypeStr = TEXT("FunctionLibrary"); break;
+	default:                     BPTypeStr = TEXT("Normal"); break;
+	}
+	Root->SetStringField(TEXT("blueprint_type"), BPTypeStr);
+
+	// Status
+	FString StatusStr;
+	switch (BP->Status)
+	{
+	case BS_Unknown:       StatusStr = TEXT("Unknown"); break;
+	case BS_Dirty:         StatusStr = TEXT("Dirty"); break;
+	case BS_Error:         StatusStr = TEXT("Error"); break;
+	case BS_UpToDate:      StatusStr = TEXT("UpToDate"); break;
+	case BS_BeingCreated:  StatusStr = TEXT("BeingCreated"); break;
+	default:               StatusStr = TEXT("Unknown"); break;
+	}
+	Root->SetStringField(TEXT("status"), StatusStr);
+
+	// Generated class name
+	if (BP->GeneratedClass)
+	{
+		Root->SetStringField(TEXT("generated_class_name"), BP->GeneratedClass->GetName());
+	}
+
+	// Flags
+	Root->SetBoolField(TEXT("is_data_only"), FBlueprintEditorUtils::IsDataOnlyBlueprint(BP));
+	Root->SetBoolField(TEXT("is_actor_based"), FBlueprintEditorUtils::IsActorBased(BP));
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// --- get_interfaces ---
+
+FMonolithActionResult FMonolithBlueprintActions::HandleGetInterfaces(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> InterfacesArr;
+
+	for (const FBPInterfaceDescription& Iface : BP->ImplementedInterfaces)
+	{
+		if (!Iface.Interface) continue;
+
+		TSharedPtr<FJsonObject> IObj = MakeShared<FJsonObject>();
+		TSharedPtr<FJsonObject> ClassObj = MakeShared<FJsonObject>();
+		ClassObj->SetStringField(TEXT("name"), Iface.Interface->GetName());
+		ClassObj->SetStringField(TEXT("path"), Iface.Interface->GetPathName());
+		IObj->SetObjectField(TEXT("interface_class"), ClassObj);
+		IObj->SetBoolField(TEXT("is_inherited"), false);
+		InterfacesArr.Add(MakeShared<FJsonValueObject>(IObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetArrayField(TEXT("interfaces"), InterfacesArr);
+	Root->SetNumberField(TEXT("count"), InterfacesArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// --- get_construction_script ---
+
+FMonolithActionResult FMonolithBlueprintActions::HandleGetConstructionScript(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	UEdGraph* CSGraph = FBlueprintEditorUtils::FindUserConstructionScript(BP);
+	if (!CSGraph)
+	{
+		return FMonolithActionResult::Error(TEXT("No Construction Script found (Blueprint may not have one)"));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("graph_name"), CSGraph->GetName());
+	Root->SetStringField(TEXT("graph_type"), TEXT("construction_script"));
+
+	TArray<TSharedPtr<FJsonValue>> NodesArr;
+	for (UEdGraphNode* Node : CSGraph->Nodes)
+	{
+		if (!Node) continue;
+		NodesArr.Add(MakeShared<FJsonValueObject>(MonolithBlueprintInternal::SerializeNode(Node)));
+	}
+	Root->SetArrayField(TEXT("nodes"), NodesArr);
+	Root->SetNumberField(TEXT("node_count"), NodesArr.Num());
 
 	return FMonolithActionResult::Success(Root);
 }
