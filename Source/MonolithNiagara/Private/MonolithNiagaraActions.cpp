@@ -374,48 +374,61 @@ namespace MonolithNiagaraHelpers
 		}
 		else if (UNiagaraDataInterfaceColorCurve* ColorCurve = Cast<UNiagaraDataInterfaceColorCurve>(DI))
 		{
-			bool bAny = false;
 			TArray<TSharedPtr<FJsonValue>> R = GetKeysArray(TEXT("red"));
 			TArray<TSharedPtr<FJsonValue>> G = GetKeysArray(TEXT("green"));
 			TArray<TSharedPtr<FJsonValue>> B = GetKeysArray(TEXT("blue"));
 			TArray<TSharedPtr<FJsonValue>> A = GetKeysArray(TEXT("alpha"));
-			if (R.Num() > 0) { ParseKeysIntoCurve(ColorCurve->RedCurve, R); bAny = true; }
-			if (G.Num() > 0) { ParseKeysIntoCurve(ColorCurve->GreenCurve, G); bAny = true; }
-			if (B.Num() > 0) { ParseKeysIntoCurve(ColorCurve->BlueCurve, B); bAny = true; }
-			if (A.Num() > 0) { ParseKeysIntoCurve(ColorCurve->AlphaCurve, A); bAny = true; }
+			bool bAny = R.Num() > 0 || G.Num() > 0 || B.Num() > 0 || A.Num() > 0;
+			if (bAny)
+			{
+				// Full replace: specified channels get new keys, unspecified channels are cleared
+				if (R.Num() > 0) ParseKeysIntoCurve(ColorCurve->RedCurve, R); else ColorCurve->RedCurve.Reset();
+				if (G.Num() > 0) ParseKeysIntoCurve(ColorCurve->GreenCurve, G); else ColorCurve->GreenCurve.Reset();
+				if (B.Num() > 0) ParseKeysIntoCurve(ColorCurve->BlueCurve, B); else ColorCurve->BlueCurve.Reset();
+				if (A.Num() > 0) ParseKeysIntoCurve(ColorCurve->AlphaCurve, A); else ColorCurve->AlphaCurve.Reset();
+			}
 			return bAny;
 		}
 		else if (UNiagaraDataInterfaceVector2DCurve* Vec2Curve = Cast<UNiagaraDataInterfaceVector2DCurve>(DI))
 		{
-			bool bAny = false;
 			TArray<TSharedPtr<FJsonValue>> X = GetKeysArray(TEXT("x"));
 			TArray<TSharedPtr<FJsonValue>> Y = GetKeysArray(TEXT("y"));
-			if (X.Num() > 0) { ParseKeysIntoCurve(Vec2Curve->XCurve, X); bAny = true; }
-			if (Y.Num() > 0) { ParseKeysIntoCurve(Vec2Curve->YCurve, Y); bAny = true; }
+			bool bAny = X.Num() > 0 || Y.Num() > 0;
+			if (bAny)
+			{
+				if (X.Num() > 0) ParseKeysIntoCurve(Vec2Curve->XCurve, X); else Vec2Curve->XCurve.Reset();
+				if (Y.Num() > 0) ParseKeysIntoCurve(Vec2Curve->YCurve, Y); else Vec2Curve->YCurve.Reset();
+			}
 			return bAny;
 		}
 		else if (UNiagaraDataInterfaceVectorCurve* Vec3Curve = Cast<UNiagaraDataInterfaceVectorCurve>(DI))
 		{
-			bool bAny = false;
 			TArray<TSharedPtr<FJsonValue>> X = GetKeysArray(TEXT("x"));
 			TArray<TSharedPtr<FJsonValue>> Y = GetKeysArray(TEXT("y"));
 			TArray<TSharedPtr<FJsonValue>> Z = GetKeysArray(TEXT("z"));
-			if (X.Num() > 0) { ParseKeysIntoCurve(Vec3Curve->XCurve, X); bAny = true; }
-			if (Y.Num() > 0) { ParseKeysIntoCurve(Vec3Curve->YCurve, Y); bAny = true; }
-			if (Z.Num() > 0) { ParseKeysIntoCurve(Vec3Curve->ZCurve, Z); bAny = true; }
+			bool bAny = X.Num() > 0 || Y.Num() > 0 || Z.Num() > 0;
+			if (bAny)
+			{
+				if (X.Num() > 0) ParseKeysIntoCurve(Vec3Curve->XCurve, X); else Vec3Curve->XCurve.Reset();
+				if (Y.Num() > 0) ParseKeysIntoCurve(Vec3Curve->YCurve, Y); else Vec3Curve->YCurve.Reset();
+				if (Z.Num() > 0) ParseKeysIntoCurve(Vec3Curve->ZCurve, Z); else Vec3Curve->ZCurve.Reset();
+			}
 			return bAny;
 		}
 		else if (UNiagaraDataInterfaceVector4Curve* Vec4Curve = Cast<UNiagaraDataInterfaceVector4Curve>(DI))
 		{
-			bool bAny = false;
 			TArray<TSharedPtr<FJsonValue>> X = GetKeysArray(TEXT("x"));
 			TArray<TSharedPtr<FJsonValue>> Y = GetKeysArray(TEXT("y"));
 			TArray<TSharedPtr<FJsonValue>> Z = GetKeysArray(TEXT("z"));
 			TArray<TSharedPtr<FJsonValue>> W = GetKeysArray(TEXT("w"));
-			if (X.Num() > 0) { ParseKeysIntoCurve(Vec4Curve->XCurve, X); bAny = true; }
-			if (Y.Num() > 0) { ParseKeysIntoCurve(Vec4Curve->YCurve, Y); bAny = true; }
-			if (Z.Num() > 0) { ParseKeysIntoCurve(Vec4Curve->ZCurve, Z); bAny = true; }
-			if (W.Num() > 0) { ParseKeysIntoCurve(Vec4Curve->WCurve, W); bAny = true; }
+			bool bAny = X.Num() > 0 || Y.Num() > 0 || Z.Num() > 0 || W.Num() > 0;
+			if (bAny)
+			{
+				if (X.Num() > 0) ParseKeysIntoCurve(Vec4Curve->XCurve, X); else Vec4Curve->XCurve.Reset();
+				if (Y.Num() > 0) ParseKeysIntoCurve(Vec4Curve->YCurve, Y); else Vec4Curve->YCurve.Reset();
+				if (Z.Num() > 0) ParseKeysIntoCurve(Vec4Curve->ZCurve, Z); else Vec4Curve->ZCurve.Reset();
+				if (W.Num() > 0) ParseKeysIntoCurve(Vec4Curve->WCurve, W); else Vec4Curve->WCurve.Reset();
+			}
 			return bAny;
 		}
 		return false;
@@ -709,9 +722,15 @@ UClass* FMonolithNiagaraActions::ResolveRendererClass(const FString& RendererCla
 	if (L == TEXT("light") || L == TEXT("lightrenderer")) return UNiagaraLightRendererProperties::StaticClass();
 	if (L == TEXT("component") || L == TEXT("componentrenderer")) return UNiagaraComponentRendererProperties::StaticClass();
 
-	FString Full = RendererClass;
-	if (!Full.StartsWith(TEXT("UNiagara"))) Full = TEXT("UNiagara") + Full;
-	if (!Full.EndsWith(TEXT("RendererProperties"))) Full += TEXT("RendererProperties");
+	// Normalize to bare segment (e.g. "Sprite", "Mesh"), then rebuild full class name.
+	// Handles all input forms: "Sprite", "SpriteRenderer", "NiagaraSpriteRendererProperties",
+	// "UNiagaraSpriteRendererProperties" — all produce "UNiagaraSpriteRendererProperties".
+	FString Seg = RendererClass;
+	if (Seg.StartsWith(TEXT("UNiagara"))) Seg = Seg.Mid(8);
+	else if (Seg.StartsWith(TEXT("Niagara"))) Seg = Seg.Mid(7);
+	if (Seg.EndsWith(TEXT("RendererProperties"))) Seg = Seg.LeftChop(18);
+	else if (Seg.EndsWith(TEXT("Renderer"))) Seg = Seg.LeftChop(8);
+	FString Full = TEXT("UNiagara") + Seg + TEXT("RendererProperties");
 	UClass* C = FindFirstObject<UClass>(*Full, EFindFirstObjectOptions::NativeFirst);
 	if (!C) C = FindFirstObject<UClass>(*Full.Mid(1), EFindFirstObjectOptions::NativeFirst);
 	// Never return the abstract base class — instantiating it triggers a pure-virtual crash in CreateBoundsCalculator
@@ -1479,21 +1498,31 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetEmitterProperty(const TS
 	{
 		FString V = JV->AsString();
 		ENiagaraSimTarget NewTarget = ED->SimTarget;
-		if (V == TEXT("CPU") || V == TEXT("CPUSim")) { NewTarget = ENiagaraSimTarget::CPUSim; bOk = true; }
-		else if (V == TEXT("GPU") || V == TEXT("GPUComputeSim")) { NewTarget = ENiagaraSimTarget::GPUComputeSim; bOk = true; }
+		if (V.Equals(TEXT("CPU"), ESearchCase::IgnoreCase) || V.Equals(TEXT("CPUSim"), ESearchCase::IgnoreCase))
+			{ NewTarget = ENiagaraSimTarget::CPUSim; bOk = true; }
+		else if (V.Equals(TEXT("GPU"), ESearchCase::IgnoreCase) || V.Equals(TEXT("GPUComputeSim"), ESearchCase::IgnoreCase))
+			{ NewTarget = ENiagaraSimTarget::GPUComputeSim; bOk = true; }
 
-		if (bOk && NewTarget != ED->SimTarget)
+		if (!bOk)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("SimTarget: invalid value '%s'. Accepted: CPU, CPUSim, GPU, GPUComputeSim"), *V));
+		}
+
+		if (NewTarget != ED->SimTarget)
 		{
 			FNiagaraEmitterHandle& Handle = System->GetEmitterHandles()[Index];
+			FProperty* SimTargetProp = FindFProperty<FProperty>(
+				FVersionedNiagaraEmitterData::StaticStruct(),
+				GET_MEMBER_NAME_CHECKED(FVersionedNiagaraEmitterData, SimTarget));
+
+			// PreEditChange before modifying (matches engine's SNiagaraSimTargetToggle pattern)
+			Handle.GetInstance().Emitter->PreEditChange(SimTargetProp);
 			Handle.GetInstance().Emitter->Modify();
 			ED->SimTarget = NewTarget;
 
 			// Fire PostEditChangeVersionedProperty so the graph source is marked dirty.
-			// Without this, RequestCompile sees unchanged hash and skips compilation,
-			// leaving VM scripts with zero bytecode ("Data missing please force a recompile").
-			FProperty* SimTargetProp = FindFProperty<FProperty>(
-				FVersionedNiagaraEmitterData::StaticStruct(),
-				GET_MEMBER_NAME_CHECKED(FVersionedNiagaraEmitterData, SimTarget));
 			FPropertyChangedEvent PCE(SimTargetProp);
 			Handle.GetInstance().Emitter->PostEditChangeVersionedProperty(PCE, Handle.GetInstance().Version);
 
@@ -1792,6 +1821,39 @@ FMonolithActionResult FMonolithNiagaraActions::HandleGetModuleInputs(const TShar
 		}
 		Arr.Add(MakeShared<FJsonValueObject>(IO));
 	}
+
+	// Enumerate static switch inputs (separate engine API — not part of ParameterMap traversal)
+	{
+		TArray<UEdGraphPin*> StaticSwitchPins;
+		TSet<UEdGraphPin*> HiddenSwitchPins;
+		if (EmitterIdx != INDEX_NONE)
+		{
+			FVersionedNiagaraEmitter VE = System->GetEmitterHandles()[EmitterIdx].GetInstance();
+			FCompileConstantResolver Resolver(VE, FoundUsage);
+			FNiagaraStackGraphUtilities::GetStackFunctionStaticSwitchPins(
+				*ModuleNode, StaticSwitchPins, HiddenSwitchPins, Resolver);
+		}
+		else
+		{
+			FCompileConstantResolver Resolver(System, FoundUsage);
+			FNiagaraStackGraphUtilities::GetStackFunctionStaticSwitchPins(
+				*ModuleNode, StaticSwitchPins, HiddenSwitchPins, Resolver);
+		}
+		const UEdGraphSchema_Niagara* SwitchSchema = GetDefault<UEdGraphSchema_Niagara>();
+		for (UEdGraphPin* SwitchPin : StaticSwitchPins)
+		{
+			TSharedRef<FJsonObject> IO = MakeShared<FJsonObject>();
+			IO->SetStringField(TEXT("name"), SwitchPin->GetFName().ToString());
+			FNiagaraTypeDefinition PinType = SwitchSchema->PinToTypeDefinition(SwitchPin);
+			IO->SetStringField(TEXT("type"), PinType.GetName());
+			IO->SetStringField(TEXT("override_value"), SwitchPin->DefaultValue);
+			IO->SetBoolField(TEXT("has_override"), true);
+			IO->SetBoolField(TEXT("is_static_switch"), true);
+			IO->SetBoolField(TEXT("is_hidden"), HiddenSwitchPins.Contains(SwitchPin));
+			Arr.Add(MakeShared<FJsonValueObject>(IO));
+		}
+	}
+
 	return SuccessStr(JsonArrayToString(Arr));
 }
 
@@ -2470,30 +2532,97 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputDI(const TSha
 			TEXT("Input '%s' is a static switch and cannot accept a DataInterface. Use set_module_input_value instead."), *InputName));
 	}
 
-	// Guard: engine asserts the pin has no existing links — break them first
+	// Three-path approach to avoid orphaned nodes (which cause Module.X001 duplicates):
+	// Path A: Pin already linked to a DI node with matching class → reuse existing DI (true update-in-place)
+	// Path B: Pin linked to wrong type → remove old node + create new
+	// Path C: No existing link → create new (first-time set)
+	UNiagaraDataInterface* DIInst = nullptr;
 	if (OP.LinkedTo.Num() > 0)
 	{
-		OP.BreakAllPinLinks();
+		UNiagaraNodeInput* ExistingInputNode = Cast<UNiagaraNodeInput>(OP.LinkedTo[0]->GetOwningNode());
+		if (ExistingInputNode)
+		{
+			// Access DI via UProperty reflection (GetDataInterface() not exported)
+			FObjectProperty* DIProp = FindFProperty<FObjectProperty>(ExistingInputNode->GetClass(), TEXT("DataInterface"));
+			UNiagaraDataInterface* ExistingDI = DIProp
+				? Cast<UNiagaraDataInterface>(DIProp->GetObjectPropertyValue(DIProp->ContainerPtrToValuePtr<void>(ExistingInputNode)))
+				: nullptr;
+
+			if (ExistingDI && ExistingDI->GetClass() == DIUClass)
+			{
+				// Path A: reuse existing DI — no new node needed
+				DIInst = ExistingDI;
+			}
+			else
+			{
+				// Path B: wrong DI type — remove old node from graph, then create fresh
+				UEdGraph* Graph = ExistingInputNode->GetGraph();
+				Graph->Modify();
+				OP.BreakAllPinLinks();
+				Graph->RemoveNode(ExistingInputNode);
+			}
+		}
+		else
+		{
+			// Non-InputNode link — just break it
+			OP.BreakAllPinLinks();
+		}
 	}
 
-	UNiagaraDataInterface* DIInst = nullptr;
-	FNiagaraStackGraphUtilities::SetDataInterfaceValueForFunctionInput(OP, DIUClass, InputName, DIInst);
+	// Path B/C: create new DI node if we didn't reuse an existing one
+	if (!DIInst)
+	{
+		FNiagaraStackGraphUtilities::SetDataInterfaceValueForFunctionInput(OP, DIUClass, InputName, DIInst);
+	}
 
+	bool bCurveConfigApplied = false;
 	if (DIInst && DIConfig.IsValid())
 	{
+		// Clear CurveAsset reference if present — external curve assets override inline keys
+		if (UNiagaraDataInterfaceCurveBase* CurveBase = Cast<UNiagaraDataInterfaceCurveBase>(DIInst))
+		{
+			FObjectProperty* CurveAssetProp = FindFProperty<FObjectProperty>(CurveBase->GetClass(), TEXT("CurveAsset"));
+			if (CurveAssetProp)
+			{
+				CurveAssetProp->SetObjectPropertyValue(CurveAssetProp->ContainerPtrToValuePtr<void>(CurveBase), nullptr);
+			}
+		}
+
 		// Try curve-specific config first (handles keys, red/green/blue/alpha, x/y/z/w)
 		bool bCurveApplied = MonolithNiagaraHelpers::ApplyCurveConfig(DIInst, DIConfig);
+		bCurveConfigApplied = bCurveApplied;
 
-		// Fall back to simple property reflection for non-curve properties
-		for (auto& Pair : DIConfig->Values)
+		// Check if config had curve-like fields that ApplyCurveConfig didn't handle
+		if (!bCurveApplied)
 		{
-			// Skip curve-specific keys that were already handled
-			static const TSet<FString> CurveKeys = {
+			static const TSet<FString> CurveFieldNames = {
 				TEXT("keys"), TEXT("curve"),
 				TEXT("red"), TEXT("green"), TEXT("blue"), TEXT("alpha"),
 				TEXT("x"), TEXT("y"), TEXT("z"), TEXT("w")
 			};
-			if (CurveKeys.Contains(Pair.Key)) continue;
+			bool bHadCurveFields = false;
+			for (const auto& Pair : DIConfig->Values)
+			{
+				if (CurveFieldNames.Contains(Pair.Key)) { bHadCurveFields = true; break; }
+			}
+			if (bHadCurveFields)
+			{
+				UE_LOG(LogMonolithNiagara, Warning, TEXT("set_module_input_di: config had curve fields but DI type '%s' didn't match any known curve DI. Curve keys were NOT applied."), *DIUClass->GetName());
+			}
+		}
+
+		// Fall back to simple property reflection for non-curve properties
+		// Only skip curve field names if the DI is actually a curve type — non-curve DIs
+		// might legitimately have properties named "x", "y", "red", etc.
+		const bool bIsCurveDI = Cast<UNiagaraDataInterfaceCurveBase>(DIInst) != nullptr;
+		static const TSet<FString> CurveKeys = {
+			TEXT("keys"), TEXT("curve"),
+			TEXT("red"), TEXT("green"), TEXT("blue"), TEXT("alpha"),
+			TEXT("x"), TEXT("y"), TEXT("z"), TEXT("w")
+		};
+		for (auto& Pair : DIConfig->Values)
+		{
+			if (bIsCurveDI && CurveKeys.Contains(Pair.Key)) continue;
 
 			FProperty* Prop = DIUClass->FindPropertyByName(FName(*Pair.Key));
 			if (!Prop) continue;
@@ -2519,7 +2648,14 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputDI(const TSha
 	GEditor->EndTransaction();
 	System->RequestCompile(false);
 
-	return SuccessStr(TEXT("DI set on module input"));
+	// Build a descriptive success message
+	if (DIConfig.IsValid() && DIConfig->Values.Num() > 0)
+	{
+		return SuccessStr(FString::Printf(TEXT("DI '%s' set on input '%s'%s"),
+			*DIUClass->GetName(), *InputName,
+			bCurveConfigApplied ? TEXT(" (curve config applied)") : TEXT(" (config applied, no curve keys matched)")));
+	}
+	return SuccessStr(FString::Printf(TEXT("DI '%s' set on input '%s'"), *DIUClass->GetName(), *InputName));
 }
 
 FMonolithActionResult FMonolithNiagaraActions::CreateScriptFromHLSL(const TSharedPtr<FJsonObject>& Params, ENiagaraScriptUsage Usage)
