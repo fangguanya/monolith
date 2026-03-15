@@ -6,6 +6,46 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-03-15
+
+Native C++ source indexer, marketplace plugin content indexing, CDO property reader, and project C++ source indexing. Community PRs from NRG-Nad. 219 → 220 actions total.
+
+### Added
+
+**Source — Native C++ indexer (replaces Python/tree-sitter)**
+
+- **MonolithSource** — Completely rewrote the source indexer in native C++ (4,119 lines). Eliminates the Python/tree-sitter dependency entirely — engine source indexing now works out of the box with no Python install. Two indexing modes: full (entire engine source tree) and incremental (project C++ source only, much faster).
+- **MonolithSource** — New `MonolithQueryCommandlet` for offline source queries from the command line, without launching the full editor.
+- **MonolithSource** — New `trigger_project_reindex` action: triggers an incremental re-index of project C++ source from within an MCP session. **220 total actions.**
+
+**Index — Marketplace plugin content**
+
+- **MonolithIndex** — Auto-discovers installed marketplace and Fab plugins via `IPluginManager` and indexes their content alongside project assets. Opt out per-plugin or globally with the new `bIndexMarketplacePlugins` toggle in plugin settings.
+
+**Index — Configurable content paths**
+
+- **MonolithIndex** — `AdditionalContentPaths` setting: add arbitrary content paths (e.g. external asset packs, shared libraries) to the project index. `GetIndexedContentPaths()` and `IsIndexedContentPath()` helpers available for tools that need path-aware filtering.
+
+**Blueprint — CDO property reader (#5)**
+
+- **MonolithBlueprint** — New `get_cdo_properties` action: reads `UPROPERTY` defaults from any Blueprint CDO or `UObject` asset. Works on any class with a valid CDO. Credit: **NRG-Nad** ([#5](https://github.com/tumourlove/monolith/pull/5)).
+- **MonolithIndex** — New `FDataAssetIndexer`: deep-indexes DataAsset subclasses. 15 registered indexers total (up from 14). `bIndexDataAssets` toggle in plugin settings. Credit: **NRG-Nad** ([#5](https://github.com/tumourlove/monolith/pull/5)).
+
+**Source — Project C++ source indexing (#6)**
+
+- **MonolithSource** — `Scripts/index_project.py`: indexes project C++ source into `EngineSource.db` alongside engine symbols, enabling `find_callers`/`find_callees`/`get_class_hierarchy` across project code. Incremental pipeline with `_finalize()` and `load_existing_symbols()` — only changed files are reprocessed. Source DB grows from ~1.8 GB (engine only) to ~3.4 GB with a full project. Credit: **NRG-Nad** ([#6](https://github.com/tumourlove/monolith/pull/6)).
+
+### Fixed
+
+- **MonolithSource** — Improved error handling and recovery throughout the source indexer pipeline.
+- **MonolithNiagara** — Resolved 5 bugs in DI handling, static switch inputs, SimTarget changes, and renderer class naming.
+
+### Changed
+
+- **MonolithSource** — Source indexer no longer requires Python. The C++ indexer runs natively inside the editor on startup. Python (`index_project.py`) is still available for project C++ source indexing as a separate optional step.
+- **MonolithBlueprint** — Action count 46 → 47 (`get_cdo_properties`).
+- **Total** — Action count 219 → 220 (`trigger_project_reindex`).
+
 ## [0.7.3] - 2026-03-15
 
 Blueprint module fully realized (6 → 46 actions). Niagara HLSL module creation implemented. Major Niagara, Material, and MCP reliability fixes across all modules. 217 → 218 actions total.

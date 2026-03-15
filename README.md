@@ -1,6 +1,6 @@
 # Monolith
 
-**One plugin. Every Unreal domain. Zero Python bridges.**
+**One plugin. Every Unreal domain. Zero dependencies.**
 
 [![UE 5.7+](https://img.shields.io/badge/Unreal-5.7%2B-blue)](https://unrealengine.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -18,21 +18,21 @@ It works with **Claude Code**, **Cursor**, or any MCP-compatible client. If your
 
 ## Why Monolith?
 
-Most MCP integrations register every action as a separate tool, which floods the AI's context window with tool descriptions. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists what's available. This keeps the tool list small (12 tools) while still exposing 218 actions across nine domains.
+Most MCP integrations register every action as a separate tool, which floods the AI's context window with tool descriptions. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists what's available. This keeps the tool list small (12 tools) while still exposing 220 actions across nine domains.
 
 ## Features
 
-- **Full Blueprint read/write/CRUD** — Create Blueprints, edit variables/components/functions/nodes, compile and validate
+- **Full Blueprint read/write/CRUD** — Create Blueprints, edit variables/components/functions/nodes, compile and validate. Read CDO properties from any Blueprint or DataAsset.
 - **Material graph editing** — Read, build, and validate material graphs with preview support
 - **Animation coverage** — Montages, blend spaces, ABP state machines, skeletons, bone tracks
 - **Niagara particle systems** — Create and edit systems, emitters, modules, parameters, renderers, and HLSL
 - **Editor integration** — Build triggers, log capture, compile output, crash context, Live Coding support
 - **Config management** — INI resolution, diff, search, and explain
-- **Deep project search** — SQLite FTS5 full-text search across all indexed assets
-- **Engine source intelligence** — Tree-sitter C++ parsing of the UE source tree with call graphs and class hierarchy
+- **Deep project search** — SQLite FTS5 full-text search across all indexed assets, including marketplace and Fab plugin content. Configurable additional content paths.
+- **Engine source intelligence** — Native C++ indexer (no Python required) with call graphs, class hierarchy, and cross-references. Optional project C++ source indexing for richer results.
 - **Auto-updater** — Checks GitHub Releases on editor startup, one-click update
 - **Claude Code skills** — Domain-specific workflow guides bundled with the plugin
-- **Pure C++** — Direct UE API access, embedded Streamable HTTP server
+- **Pure C++** — Direct UE API access, embedded Streamable HTTP server, zero external dependencies
 
 ---
 
@@ -45,7 +45,7 @@ Most MCP integrations register every action as a separate tool, which floods the
 > **Platform:** Windows only. Mac and Linux support is coming soon.
 
 - **Claude Code, Cursor, or another MCP client** — Any tool that supports the Model Context Protocol
-- **(Optional) Python 3.10+** — Only needed if you want engine source code lookups
+- **(Optional) Python 3.10+** — Only needed if you want to index your own project's C++ source into the source database. Engine source indexing is built-in and requires no Python.
 
 ### Step 1: Download Monolith
 
@@ -145,14 +145,16 @@ If you see `Monolith MCP server listening on port 9316`, you're good.
 
 Your AI should list the Monolith namespace tools (`blueprint_query`, `material_query`, etc.).
 
-### Step 5: (Optional) Engine Source Index
+### Step 5: (Optional) Project C++ Source Index
 
-If you want your AI to look up Unreal Engine C++ APIs, function signatures, call graphs, and class hierarchies:
+Engine source indexing is built-in — no setup needed. `source_query` actions work immediately.
+
+If you also want your AI to search your **own project's C++ source** (find callers, callees, and class hierarchies across project code):
 
 1. Install **Python 3.10+**
-2. Run the source indexer script (see `Source/MonolithSource/` for details)
-3. This builds a local SQLite database of the entire UE source tree
-4. Once indexed, `source_query` actions become available
+2. Run `python Plugins/Monolith/Scripts/index_project.py` from your project root
+3. This indexes your project source into `EngineSource.db` alongside engine symbols
+4. Run `source_query("trigger_project_reindex")` from your AI session to re-run it without leaving the editor
 
 ### Verify Everything Works
 
@@ -181,17 +183,17 @@ cp -r Plugins/Monolith/Skills/* ~/.claude/skills/
 ```
 Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, auto-updater (4 actions)
-  MonolithBlueprint     — Blueprint read/write, variable/component/graph CRUD, node operations, compile (46 actions)
+  MonolithBlueprint     — Blueprint read/write, variable/component/graph CRUD, node operations, compile, CDO reader (47 actions)
   MonolithMaterial      — Material inspection + graph editing + CRUD (25 actions)
   MonolithAnimation     — Animation sequences, montages, ABPs, PoseSearch (62 actions)
   MonolithNiagara       — Niagara particle systems (47 actions)
   MonolithEditor        — Build triggers, log capture, compile output, crash context (13 actions)
   MonolithConfig        — Config/INI resolution and search (6 actions)
-  MonolithIndex         — SQLite FTS5 deep project indexer (5 actions)
-  MonolithSource        — Engine source + API lookup (10 actions)
+  MonolithIndex         — SQLite FTS5 deep project indexer, marketplace content, 15 asset indexers (5 actions)
+  MonolithSource        — Native C++ engine source indexer, call graphs, class hierarchy (11 actions)
 ```
 
-**218 actions total across 9 modules, exposed through 12 MCP tools.**
+**220 actions total across 9 modules, exposed through 12 MCP tools.**
 
 ### Tool Reference
 
@@ -201,14 +203,14 @@ Monolith.uplugin
 | `monolith` | `monolith_status` | — | Server health, version, index status |
 | `monolith` | `monolith_reindex` | — | Trigger full project re-index |
 | `monolith` | `monolith_update` | — | Check or install updates |
-| `blueprint` | `blueprint_query` | 46 | Full Blueprint CRUD — read/write graphs, variables, components, functions, nodes, compile |
+| `blueprint` | `blueprint_query` | 47 | Full Blueprint CRUD — read/write graphs, variables, components, functions, nodes, compile, CDO properties |
 | `material` | `material_query` | 25 | Inspection, editing, graph building, previews, validation, CRUD |
 | `animation` | `animation_query` | 62 | Montages, blend spaces, ABPs, skeletons, bone tracks, PoseSearch |
 | `niagara` | `niagara_query` | 47 | Systems, emitters, modules, parameters, renderers, HLSL |
 | `editor` | `editor_query` | 13 | Build triggers, error logs, compile output, crash context |
 | `config` | `config_query` | 6 | INI resolution, explain, diff, search |
-| `project` | `project_query` | 5 | Deep project search — FTS5 across all indexed assets |
-| `source` | `source_query` | 10 | Engine source lookup, call graphs, class hierarchy |
+| `project` | `project_query` | 5 | Deep project search — FTS5 across all indexed assets including marketplace plugins |
+| `source` | `source_query` | 11 | Native C++ engine source lookup, call graphs, class hierarchy, project reindex |
 
 ### What Can the AI Actually Do?
 
@@ -226,7 +228,7 @@ Monolith.uplugin
 
 **Project** — Full-text search across every indexed asset in your project. Find assets by name, type, path, or content. Trace references between assets. The search index updates automatically when assets change.
 
-**Source** — Look up any Unreal Engine C++ API: read function implementations, search across the entire engine source, get class hierarchies, trace call graphs (callers and callees), and verify include paths. The AI never has to guess a function signature — it can check the actual source.
+**Source** — Look up any Unreal Engine C++ API: read function implementations, search across the entire engine source, get class hierarchies, trace call graphs (callers and callees), and verify include paths. The native C++ indexer runs automatically — no Python required. Optionally index your own project C++ source for richer cross-references. The AI never has to guess a function signature — it can check the actual source.
 
 ---
 
@@ -249,7 +251,7 @@ Monolith includes a built-in auto-updater:
 | **Plugin doesn't appear in editor** | Verify the folder is at `YourProject/Plugins/Monolith/` and contains `Monolith.uplugin`. Check you're on UE 5.7+. |
 | **MCP connection refused** | Make sure the editor is open and running. Check Output Log for port conflicts. Verify `.mcp.json` is in your project root. |
 | **Index shows 0 assets** | Run `monolith_reindex` or restart the editor. Check Output Log for indexing errors. |
-| **Source tools return empty results** | The Python engine source indexer hasn't been run. See Step 5 above. |
+| **Source tools return empty results** | Run `monolith_reindex()` and wait for completion, then retry. Engine source indexing is built-in — if results are still empty, check the Output Log for `LogMonolith` errors. |
 | **Claude can't find any tools** | Check `.mcp.json` transport type: Claude Code uses `"http"`, Cursor/Cline use `"streamableHttp"`. Restart your AI client after creating the file. |
 | **Tools fail on first try** | Restart Claude Code to refresh the MCP connection. This is a known quirk with initial connection timing. |
 | **Port 9316 already in use** | Change the port in Editor Preferences > Plugins > Monolith, then update the port in `.mcp.json` to match. |
@@ -267,6 +269,9 @@ Plugin settings are at **Editor Preferences > Plugins > Monolith**:
 | Auto-Update | `On` | Check GitHub Releases on editor startup |
 | Module Toggles | All enabled | Enable/disable individual domain modules |
 | Database Path | Project-local | Override SQLite database storage location |
+| Index Marketplace Plugins | `On` | Index content from installed marketplace/Fab plugins |
+| Index Data Assets | `On` | Deep-index DataAsset subclasses (15 indexers) |
+| Additional Content Paths | `[]` | Extra content paths to include in the project index |
 
 ---
 

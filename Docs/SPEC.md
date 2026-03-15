@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~219 individual tools down to 12 MCP tools (218 total actions), cutting AI assistant context consumption by ~95%.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 12 MCP tools (220 total actions), cutting AI assistant context consumption by ~95%.
 
 ### What It Replaces
 
@@ -42,7 +42,7 @@ Monolith.uplugin
   MonolithEditor        — Build triggers, live compile, log capture, compile output, crash context (13 actions)
   MonolithConfig        — Config/INI resolution and search (6 actions)
   MonolithIndex         — SQLite FTS5 deep project indexer, 14 internal indexers (5 MCP actions)
-  MonolithSource        — Engine source + API lookup (10 actions)
+  MonolithSource        — Engine source + API lookup (11 actions)
 ```
 
 ### Discovery/Dispatch Pattern
@@ -111,11 +111,11 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers 46 blueprint actions |
+| `FMonolithBlueprintModule` | Registers 47 blueprint actions |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
-#### Actions (46 — namespace: "blueprint")
+#### Actions (47 — namespace: "blueprint")
 
 **Read Actions (13)**
 | Action | Params | Description |
@@ -590,18 +590,19 @@ All marked with "UE 5.7 FIX" comments:
 
 **Dependencies:** Core, CoreUObject, Engine, MonolithCore, SQLiteCore, EditorSubsystem, UnrealEd, Json, JsonUtilities, Slate, SlateCore
 
-**Note:** Module structure was flattened — the vestigial outer stub has been removed. MonolithSource now properly registers 10-11 actions (read_source, find_references, find_callers, find_callees, search_source, get_class_hierarchy, get_module_info, get_symbol_context, read_file, trigger_reindex).
+**Note:** Module structure was flattened — the vestigial outer stub has been removed. MonolithSource registers 11 actions. The engine source indexer is a native C++ implementation (`UMonolithSourceSubsystem` builds `EngineSource.db` in-process). The legacy Python tree-sitter indexer (`Scripts/source_indexer/`) is no longer used.
 
 #### Classes
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithSourceModule` | Registers 10 source actions (properly registers all actions after stub removal fix) |
-| `UMonolithSourceSubsystem` | UEditorSubsystem. Owns read-only engine source DB. Manages Python indexer subprocess |
+| `FMonolithSourceModule` | Registers 11 source actions |
+| `UMonolithSourceSubsystem` | UEditorSubsystem. Owns engine source DB. Runs native C++ source indexer. Exposes `TriggerReindex()` (full engine re-index) and `TriggerProjectReindex()` (project C++ only, incremental) |
 | `FMonolithSourceDatabase` | Read-only SQLite wrapper. Thread-safe via FCriticalSection. FTS queries with prefix matching |
-| `FMonolithSourceActions` | 10 handlers. Helpers: IsForwardDeclaration (regex), ExtractMembers (smart class outline) |
+| `FMonolithSourceActions` | 11 handlers. Helpers: IsForwardDeclaration (regex), ExtractMembers (smart class outline) |
+| `UMonolithQueryCommandlet` | UCommandlet. Offline CLI — run via `UnrealEditor-Cmd.exe ProjectName -run=MonolithQuery`. Replaces `monolith_offline.py` for read/query operations without a full editor session |
 
-#### Actions (10 — namespace: "source")
+#### Actions (11 — namespace: "source")
 
 | Action | Params | Description |
 |--------|--------|-------------|
@@ -614,26 +615,38 @@ All marked with "UE 5.7 FIX" comments:
 | `get_module_info` | `module_name` | Module stats: file count, symbol counts, key classes |
 | `get_symbol_context` | `symbol`, `context_lines` | Definition with surrounding context |
 | `read_file` | `file_path`, `start_line`, `end_line` | Read source lines by path (absolute -> DB exact -> DB suffix match) |
-| `trigger_reindex` | none | Trigger Python indexer subprocess |
+| `trigger_reindex` | none | Trigger full C++ engine source re-index (replaces entire EngineSource.db) |
+| `trigger_project_reindex` | none | Trigger incremental project-only C++ source re-index (updates project symbols in EngineSource.db without a full rebuild) |
 
 **DB Location:** `Plugins/Monolith/Saved/EngineSource.db`
 
 ---
 
-## 4. Python Source Indexer
+## 4. Source Indexer
+
+### 4.1 C++ Indexer (current)
+
+The engine source indexer is a native C++ implementation within `MonolithSource`. `UMonolithSourceSubsystem` builds and maintains `EngineSource.db` in-process. Indexing is triggered via:
+
+- **`trigger_reindex`** — full engine source re-index
+- **`trigger_project_reindex`** — incremental project-only C++ re-index (faster; only updates project symbols)
+
+### 4.2 Python Source Indexer (legacy)
+
+> **LEGACY:** The Python tree-sitter indexer in `Scripts/source_indexer/` has been superseded by the native C++ indexer. It is no longer invoked by MonolithSource and is retained only for reference.
 
 **Location:** `Scripts/source_indexer/`
 **Entry point:** `python -m source_indexer --source PATH --db PATH [--shaders PATH]`
 **Dependencies:** tree-sitter>=0.21.0, tree-sitter-cpp>=0.21.0, Python 3.10+
 
-### Pipeline (IndexingPipeline)
+#### Pipeline (IndexingPipeline)
 
 1. **Module Discovery** — Walks Runtime, Editor, Developer, Programs under Engine/Source + Engine/Plugins. Optionally Engine/Shaders
 2. **File Processing** — C++ files -> CppParser (tree-sitter AST) -> symbols, includes. Shader files -> ShaderParser (regex) -> symbols, includes
 3. **Source Line FTS** — Chunks source in batches of 10 lines into source_fts table
 4. **Finalization** — Resolves inheritance, runs ReferenceBuilder for call/type cross-references
 
-### Parsers
+#### Parsers
 
 | Parser | Technology | Handles |
 |--------|-----------|---------|
@@ -658,6 +671,22 @@ All marked with "UE 5.7 FIX" comments:
 ---
 
 ## 5. Offline CLI
+
+Two options for offline access (no full editor session required):
+
+### 5.1 MonolithQueryCommandlet (preferred)
+
+**Class:** `UMonolithQueryCommandlet`
+**Run via:**
+```
+"C:\Program Files (x86)\UE_5.7\Engine\Binaries\Win64\UnrealEditor-Cmd.exe" YourProject -run=MonolithQuery [args...]
+```
+
+Replaces `monolith_offline.py` as the primary offline access path. Uses the same C++ DB layer as the live MCP server, so query results are identical.
+
+### 5.2 monolith_offline.py (legacy)
+
+> **LEGACY:** `monolith_offline.py` is superseded by `MonolithQueryCommandlet`. It remains functional as a zero-dependency fallback requiring only Python stdlib and no UE installation.
 
 **Location:** `Saved/monolith_offline.py`
 **Dependencies:** Python stdlib only (sqlite3, argparse, json, re, pathlib) — no pip installs required
@@ -716,7 +745,7 @@ python Saved/monolith_offline.py <namespace> <action> [args...]
 | unreal-animation | animation, montage, ABP, blend space, notify, curves, compression, PoseSearch | `animation_query()` | 67 |
 | unreal-blueprints | Blueprint, BP, event graph, node, variable | `blueprint_query()` | 46 |
 | unreal-build | build, compile, Live Coding, hot reload, rebuild | `editor_query()` | 13 |
-| unreal-cpp | C++, header, include, UCLASS, Build.cs, linker error | `source_query()` + `config_query()` | 10+6 |
+| unreal-cpp | C++, header, include, UCLASS, Build.cs, linker error | `source_query()` + `config_query()` | 11+6 |
 | unreal-debugging | build error, crash, log, debug, stack trace | `editor_query()` | 13 |
 | unreal-materials | material, shader, PBR, texture, material graph | `material_query()` | 25 |
 | unreal-niagara | Niagara, particle, VFX, emitter | `niagara_query()` | 46 |
@@ -793,7 +822,7 @@ YourProject/Plugins/Monolith/
     .mcp.json.example
     CLAUDE.md.example
   Scripts/
-    source_indexer/                (Python tree-sitter indexer)
+    source_indexer/                (LEGACY: Python tree-sitter indexer — superseded by C++ indexer in MonolithSource)
       db/schema.py
       ...
   MCP/
@@ -876,14 +905,14 @@ See `TODO.md` for the full list. Key architectural constraints:
 | Module | Namespace | Actions |
 |--------|-----------|---------|
 | MonolithCore | monolith | 4 |
-| MonolithBlueprint | blueprint | 46 |
+| MonolithBlueprint | blueprint | 47 |
 | MonolithMaterial | material | 25 |
 | MonolithAnimation | animation | 62 |
-| MonolithNiagara | niagara | 46 |
+| MonolithNiagara | niagara | 47 |
 | MonolithEditor | editor | 13 |
 | MonolithConfig | config | 6 |
 | MonolithIndex | project | 5 |
-| MonolithSource | source | 10 |
-| **Total** | | **217** |
+| MonolithSource | source | 11 |
+| **Total** | | **220** |
 
-**Note:** All skill files now correctly reflect the C++ action counts (217 total). The original Python server had higher counts (~231 tools) due to fragmented action design. Note: PoseSearch's 5 actions are included in Animation's 62 — they are not additive.
+**Note:** PoseSearch's 5 actions are included in Animation's 62 — they are not additive. The original Python server had higher counts (~231 tools) due to fragmented action design.

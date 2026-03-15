@@ -5,7 +5,7 @@ description: Use when writing or debugging Unreal Engine C++ code via Monolith M
 
 # Unreal C++ Development Workflows
 
-You have access to **Monolith** with 10 source actions via `source_query()` and 6 config actions via `config_query()`.
+You have access to **Monolith** with 11 source actions via `source_query()` and 6 config actions via `config_query()`.
 
 ## Discovery
 
@@ -14,7 +14,7 @@ monolith_discover({ namespace: "source" })
 monolith_discover({ namespace: "config" })
 ```
 
-## Source Actions (10)
+## Source Actions (11)
 
 | Action | Key Params | Purpose |
 |--------|-----------|---------|
@@ -27,7 +27,8 @@ monolith_discover({ namespace: "config" })
 | `get_module_info` | `symbol` | Module dependencies, build type |
 | `get_symbol_context` | `symbol` | Get a symbol's definition and surrounding context |
 | `read_file` | `file_path` | Read raw engine source file by path |
-| `trigger_reindex` | — | Trigger a re-index of engine source |
+| `trigger_reindex` | — | Trigger full C++ engine source re-index |
+| `trigger_project_reindex` | — | Trigger incremental project-only C++ source re-index (faster) |
 
 ## Key Parameter Names
 

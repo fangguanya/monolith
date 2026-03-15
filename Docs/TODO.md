@@ -67,6 +67,8 @@ None!
 - [ ] **SSE streaming** — DEFERRED. `MonolithHttpServer.cpp` SSE endpoint returns a single event and closes. Comment: "Full SSE streaming will be implemented when we need server-initiated notifications."
   - **File:** `Source/MonolithCore/Private/MonolithHttpServer.cpp` (~line 232)
 
+- [x] **C++ source indexer — native port complete** — DONE (2026-03-15). `MonolithSource` module now runs a native C++ indexer via `UMonolithSourceSubsystem`. The Python tree-sitter indexer (`Scripts/source_indexer/`) is legacy and no longer invoked. New action: `trigger_project_reindex` for incremental project-only C++ re-index. New commandlet: `UMonolithQueryCommandlet` (-run=MonolithQuery) replaces `monolith_offline.py` as the preferred offline access path.
+
 - [x] **Python indexer: capture full class/struct definitions** — FIXED (2026-03-08). Added UE macro preprocessor that strips UCLASS/USTRUCT/UENUM/UINTERFACE, *_API, GENERATED_BODY() before tree-sitter parsing. 62,059 definitions now captured (was near-zero).
 
 - [x] **Source index: ancestor traversal** — FIXED (2026-03-08). Inheritance table now has 37,010 entries across 34,444 classes. AActor→UObject, APawn→AActor, ACharacter→APawn all working.
