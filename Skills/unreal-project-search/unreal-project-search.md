@@ -31,9 +31,9 @@ All asset paths follow UE content browser format (no .uasset extension):
 |--------|--------|---------|
 | `search` | `query` (string) | Full-text search across all indexed assets, nodes, variables, parameters |
 | `find_references` | `asset_path` (string) | Find all assets that reference a given asset |
-| `find_by_type` | `asset_type` (string) | List all assets of a specific type |
+| `find_by_type` | `asset_type` (string), `module`? (string) | List all assets of a specific type, optionally filtered by plugin/module |
 | `get_asset_details` | `asset_path` (string) | Detailed metadata for a specific asset |
-| `get_stats` | _(none)_ | Index statistics — asset counts by type, index freshness |
+| `get_stats` | _(none)_ | Index statistics — asset counts by type, module_breakdown by plugin, index freshness |
 
 ## FTS5 Search Syntax
 

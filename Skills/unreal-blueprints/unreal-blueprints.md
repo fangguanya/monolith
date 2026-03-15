@@ -5,7 +5,7 @@ description: Use when working with Unreal Engine Blueprints via Monolith MCP —
 
 # Unreal Blueprint Workflows
 
-You have access to **Monolith** with 46 Blueprint actions via `blueprint_query()`.
+You have access to **Monolith** with 47 Blueprint actions via `blueprint_query()`.
 
 ## Discovery
 
@@ -41,6 +41,7 @@ monolith_discover({ namespace: "blueprint" })
 | `get_parent_class` | `asset_path` | Parent class, blueprint type, status, capabilities |
 | `get_interfaces` | `asset_path` | Implemented interfaces (direct + inherited) |
 | `get_construction_script` | `asset_path` | Construction script graph data |
+| `get_cdo_properties` | `asset_path`, `category_filter`?, `include_parent_defaults`? | Read all UPROPERTY defaults from Blueprint CDO or UObject asset |
 
 ### Variable CRUD (7)
 
