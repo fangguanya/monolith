@@ -38,6 +38,7 @@ FMonolithActionResult FProjectSearchAction::Execute(const TSharedPtr<FJsonObject
 		Entry->SetStringField(TEXT("asset_path"), SR.AssetPath);
 		Entry->SetStringField(TEXT("asset_name"), SR.AssetName);
 		Entry->SetStringField(TEXT("asset_class"), SR.AssetClass);
+		Entry->SetStringField(TEXT("module_name"), SR.ModuleName);
 		Entry->SetStringField(TEXT("match_context"), SR.MatchContext);
 		Entry->SetNumberField(TEXT("rank"), SR.Rank);
 		ResultsArr.Add(MakeShared<FJsonValueObject>(Entry));

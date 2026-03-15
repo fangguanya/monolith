@@ -12,6 +12,11 @@ FMonolithActionResult FProjectFindByTypeAction::Execute(const TSharedPtr<FJsonOb
 	}
 	int32 Limit = Params->HasField(TEXT("limit")) ? Params->GetIntegerField(TEXT("limit")) : 100;
 	int32 Offset = Params->HasField(TEXT("offset")) ? Params->GetIntegerField(TEXT("offset")) : 0;
+	FString ModuleFilter;
+	if (Params->HasField(TEXT("module")))
+	{
+		ModuleFilter = Params->GetStringField(TEXT("module"));
+	}
 
 	if (AssetClass.IsEmpty())
 	{
@@ -26,6 +31,15 @@ FMonolithActionResult FProjectFindByTypeAction::Execute(const TSharedPtr<FJsonOb
 
 	TArray<FIndexedAsset> Assets = Subsystem->FindByType(AssetClass, Limit, Offset);
 
+	if (!ModuleFilter.IsEmpty())
+	{
+		Assets.RemoveAll([&ModuleFilter](const FIndexedAsset& A) { return A.ModuleName != ModuleFilter; });
+		if (Assets.Num() > Limit)
+		{
+			Assets.SetNum(Limit);
+		}
+	}
+
 	auto Result = MakeShared<FJsonObject>();
 	TArray<TSharedPtr<FJsonValue>> AssetsArr;
 	for (const FIndexedAsset& Asset : Assets)
@@ -34,6 +48,7 @@ FMonolithActionResult FProjectFindByTypeAction::Execute(const TSharedPtr<FJsonOb
 		Entry->SetStringField(TEXT("package_path"), Asset.PackagePath);
 		Entry->SetStringField(TEXT("asset_name"), Asset.AssetName);
 		Entry->SetStringField(TEXT("asset_class"), Asset.AssetClass);
+		Entry->SetStringField(TEXT("module_name"), Asset.ModuleName);
 		Entry->SetNumberField(TEXT("file_size_bytes"), Asset.FileSizeBytes);
 		Entry->SetStringField(TEXT("indexed_at"), Asset.IndexedAt);
 		AssetsArr.Add(MakeShared<FJsonValueObject>(Entry));
@@ -51,6 +66,7 @@ TSharedPtr<FJsonObject> FProjectFindByTypeAction::GetSchema()
 {
 	return FParamSchemaBuilder()
 		.Required(TEXT("asset_type"), TEXT("string"), TEXT("Asset class name (e.g. Blueprint, Material, StaticMesh, Texture2D)"))
+		.Optional(TEXT("module"), TEXT("string"), TEXT("Filter by plugin/module name (e.g. InventorySystemX)"))
 		.Optional(TEXT("limit"), TEXT("integer"), TEXT("Maximum results"), TEXT("100"))
 		.Optional(TEXT("offset"), TEXT("integer"), TEXT("Pagination offset"), TEXT("0"))
 		.Build();

@@ -17,4 +17,10 @@ public:
 
 	virtual bool IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId) override;
 	virtual FString GetName() const override { return TEXT("DependencyIndexer"); }
+
+	/** Set of valid path prefixes for indexing */
+	TArray<FName> IndexedPaths;
+
+	/** Set indexed paths. Called before IndexAsset. */
+	void SetIndexedPaths(const TArray<FName>& InPaths) { IndexedPaths = InPaths; }
 };

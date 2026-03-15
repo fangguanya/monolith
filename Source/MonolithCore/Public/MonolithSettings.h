@@ -105,6 +105,10 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Post-Pass Indexers")
 	bool bIndexGameplayTags = true;
 
+	/** Index content from enabled marketplace plugins (installed via Fab/Epic launcher) */
+	UPROPERTY(config, EditAnywhere, Category="Indexing")
+	bool bIndexMarketplacePlugins = true;
+
 	// --- Module Toggles ---
 
 	UPROPERTY(config, EditAnywhere, Category="Modules")

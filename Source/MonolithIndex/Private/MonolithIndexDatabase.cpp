@@ -151,12 +151,13 @@ CREATE TABLE IF NOT EXISTS datatable_rows (
 );
 CREATE INDEX IF NOT EXISTS idx_dt_asset ON datatable_rows(asset_id);
 
--- FTS5 index over assets (name, class, description, path)
+-- FTS5 index over assets (name, class, description, path, module)
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_assets USING fts5(
     asset_name,
     asset_class,
     description,
     package_path,
+    module_name,
     content=assets,
     content_rowid=id,
     tokenize='porter unicode61'
@@ -164,18 +165,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_assets USING fts5(
 
 -- FTS5 triggers to keep index in sync
 CREATE TRIGGER IF NOT EXISTS fts_assets_ai AFTER INSERT ON assets BEGIN
-    INSERT INTO fts_assets(rowid, asset_name, asset_class, description, package_path)
-    VALUES (new.id, new.asset_name, new.asset_class, new.description, new.package_path);
+    INSERT INTO fts_assets(rowid, asset_name, asset_class, description, package_path, module_name)
+    VALUES (new.id, new.asset_name, new.asset_class, new.description, new.package_path, new.module_name);
 END;
 CREATE TRIGGER IF NOT EXISTS fts_assets_ad AFTER DELETE ON assets BEGIN
-    INSERT INTO fts_assets(fts_assets, rowid, asset_name, asset_class, description, package_path)
-    VALUES ('delete', old.id, old.asset_name, old.asset_class, old.description, old.package_path);
+    INSERT INTO fts_assets(fts_assets, rowid, asset_name, asset_class, description, package_path, module_name)
+    VALUES ('delete', old.id, old.asset_name, old.asset_class, old.description, old.package_path, old.module_name);
 END;
 CREATE TRIGGER IF NOT EXISTS fts_assets_au AFTER UPDATE ON assets BEGIN
-    INSERT INTO fts_assets(fts_assets, rowid, asset_name, asset_class, description, package_path)
-    VALUES ('delete', old.id, old.asset_name, old.asset_class, old.description, old.package_path);
-    INSERT INTO fts_assets(rowid, asset_name, asset_class, description, package_path)
-    VALUES (new.id, new.asset_name, new.asset_class, new.description, new.package_path);
+    INSERT INTO fts_assets(fts_assets, rowid, asset_name, asset_class, description, package_path, module_name)
+    VALUES ('delete', old.id, old.asset_name, old.asset_class, old.description, old.package_path, old.module_name);
+    INSERT INTO fts_assets(rowid, asset_name, asset_class, description, package_path, module_name)
+    VALUES (new.id, new.asset_name, new.asset_class, new.description, new.package_path, new.module_name);
 END;
 
 -- FTS5 index over nodes (name, class, type)
@@ -793,7 +794,7 @@ TArray<FSearchResult> FMonolithIndexDatabase::FullTextSearch(const FString& Quer
 
 	// Search assets FTS
 	FString SQL = FString::Printf(
-		TEXT("SELECT a.package_path, a.asset_name, a.asset_class, snippet(fts_assets, 2, '>>>', '<<<', '...', 32) as ctx, rank FROM fts_assets f JOIN assets a ON a.id = f.rowid WHERE fts_assets MATCH ? ORDER BY rank LIMIT %d;"),
+		TEXT("SELECT a.package_path, a.asset_name, a.asset_class, a.module_name, snippet(fts_assets, 2, '>>>', '<<<', '...', 32) as ctx, rank FROM fts_assets f JOIN assets a ON a.id = f.rowid WHERE fts_assets MATCH ? ORDER BY rank LIMIT %d;"),
 		Limit
 	);
 
@@ -807,16 +808,17 @@ TArray<FSearchResult> FMonolithIndexDatabase::FullTextSearch(const FString& Quer
 		Stmt.GetColumnValueByIndex(0, R.AssetPath);
 		Stmt.GetColumnValueByIndex(1, R.AssetName);
 		Stmt.GetColumnValueByIndex(2, R.AssetClass);
-		Stmt.GetColumnValueByIndex(3, R.MatchContext);
+		Stmt.GetColumnValueByIndex(3, R.ModuleName);
+		Stmt.GetColumnValueByIndex(4, R.MatchContext);
 		double RankD = 0.0;
-		Stmt.GetColumnValueByIndex(4, RankD);
+		Stmt.GetColumnValueByIndex(5, RankD);
 		R.Rank = static_cast<float>(RankD);
 		Results.Add(MoveTemp(R));
 	}
 
 	// Also search nodes FTS
 	FString NodeSQL = FString::Printf(
-		TEXT("SELECT a.package_path, a.asset_name, a.asset_class, snippet(fts_nodes, 0, '>>>', '<<<', '...', 32) as ctx, f.rank FROM fts_nodes f JOIN nodes n ON n.id = f.rowid JOIN assets a ON a.id = n.asset_id WHERE fts_nodes MATCH ? ORDER BY f.rank LIMIT %d;"),
+		TEXT("SELECT a.package_path, a.asset_name, a.asset_class, a.module_name, snippet(fts_nodes, 0, '>>>', '<<<', '...', 32) as ctx, f.rank FROM fts_nodes f JOIN nodes n ON n.id = f.rowid JOIN assets a ON a.id = n.asset_id WHERE fts_nodes MATCH ? ORDER BY f.rank LIMIT %d;"),
 		Limit
 	);
 
@@ -830,9 +832,10 @@ TArray<FSearchResult> FMonolithIndexDatabase::FullTextSearch(const FString& Quer
 		Stmt2.GetColumnValueByIndex(0, R.AssetPath);
 		Stmt2.GetColumnValueByIndex(1, R.AssetName);
 		Stmt2.GetColumnValueByIndex(2, R.AssetClass);
-		Stmt2.GetColumnValueByIndex(3, R.MatchContext);
+		Stmt2.GetColumnValueByIndex(3, R.ModuleName);
+		Stmt2.GetColumnValueByIndex(4, R.MatchContext);
 		double RankD = 0.0;
-		Stmt2.GetColumnValueByIndex(4, RankD);
+		Stmt2.GetColumnValueByIndex(5, RankD);
 		R.Rank = static_cast<float>(RankD);
 		Results.Add(MoveTemp(R));
 	}
@@ -896,6 +899,20 @@ TSharedPtr<FJsonObject> FMonolithIndexDatabase::GetStats()
 		ClassBreakdown->SetNumberField(ClassName, Count);
 	}
 	Stats->SetObjectField(TEXT("asset_class_breakdown"), ClassBreakdown);
+
+	// Module breakdown (which plugins have how many assets)
+	auto ModuleBreakdown = MakeShared<FJsonObject>();
+	FSQLitePreparedStatement ModStmt;
+	ModStmt.Create(*Database, TEXT("SELECT CASE WHEN module_name = '' THEN 'Project' ELSE module_name END as mod, COUNT(*) as cnt FROM assets GROUP BY module_name ORDER BY cnt DESC;"));
+	while (ModStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString ModName;
+		int64 Count = 0;
+		ModStmt.GetColumnValueByIndex(0, ModName);
+		ModStmt.GetColumnValueByIndex(1, Count);
+		ModuleBreakdown->SetNumberField(ModName, Count);
+	}
+	Stats->SetObjectField(TEXT("module_breakdown"), ModuleBreakdown);
 
 	return Stats;
 }

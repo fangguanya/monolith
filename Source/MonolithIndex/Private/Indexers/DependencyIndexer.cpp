@@ -4,12 +4,21 @@
 
 bool FDependencyIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
 {
-	// This indexer ignores individual asset params -- processes ALL assets at once
 	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 
 	TArray<FAssetData> AllAssets;
 	FARFilter Filter;
-	Filter.PackagePaths.Add(FName(TEXT("/Game")));
+	if (IndexedPaths.Num() > 0)
+	{
+		for (const FName& Path : IndexedPaths)
+		{
+			Filter.PackagePaths.Add(Path);
+		}
+	}
+	else
+	{
+		Filter.PackagePaths.Add(FName(TEXT("/Game")));
+	}
 	Filter.bRecursivePaths = true;
 	Registry.GetAssets(Filter, AllAssets);
 
@@ -20,7 +29,6 @@ bool FDependencyIndexer::IndexAsset(const FAssetData& AssetData, UObject* Loaded
 		int64 SourceId = DB.GetAssetId(Source.PackageName.ToString());
 		if (SourceId < 0) continue;
 
-		// Get hard dependencies
 		TArray<FAssetIdentifier> HardDeps;
 		Registry.GetDependencies(Source.PackageName, HardDeps,
 			UE::AssetRegistry::EDependencyCategory::Package,
@@ -29,8 +37,6 @@ bool FDependencyIndexer::IndexAsset(const FAssetData& AssetData, UObject* Loaded
 		for (const FAssetIdentifier& Dep : HardDeps)
 		{
 			FString DepPath = Dep.PackageName.ToString();
-			if (!DepPath.StartsWith(TEXT("/Game/"))) continue;
-
 			int64 TargetId = DB.GetAssetId(DepPath);
 			if (TargetId < 0) continue;
 
@@ -42,7 +48,6 @@ bool FDependencyIndexer::IndexAsset(const FAssetData& AssetData, UObject* Loaded
 			DepsInserted++;
 		}
 
-		// Get soft dependencies
 		TArray<FAssetIdentifier> SoftDeps;
 		Registry.GetDependencies(Source.PackageName, SoftDeps,
 			UE::AssetRegistry::EDependencyCategory::Package,
@@ -51,8 +56,6 @@ bool FDependencyIndexer::IndexAsset(const FAssetData& AssetData, UObject* Loaded
 		for (const FAssetIdentifier& Dep : SoftDeps)
 		{
 			FString DepPath = Dep.PackageName.ToString();
-			if (!DepPath.StartsWith(TEXT("/Game/"))) continue;
-
 			int64 TargetId = DB.GetAssetId(DepPath);
 			if (TargetId < 0) continue;
 

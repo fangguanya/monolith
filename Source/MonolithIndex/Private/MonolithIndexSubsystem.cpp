@@ -7,6 +7,7 @@
 #include "Misc/Paths.h"
 #include "HAL/RunnableThread.h"
 #include "Async/Async.h"
+#include "Interfaces/IPluginManager.h"
 
 // Indexers
 #include "Indexers/BlueprintIndexer.h"
@@ -173,6 +174,9 @@ void UMonolithIndexSubsystem::StartFullIndex()
 	// Reset the database for a full re-index
 	Database->ResetDatabase();
 
+	// Gather marketplace plugin paths for indexing
+	IndexedPlugins = GatherMarketplacePluginPaths();
+
 	// Show notification
 	FAsyncTaskNotificationConfig NotifConfig;
 	NotifConfig.TitleText = FText::FromString(TEXT("Monolith"));
@@ -183,6 +187,7 @@ void UMonolithIndexSubsystem::StartFullIndex()
 
 	// Launch background thread
 	IndexingTaskPtr = MakeUnique<FIndexingTask>(this);
+	IndexingTaskPtr->PluginsToIndex = IndexedPlugins;
 	IndexingThread.Reset(FRunnableThread::Create(
 		IndexingTaskPtr.Get(),
 		TEXT("MonolithIndexing"),
@@ -233,6 +238,40 @@ TSharedPtr<FJsonObject> UMonolithIndexSubsystem::GetAssetDetails(const FString& 
 	return Database->GetAssetDetails(PackagePath);
 }
 
+TArray<FIndexedPluginInfo> UMonolithIndexSubsystem::GatherMarketplacePluginPaths() const
+{
+    TArray<FIndexedPluginInfo> Result;
+
+    const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
+    if (!Settings->bIndexMarketplacePlugins)
+    {
+        return Result;
+    }
+
+    TArray<TSharedRef<IPlugin>> ContentPlugins = IPluginManager::Get().GetEnabledPluginsWithContent();
+    for (const TSharedRef<IPlugin>& Plugin : ContentPlugins)
+    {
+        if (!Plugin->GetDescriptor().bInstalled)
+        {
+            continue;
+        }
+
+        FIndexedPluginInfo Info;
+        Info.PluginName = Plugin->GetName();
+        Info.MountPath = Plugin->GetMountedAssetPath();
+        Info.ContentDir = Plugin->GetContentDir();
+        Info.FriendlyName = Plugin->GetDescriptor().FriendlyName;
+
+        UE_LOG(LogMonolithIndex, Log, TEXT("Marketplace plugin found: %s (mount: %s)"),
+            *Info.FriendlyName, *Info.MountPath);
+
+        Result.Add(MoveTemp(Info));
+    }
+
+    UE_LOG(LogMonolithIndex, Log, TEXT("Found %d marketplace plugins to index"), Result.Num());
+    return Result;
+}
+
 // ============================================================
 // Background indexing task
 // ============================================================
@@ -247,7 +286,7 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// Asset Registry enumeration MUST happen on the game thread
 	TArray<FAssetData> AllAssets;
 	FEvent* RegistryEvent = FPlatformProcess::GetSynchEventFromPool(true);
-	AsyncTask(ENamedThreads::GameThread, [&AllAssets, RegistryEvent]()
+	AsyncTask(ENamedThreads::GameThread, [this, &AllAssets, RegistryEvent]()
 	{
 		IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 
@@ -259,6 +298,16 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 
 		FARFilter Filter;
 		Filter.PackagePaths.Add(FName(TEXT("/Game")));
+		// Add marketplace plugin mount paths
+		for (const FIndexedPluginInfo& PluginInfo : PluginsToIndex)
+		{
+			FString CleanPath = PluginInfo.MountPath;
+			if (CleanPath.EndsWith(TEXT("/")))
+			{
+				CleanPath.LeftChopInline(1);
+			}
+			Filter.PackagePaths.Add(FName(*CleanPath));
+		}
 		Filter.bRecursivePaths = true;
 		AssetRegistry.GetAssets(Filter, AllAssets);
 
@@ -318,6 +367,19 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 		IndexedAsset.AssetName = AssetData.AssetName.ToString();
 		IndexedAsset.AssetClass = AssetData.AssetClassPath.GetAssetName().ToString();
 		ClassDistribution.FindOrAdd(IndexedAsset.AssetClass)++;
+
+		// Determine module name from package path
+		if (!IndexedAsset.PackagePath.StartsWith(TEXT("/Game/")))
+		{
+			for (const FIndexedPluginInfo& PluginInfo : PluginsToIndex)
+			{
+				if (IndexedAsset.PackagePath.StartsWith(PluginInfo.MountPath))
+				{
+					IndexedAsset.ModuleName = PluginInfo.PluginName;
+					break;
+				}
+			}
+		}
 
 		int64 AssetId = DB->InsertAsset(IndexedAsset);
 		if (AssetId < 0)
@@ -481,6 +543,19 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 			DeepIndexed.Load(), DeepErrors.Load());
 	}
 
+	// Build indexed paths list for post-pass indexers
+	TArray<FName> IndexedPaths;
+	IndexedPaths.Add(FName(TEXT("/Game")));
+	for (const FIndexedPluginInfo& PluginInfo : PluginsToIndex)
+	{
+		FString CleanPath = PluginInfo.MountPath;
+		if (CleanPath.EndsWith(TEXT("/")))
+		{
+			CleanPath.LeftChopInline(1);
+		}
+		IndexedPaths.Add(FName(*CleanPath));
+	}
+
 	// Run dependency indexer on game thread (Asset Registry requires it)
 	Owner->IndexingStatusMessage = TEXT("Analyzing dependencies...");
 	TSharedPtr<IMonolithIndexer>* DepIndexer = Owner->ClassToIndexer.Find(TEXT("__Dependencies__"));
@@ -489,6 +564,10 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 		double SentinelStart = FPlatformTime::Seconds();
 		UE_LOG(LogMonolithIndex, Log, TEXT("Running dependency indexer..."));
 		TSharedPtr<IMonolithIndexer> DepIndexerCopy = *DepIndexer;
+		if (FDependencyIndexer* DepRaw = static_cast<FDependencyIndexer*>(DepIndexerCopy.Get()))
+		{
+			DepRaw->SetIndexedPaths(IndexedPaths);
+		}
 		FEvent* DepEvent = FPlatformProcess::GetSynchEventFromPool(true);
 		AsyncTask(ENamedThreads::GameThread, [DB, DepIndexerCopy, DepEvent]()
 		{
@@ -511,6 +590,10 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 		double SentinelStart = FPlatformTime::Seconds();
 		UE_LOG(LogMonolithIndex, Log, TEXT("Running level indexer..."));
 		TSharedPtr<IMonolithIndexer> LevelIndexerCopy = *LevelIndexer;
+		if (FLevelIndexer* LevelRaw = static_cast<FLevelIndexer*>(LevelIndexerCopy.Get()))
+		{
+			LevelRaw->SetIndexedPaths(IndexedPaths);
+		}
 		FEvent* LevelEvent = FPlatformProcess::GetSynchEventFromPool(true);
 		AsyncTask(ENamedThreads::GameThread, [DB, LevelIndexerCopy, LevelEvent]()
 		{

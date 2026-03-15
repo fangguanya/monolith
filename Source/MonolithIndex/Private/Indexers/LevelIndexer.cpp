@@ -14,10 +14,20 @@ bool FLevelIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset
 {
 	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 
-	// Find all World assets under /Game
+	// Find all World assets under indexed paths
 	TArray<FAssetData> WorldAssets;
 	FARFilter Filter;
-	Filter.PackagePaths.Add(FName(TEXT("/Game")));
+	if (IndexedPaths.Num() > 0)
+	{
+		for (const FName& Path : IndexedPaths)
+		{
+			Filter.PackagePaths.Add(Path);
+		}
+	}
+	else
+	{
+		Filter.PackagePaths.Add(FName(TEXT("/Game")));
+	}
 	Filter.bRecursivePaths = true;
 	Filter.ClassPaths.Add(UWorld::StaticClass()->GetClassPathName());
 	Registry.GetAssets(Filter, WorldAssets);

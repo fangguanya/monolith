@@ -131,6 +131,7 @@ struct FSearchResult
 	FString AssetPath;
 	FString AssetName;
 	FString AssetClass;
+	FString ModuleName;
 	FString MatchContext; // snippet around the match
 	float Rank = 0.0f;
 };

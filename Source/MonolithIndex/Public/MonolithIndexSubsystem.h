@@ -10,6 +10,15 @@
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnIndexingProgress, int32 /*Current*/, int32 /*Total*/);
 DECLARE_MULTICAST_DELEGATE_OneParam(FOnIndexingComplete, bool /*bSuccess*/);
 
+/** Info about an indexed plugin */
+struct FIndexedPluginInfo
+{
+    FString PluginName;     // Logical name (e.g., "InventorySystemX")
+    FString MountPath;      // AR virtual root (e.g., "/InventorySystemX/")
+    FString ContentDir;     // Disk path to Content/
+    FString FriendlyName;   // Display name from .uplugin
+};
+
 /**
  * Editor subsystem that orchestrates the Monolith project index.
  * Owns the SQLite database, manages indexers, runs background indexing.
@@ -68,6 +77,7 @@ private:
 		TAtomic<bool> bShouldStop{false};
 		TAtomic<int32> CurrentIndex{0};
 		TAtomic<int32> TotalAssets{0};
+		TArray<FIndexedPluginInfo> PluginsToIndex;
 
 	private:
 		UMonolithIndexSubsystem* Owner;
@@ -78,6 +88,12 @@ private:
 	void RegisterDefaultIndexers();
 	FString GetDatabasePath() const;
 	bool ShouldAutoIndex() const;
+
+	/** Gather mount paths for enabled marketplace plugins */
+	TArray<FIndexedPluginInfo> GatherMarketplacePluginPaths() const;
+
+	/** Cached list of plugin paths being indexed (set during StartFullIndex) */
+	TArray<FIndexedPluginInfo> IndexedPlugins;
 
 	TUniquePtr<FMonolithIndexDatabase> Database;
 	TArray<TSharedPtr<IMonolithIndexer>> Indexers;
