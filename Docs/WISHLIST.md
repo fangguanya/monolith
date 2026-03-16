@@ -2,9 +2,18 @@
 
 Compiled 2026-03-14 from hands-on stress testing across Blueprint, Niagara, and Material agents.
 **121 items total** (17 bug fixes + 104 new features/improvements).
+**Bug status (2026-03-16): ALL 17 P0 bugs FIXED** + 1 bonus bug (add_variable type mapping).
 
-Current action counts: Blueprint 46, Niagara 44, Material 25 = **115 total**
-Estimated after full implementation: Blueprint ~82, Niagara ~65, Material ~69 = **~216 total**
+Current action counts: Blueprint 47, Niagara 47, Material 25, Animation 62, Editor 13, Config 6, Source 10, Project 5, Core 4 = **219 total**
+Estimated after full implementation: Blueprint ~67, Niagara ~65, Material ~47, Animation ~74, Editor ~39 = **~290+ total**
+
+Implementation plans (all amended 2026-03-16):
+- `Docs/plans/2026-03-15-blueprint-implementation-plan.md` (7 waves, 47→67)
+- `Docs/plans/2026-03-15-material-implementation-plan.md` (6 waves, 25→47)
+- `Docs/plans/2026-03-15-niagara-implementation-plan.md` (6 waves, 47→65)
+- `Docs/plans/2026-03-15-editor-implementation-plan.md` (3 waves, 13→39)
+- `Docs/plans/2026-03-15-animation-wave8-plan.md` (10 waves, 62→74, includes experimental ABP writes)
+- `Docs/plans/2026-03-16-abp-write-research.md` (feasibility study — all APIs exported)
 
 ---
 

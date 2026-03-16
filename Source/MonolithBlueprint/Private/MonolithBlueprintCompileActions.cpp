@@ -39,9 +39,10 @@ void FMonolithBlueprintCompileActions::RegisterActions(FMonolithToolRegistry& Re
 		TEXT("Create a new Blueprint asset at the given save path with the specified parent class and blueprint type."),
 		FMonolithActionHandler::CreateStatic(&HandleCreateBlueprint),
 		FParamSchemaBuilder()
-			.Required(TEXT("save_path"),      TEXT("string"), TEXT("Asset save path, e.g. /Game/Test/BP_MyActor"))
-			.Required(TEXT("parent_class"),   TEXT("string"), TEXT("Parent class name, e.g. Actor, Pawn, Character"))
-			.Optional(TEXT("blueprint_type"), TEXT("string"), TEXT("Blueprint type: Normal, Const, MacroLibrary, Interface, FunctionLibrary (default: Normal)"), TEXT("Normal"))
+			.Required(TEXT("save_path"),      TEXT("string"),  TEXT("Asset save path, e.g. /Game/Test/BP_MyActor"))
+			.Required(TEXT("parent_class"),   TEXT("string"),  TEXT("Parent class name, e.g. Actor, Pawn, Character"))
+			.Optional(TEXT("blueprint_type"), TEXT("string"),  TEXT("Blueprint type: Normal, Const, MacroLibrary, Interface, FunctionLibrary (default: Normal)"), TEXT("Normal"))
+			.Optional(TEXT("skip_save"),      TEXT("boolean"), TEXT("Skip the synchronous package save — Blueprint exists in-memory and can be saved later (default: false)"), TEXT("false"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("duplicate_blueprint"),
@@ -319,8 +320,20 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleCreateBlueprint(co
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create Blueprint at: %s"), *SavePath));
 	}
 
+	// Read skip_save param (default false)
+	bool bSkipSave = false;
+	if (Params->HasField(TEXT("skip_save")))
+	{
+		bSkipSave = Params->GetBoolField(TEXT("skip_save"));
+	}
+
 	Package->MarkPackageDirty();
 	FAssetRegistryModule::AssetCreated(NewBP);
+
+	if (!bSkipSave)
+	{
+		UEditorAssetLibrary::SaveAsset(SavePath, false);
+	}
 
 	FString GeneratedClassName;
 	if (NewBP->GeneratedClass)
@@ -333,6 +346,7 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleCreateBlueprint(co
 	Root->SetStringField(TEXT("parent_class"), ParentClass->GetName());
 	Root->SetStringField(TEXT("blueprint_type"), BlueprintTypeStr);
 	Root->SetStringField(TEXT("generated_class"), GeneratedClassName);
+	Root->SetBoolField(TEXT("saved"), !bSkipSave);
 	Root->SetBoolField(TEXT("success"), true);
 	return FMonolithActionResult::Success(Root);
 }

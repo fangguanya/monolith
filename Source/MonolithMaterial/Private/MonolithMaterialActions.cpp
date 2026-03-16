@@ -278,6 +278,60 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("to_input"), TEXT("string"), TEXT("Target input pin name (empty = default)"))
 			.Optional(TEXT("to_property"), TEXT("string"), TEXT("Material property name: BaseColor, Roughness, etc. (for expr-to-material)"))
 			.Build());
+
+	// --- Wave 3: Free wins (graph utilities & inspection) ---
+
+	Registry.RegisterAction(TEXT("material"), TEXT("auto_layout"),
+		TEXT("Auto-layout all expression nodes in a material or material function graph"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::AutoLayout),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material or material function asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("duplicate_expression"),
+		TEXT("Duplicate an expression node within the same material. Output connections are NOT duplicated (input connections are preserved)"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::DuplicateExpression),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material asset path"))
+			.Required(TEXT("expression_name"), TEXT("string"), TEXT("Name of the expression to duplicate"))
+			.Optional(TEXT("offset_x"), TEXT("integer"), TEXT("X offset from original position"), TEXT("50"))
+			.Optional(TEXT("offset_y"), TEXT("integer"), TEXT("Y offset from original position"), TEXT("50"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("list_expression_classes"),
+		TEXT("List all available material expression classes with pin counts. First call may take 1-2s (cached after)"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::ListExpressionClasses),
+		FParamSchemaBuilder()
+			.Optional(TEXT("filter"), TEXT("string"), TEXT("Substring filter on class name (case-insensitive)"))
+			.Optional(TEXT("category"), TEXT("string"), TEXT("Filter by MenuCategories substring"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("get_expression_connections"),
+		TEXT("Get all input connections and output consumers for a single expression"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::GetExpressionConnections),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material asset path"))
+			.Required(TEXT("expression_name"), TEXT("string"), TEXT("Name of the expression"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("move_expression"),
+		TEXT("Move one or more expression nodes to new positions"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::MoveExpression),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material asset path"))
+			.Optional(TEXT("expression_name"), TEXT("string"), TEXT("Single expression to move"))
+			.Optional(TEXT("pos_x"), TEXT("integer"), TEXT("X position (or offset if relative=true)"))
+			.Optional(TEXT("pos_y"), TEXT("integer"), TEXT("Y position (or offset if relative=true)"))
+			.Optional(TEXT("relative"), TEXT("bool"), TEXT("Treat pos_x/pos_y as offsets from current position"), TEXT("false"))
+			.Optional(TEXT("expressions"), TEXT("array"), TEXT("Batch: array of {name, x, y} objects"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("get_material_properties"),
+		TEXT("Get top-level material properties: blend mode, shading model, domain, usage flags, etc."),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::GetMaterialProperties),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material or material instance asset path"))
+			.Build());
 }
 
 // ============================================================================
@@ -2126,33 +2180,47 @@ FMonolithActionResult FMonolithMaterialActions::GetLayerInfo(const TSharedPtr<FJ
 // Wave 2 — Helpers
 // ============================================================================
 
-static EMaterialDomain ParseMaterialDomain(const FString& Str)
+// Generic enum parser using StaticEnum — handles bare names ("Opaque"),
+// prefixed ("BLEND_Opaque"), and fully qualified ("EBlendMode::Opaque") forms.
+template<typename TEnum>
+static bool ParseEnum(const FString& Str, TEnum& OutValue, FString& OutError)
 {
-	if (Str.Equals(TEXT("DeferredDecal"), ESearchCase::IgnoreCase)) return MD_DeferredDecal;
-	if (Str.Equals(TEXT("PostProcess"), ESearchCase::IgnoreCase)) return MD_PostProcess;
-	if (Str.Equals(TEXT("LightFunction"), ESearchCase::IgnoreCase)) return MD_LightFunction;
-	if (Str.Equals(TEXT("UI"), ESearchCase::IgnoreCase)) return MD_UI;
-	return MD_Surface;
-}
+	const UEnum* Enum = StaticEnum<TEnum>();
 
-static EBlendMode ParseBlendMode(const FString& Str)
-{
-	if (Str.Equals(TEXT("Masked"), ESearchCase::IgnoreCase)) return BLEND_Masked;
-	if (Str.Equals(TEXT("Translucent"), ESearchCase::IgnoreCase)) return BLEND_Translucent;
-	if (Str.Equals(TEXT("Additive"), ESearchCase::IgnoreCase)) return BLEND_Additive;
-	if (Str.Equals(TEXT("Modulate"), ESearchCase::IgnoreCase)) return BLEND_Modulate;
-	if (Str.Equals(TEXT("AlphaComposite"), ESearchCase::IgnoreCase)) return BLEND_AlphaComposite;
-	return BLEND_Opaque;
-}
+	// Pass 1: try the raw input (handles prefixed and fully qualified forms)
+	int64 Value = Enum->GetValueByNameString(Str);
 
-static EMaterialShadingModel ParseShadingModel(const FString& Str)
-{
-	if (Str.Equals(TEXT("Unlit"), ESearchCase::IgnoreCase)) return MSM_Unlit;
-	if (Str.Equals(TEXT("Subsurface"), ESearchCase::IgnoreCase)) return MSM_Subsurface;
-	if (Str.Equals(TEXT("SubsurfaceProfile"), ESearchCase::IgnoreCase)) return MSM_SubsurfaceProfile;
-	if (Str.Equals(TEXT("ClearCoat"), ESearchCase::IgnoreCase)) return MSM_ClearCoat;
-	if (Str.Equals(TEXT("TwoSidedFoliage"), ESearchCase::IgnoreCase)) return MSM_TwoSidedFoliage;
-	return MSM_DefaultLit;
+	// Pass 2: if raw failed, try prepending common enum prefixes for short names
+	if (Value == INDEX_NONE)
+	{
+		// Extract the prefix from the first enum value (e.g., "BLEND_" from "BLEND_Opaque")
+		FString FirstName = Enum->GetNameStringByIndex(0);
+		int32 UnderscoreIdx;
+		if (FirstName.FindChar('_', UnderscoreIdx))
+		{
+			FString Prefix = FirstName.Left(UnderscoreIdx + 1); // e.g., "BLEND_"
+			Value = Enum->GetValueByNameString(Prefix + Str);
+		}
+	}
+
+	if (Value == INDEX_NONE)
+	{
+		TArray<FString> ValidNames;
+		for (int32 i = 0; i < Enum->NumEnums() - 1; i++)
+		{
+			FString Name = Enum->GetNameStringByIndex(i);
+			// Filter out sentinel values (_MAX, _NUM, FromMaterialExpression)
+			if (Name.EndsWith(TEXT("_MAX")) || Name.EndsWith(TEXT("_NUM")) || Name.Contains(TEXT("FromMaterial")))
+			{
+				continue;
+			}
+			ValidNames.Add(Name);
+		}
+		OutError = FString::Printf(TEXT("Invalid value '%s'. Valid values: %s"), *Str, *FString::Join(ValidNames, TEXT(", ")));
+		return false;
+	}
+	OutValue = static_cast<TEnum>(Value);
+	return true;
 }
 
 // ============================================================================
@@ -2208,9 +2276,25 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterial(const TSharedPtr<
 	}
 
 	// Set material properties
-	NewMat->MaterialDomain = ParseMaterialDomain(DomainStr);
-	NewMat->BlendMode = ParseBlendMode(BlendModeStr);
-	NewMat->SetShadingModel(ParseShadingModel(ShadingModelStr));
+	FString EnumError;
+	EMaterialDomain Domain;
+	if (!ParseEnum<EMaterialDomain>(DomainStr, Domain, EnumError))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("material_domain: %s"), *EnumError));
+	}
+	EBlendMode BlendMode;
+	if (!ParseEnum<EBlendMode>(BlendModeStr, BlendMode, EnumError))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("blend_mode: %s"), *EnumError));
+	}
+	EMaterialShadingModel ShadingModel;
+	if (!ParseEnum<EMaterialShadingModel>(ShadingModelStr, ShadingModel, EnumError))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("shading_model: %s"), *EnumError));
+	}
+	NewMat->MaterialDomain = Domain;
+	NewMat->BlendMode = BlendMode;
+	NewMat->SetShadingModel(ShadingModel);
 	NewMat->TwoSided = bTwoSided;
 
 	// Register with asset registry and mark dirty
@@ -2383,19 +2467,40 @@ FMonolithActionResult FMonolithMaterialActions::SetMaterialProperty(const TShare
 	if (Params->HasField(TEXT("blend_mode")))
 	{
 		FString Val = Params->GetStringField(TEXT("blend_mode"));
-		Mat->BlendMode = ParseBlendMode(Val);
+		FString EnumError;
+		EBlendMode ParsedMode;
+		if (!ParseEnum<EBlendMode>(Val, ParsedMode, EnumError))
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("blend_mode: %s"), *EnumError));
+		}
+		Mat->BlendMode = ParsedMode;
 		RecordChange(TEXT("blend_mode"), Val);
 	}
 	if (Params->HasField(TEXT("shading_model")))
 	{
 		FString Val = Params->GetStringField(TEXT("shading_model"));
-		Mat->SetShadingModel(ParseShadingModel(Val));
+		FString EnumError;
+		EMaterialShadingModel ParsedModel;
+		if (!ParseEnum<EMaterialShadingModel>(Val, ParsedModel, EnumError))
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("shading_model: %s"), *EnumError));
+		}
+		Mat->SetShadingModel(ParsedModel);
 		RecordChange(TEXT("shading_model"), Val);
 	}
 	if (Params->HasField(TEXT("material_domain")))
 	{
 		FString Val = Params->GetStringField(TEXT("material_domain"));
-		Mat->MaterialDomain = ParseMaterialDomain(Val);
+		FString EnumError;
+		EMaterialDomain ParsedDomain;
+		if (!ParseEnum<EMaterialDomain>(Val, ParsedDomain, EnumError))
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("material_domain: %s"), *EnumError));
+		}
+		Mat->MaterialDomain = ParsedDomain;
 		RecordChange(TEXT("material_domain"), Val);
 	}
 	if (Params->HasField(TEXT("two_sided")))
@@ -2871,7 +2976,30 @@ FMonolithActionResult FMonolithMaterialActions::SetExpressionProperty(const TSha
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
 	FString ExprName = Params->GetStringField(TEXT("expression_name"));
 	FString PropName = Params->GetStringField(TEXT("property_name"));
-	FString ValueStr = Params->GetStringField(TEXT("value"));
+
+	// Extract value as string regardless of JSON type — GetStringField returns ""
+	// for JSON numbers, which then gets Atof'd to 0.0 (Bug #6).
+	FString ValueStr;
+	{
+		const TSharedPtr<FJsonValue>* ValueField = Params->Values.Find(TEXT("value"));
+		if (ValueField && ValueField->IsValid())
+		{
+			switch ((*ValueField)->Type)
+			{
+				case EJson::Number:
+					ValueStr = FString::SanitizeFloat((*ValueField)->AsNumber());
+					break;
+				case EJson::Boolean:
+					ValueStr = (*ValueField)->AsBool() ? TEXT("true") : TEXT("false");
+					break;
+				case EJson::String:
+					ValueStr = (*ValueField)->AsString();
+					break;
+				default:
+					break;
+			}
+		}
+	}
 
 	UMaterial* Mat = LoadBaseMaterial(AssetPath);
 	if (!Mat)
@@ -3072,6 +3200,613 @@ FMonolithActionResult FMonolithMaterialActions::ConnectExpressions(const TShared
 		TArray<TSharedPtr<FJsonValue>> WarnArr;
 		for (const FString& W : Warnings) WarnArr.Add(MakeShared<FJsonValueString>(W));
 		ResultJson->SetArrayField(TEXT("warnings"), WarnArr);
+	}
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Wave 3 — Free Wins
+// ============================================================================
+
+// ============================================================================
+// Action: auto_layout
+// Params: { "asset_path": "..." }
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::AutoLayout(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+
+	// Try as UMaterialFunction first (covers MaterialLayer, MaterialLayerBlend too)
+	UMaterialFunction* MatFunc = Cast<UMaterialFunction>(LoadedAsset);
+	if (MatFunc)
+	{
+		int32 ExprCount = MatFunc->GetExpressions().Num();
+		UMaterialEditingLibrary::LayoutMaterialFunctionExpressions(MatFunc);
+		ResultJson->SetStringField(TEXT("type"), TEXT("MaterialFunction"));
+		ResultJson->SetNumberField(TEXT("expression_count"), ExprCount);
+		return FMonolithActionResult::Success(ResultJson);
+	}
+
+	// Try as UMaterial
+	UMaterial* Mat = Cast<UMaterial>(LoadedAsset);
+	if (Mat)
+	{
+		int32 ExprCount = Mat->GetExpressions().Num();
+		UMaterialEditingLibrary::LayoutMaterialExpressions(Mat);
+		ResultJson->SetStringField(TEXT("type"), TEXT("Material"));
+		ResultJson->SetNumberField(TEXT("expression_count"), ExprCount);
+		return FMonolithActionResult::Success(ResultJson);
+	}
+
+	return FMonolithActionResult::Error(FString::Printf(TEXT("Asset '%s' is not a Material or MaterialFunction"), *AssetPath));
+}
+
+// ============================================================================
+// Action: duplicate_expression
+// Params: { "asset_path", "expression_name", "offset_x"?, "offset_y"? }
+// Note: Output connections are NOT duplicated (input connections are preserved) by UMaterialEditingLibrary::DuplicateMaterialExpression
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::DuplicateExpression(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString ExprName = Params->GetStringField(TEXT("expression_name"));
+	int32 OffsetX = Params->HasField(TEXT("offset_x")) ? static_cast<int32>(Params->GetNumberField(TEXT("offset_x"))) : 50;
+	int32 OffsetY = Params->HasField(TEXT("offset_y")) ? static_cast<int32>(Params->GetNumberField(TEXT("offset_y"))) : 50;
+
+	UMaterial* Mat = LoadBaseMaterial(AssetPath);
+	if (!Mat)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load base material at '%s'"), *AssetPath));
+	}
+
+	// Find source expression
+	UMaterialExpression* SourceExpr = nullptr;
+	for (const TObjectPtr<UMaterialExpression>& Expr : Mat->GetExpressions())
+	{
+		if (Expr && Expr->GetName() == ExprName)
+		{
+			SourceExpr = Expr;
+			break;
+		}
+	}
+
+	if (!SourceExpr)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Expression '%s' not found in material '%s'"), *ExprName, *AssetPath));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("DuplicateExpression")));
+	Mat->Modify();
+
+	UMaterialExpression* NewExpr = UMaterialEditingLibrary::DuplicateMaterialExpression(Mat, nullptr, SourceExpr);
+	if (!NewExpr)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to duplicate expression '%s'"), *ExprName));
+	}
+
+	// Apply position offset
+	NewExpr->MaterialExpressionEditorX = SourceExpr->MaterialExpressionEditorX + OffsetX;
+	NewExpr->MaterialExpressionEditorY = SourceExpr->MaterialExpressionEditorY + OffsetY;
+
+	Mat->PreEditChange(nullptr);
+	Mat->PostEditChange();
+	GEditor->EndTransaction();
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetStringField(TEXT("source_name"), ExprName);
+	ResultJson->SetStringField(TEXT("new_name"), NewExpr->GetName());
+	ResultJson->SetStringField(TEXT("class"), NewExpr->GetClass()->GetName());
+	ResultJson->SetNumberField(TEXT("pos_x"), NewExpr->MaterialExpressionEditorX);
+	ResultJson->SetNumberField(TEXT("pos_y"), NewExpr->MaterialExpressionEditorY);
+	ResultJson->SetStringField(TEXT("note"), TEXT("Output connections are NOT duplicated (input connections are preserved) — only the expression node itself is copied"));
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: list_expression_classes
+// Params: { "filter"?, "category"? }
+// Cached in a static TMap — first call creates temp instances (~1-2s), subsequent calls instant.
+// ============================================================================
+
+namespace
+{
+	struct FExpressionClassInfo
+	{
+		FString ClassName;
+		FString DisplayName;
+		FString MenuCategories;
+		bool bIsParameter;
+		int32 InputCount;
+		int32 OutputCount;
+	};
+
+	static TArray<FExpressionClassInfo> GCachedExpressionClasses;
+	static bool GExpressionClassesCached = false;
+
+	void EnsureExpressionClassCache()
+	{
+		if (GExpressionClassesCached)
+		{
+			return;
+		}
+
+		TArray<UClass*> DerivedClasses;
+		GetDerivedClasses(UMaterialExpression::StaticClass(), DerivedClasses, true);
+
+		for (UClass* Class : DerivedClasses)
+		{
+			if (!Class || Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_Hidden))
+			{
+				continue;
+			}
+
+			// Create temporary instance to read pin info
+			UMaterialExpression* TempExpr = NewObject<UMaterialExpression>(GetTransientPackage(), Class, NAME_None, RF_Transient);
+			if (!TempExpr)
+			{
+				continue;
+			}
+
+			FExpressionClassInfo Info;
+			Info.ClassName = Class->GetName();
+			Info.DisplayName = Class->GetDisplayNameText().ToString();
+			Info.bIsParameter = Class->IsChildOf(UMaterialExpressionParameter::StaticClass())
+				|| Class->IsChildOf(UMaterialExpressionTextureSampleParameter::StaticClass());
+
+			// Read keywords from the temp instance
+			Info.MenuCategories = TempExpr->GetKeywords().ToString();
+
+			// Count inputs
+			Info.InputCount = 0;
+			for (int32 i = 0; ; ++i)
+			{
+				if (!TempExpr->GetInput(i))
+				{
+					break;
+				}
+				Info.InputCount++;
+			}
+
+			// Count outputs
+			Info.OutputCount = TempExpr->Outputs.Num();
+
+			GCachedExpressionClasses.Add(MoveTemp(Info));
+
+			TempExpr->MarkAsGarbage();
+		}
+
+		// Sort alphabetically
+		GCachedExpressionClasses.Sort([](const FExpressionClassInfo& A, const FExpressionClassInfo& B)
+		{
+			return A.ClassName < B.ClassName;
+		});
+
+		GExpressionClassesCached = true;
+	}
+}
+
+FMonolithActionResult FMonolithMaterialActions::ListExpressionClasses(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Filter = Params->HasField(TEXT("filter")) ? Params->GetStringField(TEXT("filter")) : TEXT("");
+	FString Category = Params->HasField(TEXT("category")) ? Params->GetStringField(TEXT("category")) : TEXT("");
+
+	EnsureExpressionClassCache();
+
+	TArray<TSharedPtr<FJsonValue>> ClassesArray;
+	for (const FExpressionClassInfo& Info : GCachedExpressionClasses)
+	{
+		// Apply filter
+		if (!Filter.IsEmpty() && !Info.ClassName.Contains(Filter, ESearchCase::IgnoreCase)
+			&& !Info.DisplayName.Contains(Filter, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		if (!Category.IsEmpty() && !Info.MenuCategories.Contains(Category, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		auto ClassJson = MakeShared<FJsonObject>();
+		ClassJson->SetStringField(TEXT("class_name"), Info.ClassName);
+		ClassJson->SetStringField(TEXT("display_name"), Info.DisplayName);
+		ClassJson->SetBoolField(TEXT("is_parameter"), Info.bIsParameter);
+		ClassJson->SetNumberField(TEXT("input_count"), Info.InputCount);
+		ClassJson->SetNumberField(TEXT("output_count"), Info.OutputCount);
+		if (!Info.MenuCategories.IsEmpty())
+		{
+			ClassJson->SetStringField(TEXT("keywords"), Info.MenuCategories);
+		}
+		ClassesArray.Add(MakeShared<FJsonValueObject>(ClassJson));
+	}
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetNumberField(TEXT("total_classes"), GCachedExpressionClasses.Num());
+	ResultJson->SetNumberField(TEXT("filtered_count"), ClassesArray.Num());
+	ResultJson->SetArrayField(TEXT("classes"), ClassesArray);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: get_expression_connections
+// Params: { "asset_path", "expression_name" }
+// Returns inputs (what feeds into this node) and output consumers (what this node feeds)
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::GetExpressionConnections(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString ExprName = Params->GetStringField(TEXT("expression_name"));
+
+	UMaterial* Mat = LoadBaseMaterial(AssetPath);
+	if (!Mat)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load base material at '%s'"), *AssetPath));
+	}
+
+	// Find target expression
+	UMaterialExpression* TargetExpr = nullptr;
+	TConstArrayView<TObjectPtr<UMaterialExpression>> Expressions = Mat->GetExpressions();
+	for (const TObjectPtr<UMaterialExpression>& Expr : Expressions)
+	{
+		if (Expr && Expr->GetName() == ExprName)
+		{
+			TargetExpr = Expr;
+			break;
+		}
+	}
+
+	if (!TargetExpr)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Expression '%s' not found in material '%s'"), *ExprName, *AssetPath));
+	}
+
+	// --- Inputs: what feeds into this expression ---
+	TArray<TSharedPtr<FJsonValue>> InputsArray;
+	for (int32 i = 0; ; ++i)
+	{
+		FExpressionInput* Input = TargetExpr->GetInput(i);
+		if (!Input)
+		{
+			break;
+		}
+		auto InputJson = MakeShared<FJsonObject>();
+		InputJson->SetNumberField(TEXT("index"), i);
+		InputJson->SetStringField(TEXT("name"), TargetExpr->GetInputName(i).ToString());
+		InputJson->SetBoolField(TEXT("connected"), Input->Expression != nullptr);
+		if (Input->Expression)
+		{
+			InputJson->SetStringField(TEXT("connected_to"), Input->Expression->GetName());
+			InputJson->SetNumberField(TEXT("output_index"), Input->OutputIndex);
+			// Include output name if available
+			const TArray<FExpressionOutput>& SourceOutputs = Input->Expression->Outputs;
+			if (SourceOutputs.IsValidIndex(Input->OutputIndex))
+			{
+				InputJson->SetStringField(TEXT("output_name"), SourceOutputs[Input->OutputIndex].OutputName.ToString());
+			}
+		}
+		InputsArray.Add(MakeShared<FJsonValueObject>(InputJson));
+	}
+
+	// --- Outputs: what consumes this expression ---
+	// Build per-output-index consumer lists
+	TMap<int32, TArray<TSharedPtr<FJsonValue>>> OutputConsumers;
+	// Initialize with all known output indices
+	for (int32 i = 0; i < TargetExpr->Outputs.Num(); ++i)
+	{
+		OutputConsumers.FindOrAdd(i);
+	}
+
+	// Scan all expressions for inputs referencing TargetExpr
+	for (const TObjectPtr<UMaterialExpression>& Expr : Expressions)
+	{
+		if (!Expr)
+		{
+			continue;
+		}
+		for (int32 i = 0; ; ++i)
+		{
+			FExpressionInput* Input = Expr->GetInput(i);
+			if (!Input)
+			{
+				break;
+			}
+			if (Input->Expression == TargetExpr)
+			{
+				auto ConsumerJson = MakeShared<FJsonObject>();
+				ConsumerJson->SetStringField(TEXT("expression"), Expr->GetName());
+				ConsumerJson->SetStringField(TEXT("input_name"), Expr->GetInputName(i).ToString());
+				ConsumerJson->SetNumberField(TEXT("input_index"), i);
+				OutputConsumers.FindOrAdd(Input->OutputIndex).Add(MakeShared<FJsonValueObject>(ConsumerJson));
+			}
+		}
+	}
+
+	// Also scan material output slots
+	for (const FMaterialOutputEntry& Entry : MaterialOutputEntries)
+	{
+		FExpressionInput* Input = Mat->GetExpressionInputForProperty(Entry.Property);
+		if (Input && Input->Expression == TargetExpr)
+		{
+			auto ConsumerJson = MakeShared<FJsonObject>();
+			ConsumerJson->SetStringField(TEXT("material_output"), Entry.Name);
+			OutputConsumers.FindOrAdd(Input->OutputIndex).Add(MakeShared<FJsonValueObject>(ConsumerJson));
+		}
+	}
+
+	// Build outputs array
+	TArray<TSharedPtr<FJsonValue>> OutputsArray;
+	for (int32 i = 0; i < TargetExpr->Outputs.Num(); ++i)
+	{
+		auto OutputJson = MakeShared<FJsonObject>();
+		OutputJson->SetNumberField(TEXT("index"), i);
+		OutputJson->SetStringField(TEXT("name"), TargetExpr->Outputs[i].OutputName.ToString());
+		TArray<TSharedPtr<FJsonValue>>* Consumers = OutputConsumers.Find(i);
+		OutputJson->SetArrayField(TEXT("consumers"), Consumers ? *Consumers : TArray<TSharedPtr<FJsonValue>>());
+		OutputJson->SetNumberField(TEXT("consumer_count"), Consumers ? Consumers->Num() : 0);
+		OutputsArray.Add(MakeShared<FJsonValueObject>(OutputJson));
+	}
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetStringField(TEXT("expression_name"), ExprName);
+	ResultJson->SetStringField(TEXT("class"), TargetExpr->GetClass()->GetName());
+	ResultJson->SetArrayField(TEXT("inputs"), InputsArray);
+	ResultJson->SetArrayField(TEXT("outputs"), OutputsArray);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: move_expression
+// Params: { "asset_path", "expression_name"?, "pos_x"?, "pos_y"?, "relative"?, "expressions"? }
+// Single move: expression_name + pos_x + pos_y
+// Batch move: expressions = [{name, x, y}]
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::MoveExpression(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UMaterial* Mat = LoadBaseMaterial(AssetPath);
+	if (!Mat)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load base material at '%s'"), *AssetPath));
+	}
+
+	// Build a list of move operations
+	struct FMoveOp
+	{
+		FString Name;
+		int32 X;
+		int32 Y;
+	};
+	TArray<FMoveOp> MoveOps;
+	bool bRelative = Params->HasField(TEXT("relative")) ? Params->GetBoolField(TEXT("relative")) : false;
+
+	const TArray<TSharedPtr<FJsonValue>>* ExpressionsArr = nullptr;
+	// Handle Claude Code JSON string serialization quirk — array may arrive as string
+	TSharedPtr<FJsonValue> ExpressionsField = Params->TryGetField(TEXT("expressions"));
+	TArray<TSharedPtr<FJsonValue>> ParsedArray;
+	if (ExpressionsField.IsValid())
+	{
+		if (ExpressionsField->Type == EJson::Array)
+		{
+			ExpressionsArr = &ExpressionsField->AsArray();
+		}
+		else if (ExpressionsField->Type == EJson::String)
+		{
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ExpressionsField->AsString());
+			TSharedPtr<FJsonValue> Parsed;
+			if (FJsonSerializer::Deserialize(Reader, Parsed) && Parsed.IsValid() && Parsed->Type == EJson::Array)
+			{
+				ParsedArray = Parsed->AsArray();
+				ExpressionsArr = &ParsedArray;
+			}
+		}
+	}
+	if (ExpressionsArr && ExpressionsArr->Num() > 0)
+	{
+		for (const TSharedPtr<FJsonValue>& Val : *ExpressionsArr)
+		{
+			const TSharedPtr<FJsonObject>* ObjPtr = nullptr;
+			if (Val && Val->TryGetObject(ObjPtr) && ObjPtr)
+			{
+				FMoveOp Op;
+				Op.Name = (*ObjPtr)->GetStringField(TEXT("name"));
+				// Accept both "x"/"y" and "pos_x"/"pos_y"
+				Op.X = static_cast<int32>((*ObjPtr)->HasField(TEXT("x")) ? (*ObjPtr)->GetNumberField(TEXT("x")) : (*ObjPtr)->GetNumberField(TEXT("pos_x")));
+				Op.Y = static_cast<int32>((*ObjPtr)->HasField(TEXT("y")) ? (*ObjPtr)->GetNumberField(TEXT("y")) : (*ObjPtr)->GetNumberField(TEXT("pos_y")));
+				MoveOps.Add(MoveTemp(Op));
+			}
+		}
+	}
+	else if (Params->HasField(TEXT("expression_name")))
+	{
+		FMoveOp Op;
+		Op.Name = Params->GetStringField(TEXT("expression_name"));
+		Op.X = Params->HasField(TEXT("pos_x")) ? static_cast<int32>(Params->GetNumberField(TEXT("pos_x"))) : 0;
+		Op.Y = Params->HasField(TEXT("pos_y")) ? static_cast<int32>(Params->GetNumberField(TEXT("pos_y"))) : 0;
+		MoveOps.Add(MoveTemp(Op));
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("Must provide either 'expression_name' or 'expressions' array"));
+	}
+
+	if (MoveOps.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("No move operations specified"));
+	}
+
+	// Build name -> expression lookup
+	TMap<FString, UMaterialExpression*> NameToExpr;
+	for (const TObjectPtr<UMaterialExpression>& Expr : Mat->GetExpressions())
+	{
+		if (Expr)
+		{
+			NameToExpr.Add(Expr->GetName(), Expr);
+		}
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("MoveExpression")));
+	Mat->Modify();
+
+	TArray<TSharedPtr<FJsonValue>> MovedArray;
+	TArray<FString> NotFound;
+
+	for (const FMoveOp& Op : MoveOps)
+	{
+		UMaterialExpression** FoundPtr = NameToExpr.Find(Op.Name);
+		if (!FoundPtr || !*FoundPtr)
+		{
+			NotFound.Add(Op.Name);
+			continue;
+		}
+
+		UMaterialExpression* Expr = *FoundPtr;
+		if (bRelative)
+		{
+			Expr->MaterialExpressionEditorX += Op.X;
+			Expr->MaterialExpressionEditorY += Op.Y;
+		}
+		else
+		{
+			Expr->MaterialExpressionEditorX = Op.X;
+			Expr->MaterialExpressionEditorY = Op.Y;
+		}
+
+		auto MovedJson = MakeShared<FJsonObject>();
+		MovedJson->SetStringField(TEXT("name"), Op.Name);
+		MovedJson->SetNumberField(TEXT("x"), Expr->MaterialExpressionEditorX);
+		MovedJson->SetNumberField(TEXT("y"), Expr->MaterialExpressionEditorY);
+		MovedArray.Add(MakeShared<FJsonValueObject>(MovedJson));
+	}
+
+	Mat->PreEditChange(nullptr);
+	Mat->PostEditChange();
+	GEditor->EndTransaction();
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetNumberField(TEXT("moved_count"), MovedArray.Num());
+	ResultJson->SetArrayField(TEXT("moved"), MovedArray);
+	if (NotFound.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> NotFoundArr;
+		for (const FString& Name : NotFound) NotFoundArr.Add(MakeShared<FJsonValueString>(Name));
+		ResultJson->SetArrayField(TEXT("not_found"), NotFoundArr);
+	}
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: get_material_properties
+// Params: { "asset_path": "..." }
+// Works on both UMaterial and UMaterialInstance (loaded as UMaterialInterface)
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::GetMaterialProperties(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UMaterialInterface* MatInterface = LoadedAsset ? Cast<UMaterialInterface>(LoadedAsset) : nullptr;
+	if (!MatInterface)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load material at '%s'"), *AssetPath));
+	}
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetStringField(TEXT("asset_class"), MatInterface->GetClass()->GetName());
+
+	// Get blend mode
+	EBlendMode BlendMode = MatInterface->GetBlendMode();
+	const UEnum* BlendEnum = StaticEnum<EBlendMode>();
+	ResultJson->SetStringField(TEXT("blend_mode"), BlendEnum->GetNameStringByIndex(static_cast<int32>(BlendMode)));
+
+	// Get shading model(s)
+	FMaterialShadingModelField ShadingModels = MatInterface->GetShadingModels();
+	EMaterialShadingModel FirstModel = ShadingModels.GetFirstShadingModel();
+	const UEnum* ShadingEnum = StaticEnum<EMaterialShadingModel>();
+	ResultJson->SetStringField(TEXT("shading_model"), ShadingEnum->GetNameStringByIndex(static_cast<int32>(FirstModel)));
+
+	// If multiple shading models, list them all
+	if (ShadingModels.CountShadingModels() > 1)
+	{
+		TArray<TSharedPtr<FJsonValue>> ModelsArr;
+		for (int32 i = 0; i < static_cast<int32>(MSM_NUM); ++i)
+		{
+			if (ShadingModels.HasShadingModel(static_cast<EMaterialShadingModel>(i)))
+			{
+				ModelsArr.Add(MakeShared<FJsonValueString>(ShadingEnum->GetNameStringByIndex(i)));
+			}
+		}
+		ResultJson->SetArrayField(TEXT("shading_models"), ModelsArr);
+	}
+
+	// Material domain — only available on base UMaterial
+	UMaterial* BaseMat = MatInterface->GetMaterial();
+	if (BaseMat)
+	{
+		const UEnum* DomainEnum = StaticEnum<EMaterialDomain>();
+		ResultJson->SetStringField(TEXT("material_domain"), DomainEnum->GetNameStringByIndex(static_cast<int32>(BaseMat->MaterialDomain)));
+		ResultJson->SetBoolField(TEXT("two_sided"), BaseMat->TwoSided != 0);
+		ResultJson->SetNumberField(TEXT("opacity_mask_clip_value"), BaseMat->OpacityMaskClipValue);
+		ResultJson->SetBoolField(TEXT("dithered_lod_transition"), BaseMat->DitheredLODTransition != 0);
+		ResultJson->SetNumberField(TEXT("expression_count"), BaseMat->GetExpressions().Num());
+	}
+
+	// Is it translucent?
+	ResultJson->SetBoolField(TEXT("is_translucent"), IsTranslucentBlendMode(BlendMode));
+	ResultJson->SetBoolField(TEXT("is_masked"), BlendMode == BLEND_Masked);
+
+	// Usage flags
+	auto UsageJson = MakeShared<FJsonObject>();
+	if (BaseMat)
+	{
+		UsageJson->SetBoolField(TEXT("skeletal_mesh"), BaseMat->GetUsageByFlag(MATUSAGE_SkeletalMesh));
+		UsageJson->SetBoolField(TEXT("particle_sprites"), BaseMat->GetUsageByFlag(MATUSAGE_ParticleSprites));
+		UsageJson->SetBoolField(TEXT("beam_trails"), BaseMat->GetUsageByFlag(MATUSAGE_BeamTrails));
+		UsageJson->SetBoolField(TEXT("mesh_particles"), BaseMat->GetUsageByFlag(MATUSAGE_MeshParticles));
+		UsageJson->SetBoolField(TEXT("static_lighting"), BaseMat->GetUsageByFlag(MATUSAGE_StaticLighting));
+		UsageJson->SetBoolField(TEXT("morph_targets"), BaseMat->GetUsageByFlag(MATUSAGE_MorphTargets));
+		UsageJson->SetBoolField(TEXT("spline_mesh"), BaseMat->GetUsageByFlag(MATUSAGE_SplineMesh));
+		UsageJson->SetBoolField(TEXT("instanced_static_meshes"), BaseMat->GetUsageByFlag(MATUSAGE_InstancedStaticMeshes));
+		UsageJson->SetBoolField(TEXT("niagara_sprites"), BaseMat->GetUsageByFlag(MATUSAGE_NiagaraSprites));
+		UsageJson->SetBoolField(TEXT("niagara_meshes"), BaseMat->GetUsageByFlag(MATUSAGE_NiagaraMeshParticles));
+		UsageJson->SetBoolField(TEXT("niagara_ribbons"), BaseMat->GetUsageByFlag(MATUSAGE_NiagaraRibbons));
+		UsageJson->SetBoolField(TEXT("virtual_heightfield_mesh"), BaseMat->GetUsageByFlag(MATUSAGE_VirtualHeightfieldMesh));
+	}
+	ResultJson->SetObjectField(TEXT("usage_flags"), UsageJson);
+
+	// Check if this is a material instance — report parent
+	UMaterialInstance* MatInst = Cast<UMaterialInstance>(MatInterface);
+	if (MatInst && MatInst->Parent)
+	{
+		ResultJson->SetStringField(TEXT("parent_material"), MatInst->Parent->GetPathName());
+		ResultJson->SetBoolField(TEXT("is_instance"), true);
+	}
+	else
+	{
+		ResultJson->SetBoolField(TEXT("is_instance"), false);
 	}
 
 	return FMonolithActionResult::Success(ResultJson);

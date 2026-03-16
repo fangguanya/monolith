@@ -1,26 +1,8 @@
 # Monolith — TODO
 
-Last updated: 2026-03-15
+Last updated: 2026-03-16
 
 ---
-
-## Bugs (fix these first)
-
-### Critical
-
-None! All critical bugs resolved.
-
-### Moderate
-
-None!
-
-### Recently Fixed (2026-03-15)
-
-- [x] **Niagara emitter lookup — numeric index fallback** — FIXED (2026-03-15). `FindEmitterHandleIndex` already supported display names, GUIDs, and instance names. Added numeric index strings ("0", "1") as last-resort fallback.
-
-- [x] **Niagara `create_module_from_hlsl` — inputs now exposed as overridable parameters** — FIXED (2026-03-15). Two-part fix: (1) Added standalone `UNiagaraNodeInput` per typed input to the script graph — `FindInputNodes` picks them up, `AllocateDefaultPins` creates FunctionCall pins. (2) Added CustomHlsl fallback in `get_module_inputs` and `set_module_input_value` — when `GetStackFunctionInputs` returns empty (no Module.-prefixed map entries), reads FunctionCall typed pins directly.
-
-- [x] **Niagara `create_module_from_hlsl` — dot validation for I/O names** — FIXED (2026-03-15). Validates input/output names for dots before graph creation. Returns clear error with usage-specific guidance (modules: use ParameterMap writes, functions: use bare names).
 
 ### Recently Fixed (2026-03-14)
 

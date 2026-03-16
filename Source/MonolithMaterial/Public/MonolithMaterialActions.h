@@ -49,6 +49,14 @@ public:
 	static FMonolithActionResult SetExpressionProperty(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult ConnectExpressions(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Wave 3: Free wins (graph utilities & inspection) ---
+	static FMonolithActionResult AutoLayout(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult DuplicateExpression(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult ListExpressionClasses(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult GetExpressionConnections(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult MoveExpression(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult GetMaterialProperties(const TSharedPtr<FJsonObject>& Params);
+
 private:
 	/** Load a UMaterial from an asset path. Returns nullptr on failure. */
 	static UMaterial* LoadBaseMaterial(const FString& AssetPath);

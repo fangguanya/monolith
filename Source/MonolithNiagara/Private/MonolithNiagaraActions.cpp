@@ -4695,11 +4695,22 @@ FMonolithActionResult FMonolithNiagaraActions::HandleListModuleScripts(const TSh
 		// Filter by usage if specified
 		if (!UsageFilter.IsEmpty() && UsageFilter != TEXT("all") && InferredUsage != UsageFilter) continue;
 
-		// Filter by search keyword
-		if (!Search.IsEmpty() && !AssetName.Contains(Search, ESearchCase::IgnoreCase)
-			&& !PackagePath.Contains(Search, ESearchCase::IgnoreCase))
+		// Filter by search keyword — tokenize on spaces so "gravity force" matches "GravityForce"
+		if (!Search.IsEmpty())
 		{
-			continue;
+			TArray<FString> Tokens;
+			Search.ParseIntoArray(Tokens, TEXT(" "), true);
+			bool bAllMatch = true;
+			for (const FString& Token : Tokens)
+			{
+				if (!AssetName.Contains(Token, ESearchCase::IgnoreCase)
+					&& !PackagePath.Contains(Token, ESearchCase::IgnoreCase))
+				{
+					bAllMatch = false;
+					break;
+				}
+			}
+			if (!bAllMatch) continue;
 		}
 
 		TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();

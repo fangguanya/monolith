@@ -207,8 +207,83 @@ FMonolithActionResult FMonolithBlueprintVariableActions::HandleAddVariable(const
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: type"));
 	}
 
+	// Normalize common aliases so users get sensible errors instead of silent bool fallback.
+	// Only normalize bare base types (not container-prefixed ones like "array:vector").
+	{
+		// Build a mutable working copy of just the base portion for alias checks
+		auto NormalizeBaseType = [](const FString& In) -> FString
+		{
+			if (In.Equals(TEXT("integer"),    ESearchCase::IgnoreCase)) return TEXT("int");
+			if (In.Equals(TEXT("boolean"),    ESearchCase::IgnoreCase)) return TEXT("bool");
+			if (In.Equals(TEXT("vector"),     ESearchCase::IgnoreCase)) return TEXT("struct:Vector");
+			if (In.Equals(TEXT("rotator"),    ESearchCase::IgnoreCase)) return TEXT("struct:Rotator");
+			if (In.Equals(TEXT("transform"),  ESearchCase::IgnoreCase)) return TEXT("struct:Transform");
+			if (In.Equals(TEXT("color"),      ESearchCase::IgnoreCase)) return TEXT("struct:LinearColor");
+			if (In.Equals(TEXT("linearcolor"),ESearchCase::IgnoreCase)) return TEXT("struct:LinearColor");
+			return In;
+		};
+
+		// Handle container prefixes — only normalize the part after the prefix
+		static const TCHAR* Prefixes[] = { TEXT("array:"), TEXT("set:"), TEXT("map:") };
+		bool bHandled = false;
+		for (const TCHAR* Prefix : Prefixes)
+		{
+			if (TypeStr.StartsWith(Prefix))
+			{
+				FString BaseStr = TypeStr.Mid(FCString::Strlen(Prefix));
+				FString Normalized = NormalizeBaseType(BaseStr);
+				if (Normalized != BaseStr)
+				{
+					TypeStr = FString(Prefix) + Normalized;
+				}
+				bHandled = true;
+				break;
+			}
+		}
+		if (!bHandled)
+		{
+			TypeStr = NormalizeBaseType(TypeStr);
+		}
+	}
+
 	FName VarName(*Name);
 	FEdGraphPinType PinType = MonolithBlueprintInternal::ParsePinTypeFromString(TypeStr);
+
+	// If the resolved type is the bool fallback but the caller didn't ask for bool,
+	// the type string was unrecognized — return a clear error instead of silently creating a bool.
+	{
+		// Extract base type (strip container prefix for the check)
+		FString BaseForCheck = TypeStr;
+		for (const TCHAR* Prefix : { TEXT("array:"), TEXT("set:"), TEXT("map:") })
+		{
+			if (TypeStr.StartsWith(Prefix))
+			{
+				BaseForCheck = TypeStr.Mid(FCString::Strlen(Prefix));
+				break;
+			}
+		}
+		// Known prefixed types that ParsePinTypeFromString handles correctly
+		const bool bKnownPrefixedType =
+			BaseForCheck.StartsWith(TEXT("object:")) ||
+			BaseForCheck.StartsWith(TEXT("class:"))  ||
+			BaseForCheck.StartsWith(TEXT("struct:"))  ||
+			BaseForCheck.StartsWith(TEXT("enum:"))   ||
+			BaseForCheck.StartsWith(TEXT("softobject:")) ||
+			BaseForCheck.StartsWith(TEXT("softclass:"));
+		const bool bCallerWantsBool =
+			BaseForCheck.Equals(TEXT("bool"), ESearchCase::IgnoreCase);
+
+		if (!bCallerWantsBool && !bKnownPrefixedType &&
+			PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unknown variable type '%s'. Valid types: bool, byte, int, int64, float, double, string, text, name, Vector, Rotator, Transform, LinearColor. "
+				     "For structs use struct:<Name>, objects use object:<Class>, enums use enum:<Name>. "
+				     "Container types: array:<type>, set:<type>, map:<key>:<value>."),
+				*TypeStr));
+		}
+	}
+
 	FString DefaultValue = Params->GetStringField(TEXT("default_value"));
 
 	// Add the variable

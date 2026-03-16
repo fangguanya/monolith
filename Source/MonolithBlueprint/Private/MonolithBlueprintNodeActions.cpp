@@ -1,5 +1,9 @@
 #include "MonolithBlueprintNodeActions.h"
 #include "MonolithBlueprintInternal.h"
+#include "MonolithBlueprintVariableActions.h"
+#include "MonolithBlueprintComponentActions.h"
+#include "MonolithBlueprintGraphActions.h"
+#include "MonolithBlueprintCompileActions.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -12,6 +16,9 @@
 #include "K2Node_ExecutionSequence.h"
 #include "K2Node_SpawnActorFromClass.h"
 #include "EdGraphSchema_K2.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Editor.h"
 
 // ============================================================
 //  Registration
@@ -88,6 +95,16 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Required(TEXT("node_id"),     TEXT("string"), TEXT("Node ID"))
 			.Required(TEXT("position"),    TEXT("array"),  TEXT("New position as [x, y]"))
 			.Optional(TEXT("graph_name"),  TEXT("string"), TEXT("Graph name (searches all graphs if omitted)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("batch_execute"),
+		TEXT("Execute multiple Blueprint write operations on a single asset in one transaction. Each operation is { \"op\": \"action_name\", ...action_params_minus_asset_path }. Supported ops: add_node, remove_node, connect_pins, disconnect_pins, set_pin_default, set_node_position, add_variable, remove_variable, rename_variable, set_variable_type, set_variable_defaults, add_local_variable, remove_local_variable, add_component, remove_component, rename_component, reparent_component, set_component_property, duplicate_component, add_function, remove_function, rename_function, add_macro, add_event_dispatcher, set_function_params, implement_interface, remove_interface."),
+		FMonolithActionHandler::CreateStatic(&HandleBatchExecute),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),         TEXT("string"),  TEXT("Blueprint asset path"))
+			.Required(TEXT("operations"),          TEXT("array"),   TEXT("Array of operation objects: { op, ...params }"))
+			.Optional(TEXT("compile_on_complete"), TEXT("boolean"), TEXT("Compile the Blueprint after all operations complete (default: false)"))
+			.Optional(TEXT("stop_on_error"),       TEXT("boolean"), TEXT("Stop processing on first failed operation (default: false)"))
 			.Build());
 }
 
@@ -732,4 +749,158 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleSetNodePosition(const
 
 	Root->SetBoolField(TEXT("success"), true);
 	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  batch_execute
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	// Parse operations — handle both EJson::Array (normal) and EJson::String (Claude Code quirk)
+	TArray<TSharedPtr<FJsonValue>> Ops;
+	TSharedPtr<FJsonValue> OpsField = Params->TryGetField(TEXT("operations"));
+	if (!OpsField.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required field: operations"));
+	}
+	if (OpsField->Type == EJson::Array)
+	{
+		Ops = OpsField->AsArray();
+	}
+	else if (OpsField->Type == EJson::String)
+	{
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(OpsField->AsString());
+		if (!FJsonSerializer::Deserialize(Reader, Ops))
+		{
+			return FMonolithActionResult::Error(TEXT("Failed to parse operations string as JSON array"));
+		}
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("'operations' must be an array"));
+	}
+
+	bool bStopOnError = false;
+	Params->TryGetBoolField(TEXT("stop_on_error"), bStopOnError);
+
+	bool bCompileOnComplete = false;
+	Params->TryGetBoolField(TEXT("compile_on_complete"), bCompileOnComplete);
+
+	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "BPBatchExec", "BP Batch Execute"));
+
+	TArray<TSharedPtr<FJsonValue>> Results;
+	int32 Ok = 0, Fail = 0;
+
+	for (int32 i = 0; i < Ops.Num(); ++i)
+	{
+		TSharedPtr<FJsonObject> Op = Ops[i]->AsObject();
+		TSharedRef<FJsonObject> RO = MakeShared<FJsonObject>();
+		RO->SetNumberField(TEXT("index"), i);
+
+		if (!Op.IsValid())
+		{
+			RO->SetStringField(TEXT("op"), TEXT("(invalid)"));
+			RO->SetBoolField(TEXT("success"), false);
+			RO->SetStringField(TEXT("error"), TEXT("Operation entry is not a valid JSON object"));
+			Results.Add(MakeShared<FJsonValueObject>(RO));
+			Fail++;
+			if (bStopOnError) break;
+			continue;
+		}
+
+		FString OpName = Op->GetStringField(TEXT("op"));
+		RO->SetStringField(TEXT("op"), OpName);
+
+		// Build sub-params: inject asset_path then copy all op fields
+		TSharedRef<FJsonObject> SubParams = MakeShared<FJsonObject>();
+		SubParams->SetStringField(TEXT("asset_path"), AssetPath);
+		for (auto& Pair : Op->Values)
+		{
+			SubParams->SetField(Pair.Key, Pair.Value);
+		}
+
+		FMonolithActionResult SubResult = FMonolithActionResult::Error(FString::Printf(TEXT("Unknown op: %s"), *OpName));
+
+		// Node ops
+		if      (OpName == TEXT("add_node"))               SubResult = HandleAddNode(SubParams);
+		else if (OpName == TEXT("remove_node"))            SubResult = HandleRemoveNode(SubParams);
+		else if (OpName == TEXT("connect_pins"))           SubResult = HandleConnectPins(SubParams);
+		else if (OpName == TEXT("disconnect_pins"))        SubResult = HandleDisconnectPins(SubParams);
+		else if (OpName == TEXT("set_pin_default"))        SubResult = HandleSetPinDefault(SubParams);
+		else if (OpName == TEXT("set_node_position"))      SubResult = HandleSetNodePosition(SubParams);
+		// Variable ops
+		else if (OpName == TEXT("add_variable"))           SubResult = FMonolithBlueprintVariableActions::HandleAddVariable(SubParams);
+		else if (OpName == TEXT("remove_variable"))        SubResult = FMonolithBlueprintVariableActions::HandleRemoveVariable(SubParams);
+		else if (OpName == TEXT("rename_variable"))        SubResult = FMonolithBlueprintVariableActions::HandleRenameVariable(SubParams);
+		else if (OpName == TEXT("set_variable_type"))      SubResult = FMonolithBlueprintVariableActions::HandleSetVariableType(SubParams);
+		else if (OpName == TEXT("set_variable_defaults"))  SubResult = FMonolithBlueprintVariableActions::HandleSetVariableDefaults(SubParams);
+		else if (OpName == TEXT("add_local_variable"))     SubResult = FMonolithBlueprintVariableActions::HandleAddLocalVariable(SubParams);
+		else if (OpName == TEXT("remove_local_variable"))  SubResult = FMonolithBlueprintVariableActions::HandleRemoveLocalVariable(SubParams);
+		// Component ops
+		else if (OpName == TEXT("add_component"))          SubResult = FMonolithBlueprintComponentActions::HandleAddComponent(SubParams);
+		else if (OpName == TEXT("remove_component"))       SubResult = FMonolithBlueprintComponentActions::HandleRemoveComponent(SubParams);
+		else if (OpName == TEXT("rename_component"))       SubResult = FMonolithBlueprintComponentActions::HandleRenameComponent(SubParams);
+		else if (OpName == TEXT("reparent_component"))     SubResult = FMonolithBlueprintComponentActions::HandleReparentComponent(SubParams);
+		else if (OpName == TEXT("set_component_property")) SubResult = FMonolithBlueprintComponentActions::HandleSetComponentProperty(SubParams);
+		else if (OpName == TEXT("duplicate_component"))    SubResult = FMonolithBlueprintComponentActions::HandleDuplicateComponent(SubParams);
+		// Graph/interface ops
+		else if (OpName == TEXT("add_function"))           SubResult = FMonolithBlueprintGraphActions::HandleAddFunction(SubParams);
+		else if (OpName == TEXT("remove_function"))        SubResult = FMonolithBlueprintGraphActions::HandleRemoveFunction(SubParams);
+		else if (OpName == TEXT("rename_function"))        SubResult = FMonolithBlueprintGraphActions::HandleRenameFunction(SubParams);
+		else if (OpName == TEXT("add_macro"))              SubResult = FMonolithBlueprintGraphActions::HandleAddMacro(SubParams);
+		else if (OpName == TEXT("add_event_dispatcher"))   SubResult = FMonolithBlueprintGraphActions::HandleAddEventDispatcher(SubParams);
+		else if (OpName == TEXT("set_function_params"))    SubResult = FMonolithBlueprintGraphActions::HandleSetFunctionParams(SubParams);
+		else if (OpName == TEXT("implement_interface"))    SubResult = FMonolithBlueprintGraphActions::HandleImplementInterface(SubParams);
+		else if (OpName == TEXT("remove_interface"))       SubResult = FMonolithBlueprintGraphActions::HandleRemoveInterface(SubParams);
+
+		RO->SetBoolField(TEXT("success"), SubResult.bSuccess);
+		if (!SubResult.bSuccess)
+		{
+			RO->SetStringField(TEXT("error"), SubResult.ErrorMessage);
+		}
+		if (SubResult.bSuccess && SubResult.Result.IsValid())
+		{
+			RO->SetObjectField(TEXT("data"), SubResult.Result);
+		}
+
+		Results.Add(MakeShared<FJsonValueObject>(RO));
+		if (SubResult.bSuccess) Ok++; else Fail++;
+
+		if (!SubResult.bSuccess && bStopOnError) break;
+	}
+
+	GEditor->EndTransaction();
+
+	TSharedRef<FJsonObject> Final = MakeShared<FJsonObject>();
+	Final->SetBoolField(TEXT("success"), Fail == 0);
+	Final->SetNumberField(TEXT("total"), Ops.Num());
+	Final->SetNumberField(TEXT("succeeded"), Ok);
+	Final->SetNumberField(TEXT("failed"), Fail);
+	Final->SetArrayField(TEXT("results"), Results);
+
+	if (bCompileOnComplete)
+	{
+		TSharedRef<FJsonObject> CompileParams = MakeShared<FJsonObject>();
+		CompileParams->SetStringField(TEXT("asset_path"), AssetPath);
+		FMonolithActionResult CompileResult = FMonolithBlueprintCompileActions::HandleCompileBlueprint(CompileParams);
+		Final->SetBoolField(TEXT("compile_success"), CompileResult.bSuccess);
+		if (CompileResult.bSuccess && CompileResult.Result.IsValid())
+		{
+			Final->SetObjectField(TEXT("compile_result"), CompileResult.Result);
+		}
+		else if (!CompileResult.bSuccess)
+		{
+			Final->SetStringField(TEXT("compile_error"), CompileResult.ErrorMessage);
+		}
+	}
+
+	return FMonolithActionResult::Success(Final);
 }
