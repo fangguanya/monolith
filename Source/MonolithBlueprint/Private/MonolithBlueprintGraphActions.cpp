@@ -7,6 +7,7 @@
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_Event.h"
+#include "K2Node_CreateDelegate.h"
 #include "EdGraphSchema_K2.h"
 
 // --- Registration ---
@@ -94,6 +95,25 @@ void FMonolithBlueprintGraphActions::RegisterActions(FMonolithToolRegistry& Regi
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
 			.Required(TEXT("new_parent_class"), TEXT("string"), TEXT("New parent class name"))
+			.Build());
+
+	// ---- Wave 6 ----
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("remove_event_dispatcher"),
+		TEXT("Remove an event dispatcher (multicast delegate) from a Blueprint. Warns if any graph nodes still reference it."),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveEventDispatcher),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),      TEXT("string"), TEXT("Blueprint asset path"))
+			.Required(TEXT("dispatcher_name"), TEXT("string"), TEXT("Event dispatcher name (without _Signature suffix)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("set_event_dispatcher_params"),
+		TEXT("Set (replace) the signature parameters on an event dispatcher. Existing params are cleared and replaced with the new list."),
+		FMonolithActionHandler::CreateStatic(&HandleSetEventDispatcherParams),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),      TEXT("string"), TEXT("Blueprint asset path"))
+			.Required(TEXT("dispatcher_name"), TEXT("string"), TEXT("Event dispatcher name (without _Signature suffix)"))
+			.Required(TEXT("params"),          TEXT("array"),  TEXT("Array of {name, type} objects for the new signature"))
 			.Build());
 
 	// ---- Wave 5 ----
@@ -770,5 +790,212 @@ FMonolithActionResult FMonolithBlueprintGraphActions::HandleReparentBlueprint(co
 	Root->SetStringField(TEXT("asset_path"), AssetPath);
 	Root->SetStringField(TEXT("old_parent_class"), OldParent);
 	Root->SetStringField(TEXT("new_parent_class"), NewParent->GetName());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  remove_event_dispatcher  (Wave 6)
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintGraphActions::HandleRemoveEventDispatcher(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString DispatcherName = Params->GetStringField(TEXT("dispatcher_name"));
+	if (DispatcherName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: dispatcher_name"));
+	}
+
+	// Find the delegate signature graph
+	UEdGraph* SigGraph = nullptr;
+	for (UEdGraph* Graph : BP->DelegateSignatureGraphs)
+	{
+		if (!Graph) continue;
+		FString DisplayName = Graph->GetName();
+		if (DisplayName.EndsWith(TEXT("_Signature")))
+		{
+			DisplayName.LeftChopInline(10, EAllowShrinking::No);
+		}
+		if (DisplayName == DispatcherName)
+		{
+			SigGraph = Graph;
+			break;
+		}
+	}
+
+	if (!SigGraph)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Event dispatcher not found: %s"), *DispatcherName));
+	}
+
+	// Warn if any CreateDelegate nodes still reference this dispatcher
+	TArray<UEdGraph*> AllGraphs;
+	BP->GetAllGraphs(AllGraphs);
+	TArray<FString> Warnings;
+
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		if (!Graph) continue;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node) continue;
+			if (UK2Node_CreateDelegate* CreateDel = Cast<UK2Node_CreateDelegate>(Node))
+			{
+				if (CreateDel->GetDelegateSignature() &&
+					CreateDel->GetDelegateSignature()->GetOuter() == SigGraph)
+				{
+					Warnings.Add(FString::Printf(TEXT("CreateDelegate node '%s' in graph '%s' still references this dispatcher"),
+						*Node->GetName(), *Graph->GetName()));
+				}
+			}
+			else if (UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node))
+			{
+				FString FuncName = CallNode->FunctionReference.GetMemberName().ToString();
+				if (FuncName.Contains(DispatcherName))
+				{
+					Warnings.Add(FString::Printf(TEXT("CallFunction node '%s' in graph '%s' may reference this dispatcher"),
+						*Node->GetName(), *Graph->GetName()));
+				}
+			}
+		}
+	}
+
+	FBlueprintEditorUtils::RemoveGraph(BP, SigGraph, EGraphRemoveFlags::Recompile);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("removed_dispatcher"), DispatcherName);
+
+	TArray<TSharedPtr<FJsonValue>> WarnArr;
+	for (const FString& W : Warnings)
+	{
+		WarnArr.Add(MakeShared<FJsonValueString>(W));
+	}
+	Root->SetArrayField(TEXT("warnings"), WarnArr);
+	Root->SetNumberField(TEXT("warning_count"), WarnArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  set_event_dispatcher_params  (Wave 6)
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintGraphActions::HandleSetEventDispatcherParams(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString DispatcherName = Params->GetStringField(TEXT("dispatcher_name"));
+	if (DispatcherName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: dispatcher_name"));
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* ParamsArray = nullptr;
+	if (!Params->TryGetArrayField(TEXT("params"), ParamsArray) || !ParamsArray)
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: params (array of {name, type})"));
+	}
+
+	// Find the delegate signature graph
+	UEdGraph* SigGraph = nullptr;
+	for (UEdGraph* Graph : BP->DelegateSignatureGraphs)
+	{
+		if (!Graph) continue;
+		FString DisplayName = Graph->GetName();
+		if (DisplayName.EndsWith(TEXT("_Signature")))
+		{
+			DisplayName.LeftChopInline(10, EAllowShrinking::No);
+		}
+		if (DisplayName == DispatcherName)
+		{
+			SigGraph = Graph;
+			break;
+		}
+	}
+
+	if (!SigGraph)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Event dispatcher not found: %s"), *DispatcherName));
+	}
+
+	// Find the FunctionEntry node in the signature graph
+	UK2Node_FunctionEntry* EntryNode = nullptr;
+	for (UEdGraphNode* Node : SigGraph->Nodes)
+	{
+		EntryNode = Cast<UK2Node_FunctionEntry>(Node);
+		if (EntryNode) break;
+	}
+
+	if (!EntryNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No FunctionEntry node found in dispatcher signature graph: %s"), *DispatcherName));
+	}
+
+	// Clear existing user-defined pins
+	// We iterate backwards and remove non-exec, non-self pins
+	TArray<UEdGraphPin*> PinsToRemove;
+	for (UEdGraphPin* Pin : EntryNode->Pins)
+	{
+		if (!Pin) continue;
+		if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+		if (Pin->PinName == UEdGraphSchema_K2::PN_Self) continue;
+		if (Pin->Direction != EGPD_Output) continue;
+		// This is a user-defined signature param — mark for removal
+		PinsToRemove.Add(Pin);
+	}
+
+	for (UEdGraphPin* Pin : PinsToRemove)
+	{
+		EntryNode->RemoveUserDefinedPin(Pin->GetOwningNode() == EntryNode
+			? EntryNode->UserDefinedPins[
+				EntryNode->UserDefinedPins.IndexOfByPredicate([&](const TSharedPtr<FUserPinInfo>& P)
+				{
+					return P.IsValid() && P->PinName == Pin->PinName;
+				})
+			]
+			: nullptr);
+		// Safer: find in UserDefinedPins by name and remove
+	}
+
+	// Clear UserDefinedPins directly — this is the cleanest approach
+	EntryNode->UserDefinedPins.Empty();
+
+	// Add new params
+	int32 ParamsAdded = 0;
+	for (const TSharedPtr<FJsonValue>& ParamVal : *ParamsArray)
+	{
+		const TSharedPtr<FJsonObject>* ParamObj = nullptr;
+		if (!ParamVal->TryGetObject(ParamObj) || !ParamObj) continue;
+
+		FString PinName, TypeStr;
+		(*ParamObj)->TryGetStringField(TEXT("name"), PinName);
+		(*ParamObj)->TryGetStringField(TEXT("type"), TypeStr);
+		if (PinName.IsEmpty() || TypeStr.IsEmpty()) continue;
+
+		FEdGraphPinType PinType = MonolithBlueprintInternal::ParsePinTypeFromString(TypeStr);
+		EntryNode->CreateUserDefinedPin(FName(*PinName), PinType, EGPD_Output);
+		++ParamsAdded;
+	}
+
+	// Reconstruct the node to apply pin changes
+	EntryNode->ReconstructNode();
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("dispatcher_name"), DispatcherName);
+	Root->SetNumberField(TEXT("params_set"), ParamsAdded);
 	return FMonolithActionResult::Success(Root);
 }

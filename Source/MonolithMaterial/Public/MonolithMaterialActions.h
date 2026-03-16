@@ -76,6 +76,11 @@ public:
 	static FMonolithActionResult BuildFunctionGraph(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult GetFunctionInfo(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Wave 7: Batch & Advanced ---
+	static FMonolithActionResult BatchSetMaterialProperty(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult BatchRecompile(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult ImportTexture(const TSharedPtr<FJsonObject>& Params);
+
 private:
 	/** Load a UMaterial from an asset path. Returns nullptr on failure. */
 	static UMaterial* LoadBaseMaterial(const FString& AssetPath);

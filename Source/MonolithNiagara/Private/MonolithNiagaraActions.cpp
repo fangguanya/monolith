@@ -1279,6 +1279,8 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("input"), TEXT("string"), TEXT("Static switch input name"))
 			.Required(TEXT("value"), TEXT("string"), TEXT("Value to set (true/false for bool, enum value name for enums, integer for int switches)"))
 			.Build());
+
+	// Wave 2 summary actions — to be implemented
 }
 
 // ============================================================================
@@ -2513,6 +2515,20 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputDI(const TSha
 			*InputName, *MN->GetFunctionName(), *FString::Join(ValidNames, TEXT(", "))));
 	}
 
+	// Validate DI type compatibility: the resolved DIUClass must match or be a child of
+	// the input's expected DI class. This prevents silent type mismatches like assigning
+	// NiagaraDataInterfaceCurve (float) to a NiagaraDataInterfaceColorCurve input.
+	if (InputType.IsDataInterface())
+	{
+		UClass* ExpectedDIClass = const_cast<UClass*>(InputType.GetClass());
+		if (ExpectedDIClass && !DIUClass->IsChildOf(ExpectedDIClass))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Input '%s' expects DI type '%s', but got '%s'. The provided DI class is not compatible."),
+				*InputName, *ExpectedDIClass->GetName(), *DIUClass->GetName()));
+		}
+	}
+
 	// Use the full Module.X name for correct namespace aliasing
 	FNiagaraParameterHandle AH = FNiagaraParameterHandle::CreateAliasedModuleParameterHandle(
 		FNiagaraParameterHandle(MatchedDIFullName), MN);
@@ -2564,8 +2580,29 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetModuleInputDI(const TSha
 		}
 		else
 		{
-			// Non-InputNode link — just break it
+			// Non-InputNode link (e.g. ParameterMapGet, FunctionCall for dynamic inputs).
+			// Clean up orphaned upstream nodes that have no other output connections.
+			UEdGraphNode* UpstreamNode = OP.LinkedTo[0]->GetOwningNode();
+			UEdGraph* Graph = UpstreamNode ? UpstreamNode->GetGraph() : nullptr;
 			OP.BreakAllPinLinks();
+			if (UpstreamNode && Graph && !Cast<UNiagaraNodeFunctionCall>(UpstreamNode))
+			{
+				// Check if the upstream node has any remaining output connections
+				bool bHasOtherOutputs = false;
+				for (UEdGraphPin* Pin : UpstreamNode->Pins)
+				{
+					if (Pin->Direction == EGPD_Output && Pin->LinkedTo.Num() > 0)
+					{
+						bHasOtherOutputs = true;
+						break;
+					}
+				}
+				if (!bHasOtherOutputs)
+				{
+					Graph->Modify();
+					Graph->RemoveNode(UpstreamNode);
+				}
+			}
 		}
 	}
 
@@ -3334,13 +3371,58 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 	// Layer 2: Editor data (UNiagaraScriptVariable::DefaultValueVariant) — survives recompile/re-sync
 	if (bDefaultSet)
 	{
-		// Layer 1: runtime store — suppressed to prevent another cascade
+		// Layer 1: runtime store — use SetParameterValue<T> which handles the User
+		// redirection layer correctly (raw IndexOf + SetParameterData fails because
+		// GetUserParameters() returns bare names but the store indexes by "User.X" form)
 		{
 			FNiagaraParameterStore::FScopedSuppressOnChanged Suppress(US);
-			const int32 Offset = US.IndexOf(NV);
-			if (Offset != INDEX_NONE)
+			// Re-find the variable in the store after AddParameter — the store
+			// now contains it under the redirected name
+			TArray<FNiagaraVariable> UP;
+			US.GetUserParameters(UP);
+			FNiagaraVariable StoreVar;
+			bool bFoundInStore = false;
+			FString SearchName = ParamName;
+			if (SearchName.StartsWith(TEXT("User."))) SearchName = SearchName.Mid(5);
+			for (const FNiagaraVariable& P : UP)
 			{
-				US.SetParameterData(NV.GetData(), Offset, TD.GetSize());
+				if (P.GetName().ToString().Equals(SearchName, ESearchCase::IgnoreCase))
+				{
+					StoreVar = P;
+					bFoundInStore = true;
+					break;
+				}
+			}
+			if (bFoundInStore)
+			{
+				if (TD == FNiagaraTypeDefinition::GetColorDef())
+				{
+					US.SetParameterValue<FLinearColor>(NV.GetValue<FLinearColor>(), StoreVar, true);
+				}
+				else if (TD == FNiagaraTypeDefinition::GetFloatDef())
+				{
+					US.SetParameterValue<float>(NV.GetValue<float>(), StoreVar, true);
+				}
+				else if (TD == FNiagaraTypeDefinition::GetIntDef())
+				{
+					US.SetParameterValue<int32>(NV.GetValue<int32>(), StoreVar, true);
+				}
+				else if (TD == FNiagaraTypeDefinition::GetBoolDef())
+				{
+					US.SetParameterValue<FNiagaraBool>(NV.GetValue<FNiagaraBool>(), StoreVar, true);
+				}
+				else if (TD == FNiagaraTypeDefinition::GetVec2Def())
+				{
+					US.SetParameterValue<FVector2f>(NV.GetValue<FVector2f>(), StoreVar, true);
+				}
+				else if (TD == FNiagaraTypeDefinition::GetVec3Def() || TD == FNiagaraTypeDefinition::GetPositionDef())
+				{
+					US.SetParameterValue<FVector3f>(NV.GetValue<FVector3f>(), StoreVar, true);
+				}
+				else if (TD == FNiagaraTypeDefinition::GetVec4Def() || TD == FNiagaraTypeDefinition::GetQuatDef())
+				{
+					US.SetParameterValue<FVector4f>(NV.GetValue<FVector4f>(), StoreVar, true);
+				}
 			}
 		}
 
@@ -3428,59 +3510,101 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetParameterDefault(const T
 
 	FNiagaraTypeDefinition FTD = Found.GetType();
 	bool bOk = false;
-	FNiagaraVariable WriteVar = Found;
 
-	if (FTD == FNiagaraTypeDefinition::GetColorDef())
+	// Layer 1: runtime store — SetTypedParameterValue uses SetParameterValue<T> which
+	// handles the User redirection layer correctly (unlike raw IndexOf + SetParameterData
+	// which fails because GetUserParameters() returns bare names but the store indexes by
+	// the redirected "User.X" form).
 	{
-		TSharedPtr<FJsonObject> O = AsObjectOrParseString(JV);
-		if (O.IsValid())
-		{
-			WriteVar.AllocateData();
-			FLinearColor V(
-				static_cast<float>(O->GetNumberField(TEXT("r"))),
-				static_cast<float>(O->GetNumberField(TEXT("g"))),
-				static_cast<float>(O->GetNumberField(TEXT("b"))),
-				O->HasField(TEXT("a")) ? static_cast<float>(O->GetNumberField(TEXT("a"))) : 1.0f);
-			WriteVar.SetValue<FLinearColor>(V);
+		FNiagaraParameterStore::FScopedSuppressOnChanged Suppress(US);
+		bOk = SetTypedParameterValue(US, Found, FTD, JV);
+	}
 
-			// Layer 1: runtime store — suppressed to prevent cascade
+	// Layer 2: editor data — persists across recompiles
+	if (bOk)
+	{
+		if (UNiagaraSystemEditorData* EditorData = Cast<UNiagaraSystemEditorData>(System->GetEditorData()))
+		{
+			// Found has the short name from GetUserParameters — need full User. name for FindOrAddUserScriptVariable
+			FNiagaraVariable FullVar = Found;
+			if (!FullVar.GetName().ToString().StartsWith(TEXT("User.")))
 			{
-				FNiagaraParameterStore::FScopedSuppressOnChanged Suppress(US);
-				const int32 Offset = US.IndexOf(Found);
-				if (Offset != INDEX_NONE)
+				FString FullName = TEXT("User.") + FullVar.GetName().ToString();
+				FullVar.SetName(FName(*FullName));
+			}
+			// Allocate data and copy from the store so we have the correct value
+			FNiagaraVariable WriteVar = Found;
+			WriteVar.AllocateData();
+			if (FTD == FNiagaraTypeDefinition::GetColorDef())
+			{
+				TSharedPtr<FJsonObject> O = AsObjectOrParseString(JV);
+				if (O.IsValid())
 				{
-					US.SetParameterData(WriteVar.GetData(), Offset, FTD.GetSize());
-					bOk = true;
+					FLinearColor V(
+						static_cast<float>(O->GetNumberField(TEXT("r"))),
+						static_cast<float>(O->GetNumberField(TEXT("g"))),
+						static_cast<float>(O->GetNumberField(TEXT("b"))),
+						O->HasField(TEXT("a")) ? static_cast<float>(O->GetNumberField(TEXT("a"))) : 1.0f);
+					WriteVar.SetValue<FLinearColor>(V);
 				}
 			}
-
-			// Layer 2: editor data — persists across recompiles
-			if (bOk)
+			else if (FTD == FNiagaraTypeDefinition::GetFloatDef())
 			{
-				if (UNiagaraSystemEditorData* EditorData = Cast<UNiagaraSystemEditorData>(System->GetEditorData()))
+				WriteVar.SetValue<float>(static_cast<float>(JV->AsNumber()));
+			}
+			else if (FTD == FNiagaraTypeDefinition::GetIntDef())
+			{
+				WriteVar.SetValue<int32>(static_cast<int32>(JV->AsNumber()));
+			}
+			else if (FTD == FNiagaraTypeDefinition::GetBoolDef())
+			{
+				FNiagaraBool BV; BV.SetValue(JV->AsBool());
+				WriteVar.SetValue<FNiagaraBool>(BV);
+			}
+			else if (FTD == FNiagaraTypeDefinition::GetVec3Def() || FTD == FNiagaraTypeDefinition::GetPositionDef())
+			{
+				TSharedPtr<FJsonObject> O = AsObjectOrParseString(JV);
+				if (O.IsValid())
 				{
-					// Found has the short name from GetUserParameters — need full User. name for FindOrAddUserScriptVariable
-					FNiagaraVariable FullVar = Found;
-					if (!FullVar.GetName().ToString().StartsWith(TEXT("User.")))
-					{
-						FString FullName = TEXT("User.") + FullVar.GetName().ToString();
-						FullVar.SetName(FName(*FullName));
-					}
-					UNiagaraScriptVariable* ScriptVar = EditorData->FindOrAddUserScriptVariable(FullVar, *System);
-					if (ScriptVar)
-					{
-						ScriptVar->Modify();
-						ScriptVar->DefaultMode = ENiagaraDefaultMode::Value;
-						ScriptVar->SetDefaultValueData(WriteVar.GetData());
-					}
+					FVector3f V(static_cast<float>(O->GetNumberField(TEXT("x"))),
+						static_cast<float>(O->GetNumberField(TEXT("y"))),
+						static_cast<float>(O->GetNumberField(TEXT("z"))));
+					WriteVar.SetValue<FVector3f>(V);
+				}
+			}
+			else if (FTD == FNiagaraTypeDefinition::GetVec2Def())
+			{
+				TSharedPtr<FJsonObject> O = AsObjectOrParseString(JV);
+				if (O.IsValid())
+				{
+					FVector2f V(static_cast<float>(O->GetNumberField(TEXT("x"))),
+						static_cast<float>(O->GetNumberField(TEXT("y"))));
+					WriteVar.SetValue<FVector2f>(V);
+				}
+			}
+			else if (FTD == FNiagaraTypeDefinition::GetVec4Def() || FTD == FNiagaraTypeDefinition::GetQuatDef())
+			{
+				TSharedPtr<FJsonObject> O = AsObjectOrParseString(JV);
+				if (O.IsValid())
+				{
+					FVector4f V(static_cast<float>(O->GetNumberField(TEXT("x"))),
+						static_cast<float>(O->GetNumberField(TEXT("y"))),
+						static_cast<float>(O->GetNumberField(TEXT("z"))),
+						static_cast<float>(O->GetNumberField(TEXT("w"))));
+					WriteVar.SetValue<FVector4f>(V);
+				}
+			}
+			if (WriteVar.IsDataAllocated())
+			{
+				UNiagaraScriptVariable* ScriptVar = EditorData->FindOrAddUserScriptVariable(FullVar, *System);
+				if (ScriptVar)
+				{
+					ScriptVar->Modify();
+					ScriptVar->DefaultMode = ENiagaraDefaultMode::Value;
+					ScriptVar->SetDefaultValueData(WriteVar.GetData());
 				}
 			}
 		}
-	}
-	if (!bOk)
-	{
-		// Fallback for non-color types (float, int, bool, vec) — these work fine via SetTypedParameterValue
-		bOk = SetTypedParameterValue(US, Found, FTD, JV);
 	}
 
 	return bOk ? SuccessStr(TEXT("Default set")) : FMonolithActionResult::Error(TEXT("Unsupported type"));

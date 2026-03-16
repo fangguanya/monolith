@@ -16,13 +16,13 @@ struct FNiagaraParameterStore;
 
 /**
  * Niagara domain action handlers for Monolith.
- * Ported from NiagaraMCPBridge — 39 proven actions across 7 domains.
+ * 51 actions across 9 domains (Wave 1 bug fixes + Wave 2 summary/discovery).
  * Fixed for UE 5.7 API compatibility.
  */
 class FMonolithNiagaraActions
 {
 public:
-	/** Register all 42 niagara actions with the tool registry */
+	/** Register all 51 niagara actions with the tool registry */
 	static void RegisterActions(FMonolithToolRegistry& Registry);
 
 	// --- System (8) ---

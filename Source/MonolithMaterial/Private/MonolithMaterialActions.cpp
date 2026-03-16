@@ -37,6 +37,9 @@
 #include "ObjectTools.h"
 #include "ImageUtils.h"
 #include "UObject/SavePackage.h"
+#include "AssetToolsModule.h"
+#include "AssetImportTask.h"
+#include "Engine/Texture2D.h"
 
 // ============================================================================
 // Registration
@@ -461,6 +464,52 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::GetFunctionInfo),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material function asset path"))
+			.Build());
+
+	// --- Wave 7: Batch & Advanced ---
+
+	Registry.RegisterAction(TEXT("material"), TEXT("batch_set_material_property"),
+		TEXT("Set material properties on multiple materials in a single transaction"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::BatchSetMaterialProperty),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of material asset paths"))
+			.Optional(TEXT("blend_mode"), TEXT("string"), TEXT("Blend mode enum value"))
+			.Optional(TEXT("shading_model"), TEXT("string"), TEXT("Shading model enum value"))
+			.Optional(TEXT("material_domain"), TEXT("string"), TEXT("Material domain enum value"))
+			.Optional(TEXT("two_sided"), TEXT("bool"), TEXT("Enable two-sided rendering"))
+			.Optional(TEXT("opacity_mask_clip_value"), TEXT("number"), TEXT("Opacity mask clip value"))
+			.Optional(TEXT("dithered_lod_transition"), TEXT("bool"), TEXT("Enable dithered LOD transition"))
+			.Optional(TEXT("used_with_skeletal_mesh"), TEXT("bool"), TEXT("Enable SkeletalMesh usage"))
+			.Optional(TEXT("used_with_particle_sprites"), TEXT("bool"), TEXT("Enable ParticleSprites usage"))
+			.Optional(TEXT("used_with_niagara_sprites"), TEXT("bool"), TEXT("Enable NiagaraSprites usage"))
+			.Optional(TEXT("used_with_niagara_meshes"), TEXT("bool"), TEXT("Enable NiagaraMeshes usage"))
+			.Optional(TEXT("used_with_niagara_ribbons"), TEXT("bool"), TEXT("Enable NiagaraRibbons usage"))
+			.Optional(TEXT("used_with_morph_targets"), TEXT("bool"), TEXT("Enable MorphTargets usage"))
+			.Optional(TEXT("used_with_instanced_static_meshes"), TEXT("bool"), TEXT("Enable InstancedStaticMeshes usage"))
+			.Optional(TEXT("used_with_static_lighting"), TEXT("bool"), TEXT("Enable StaticLighting usage"))
+			.Optional(TEXT("fully_rough"), TEXT("bool"), TEXT("Enable fully rough"))
+			.Optional(TEXT("cast_shadow_as_masked"), TEXT("bool"), TEXT("Cast shadow as masked"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("batch_recompile"),
+		TEXT("Recompile multiple materials and return per-material instruction counts"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::BatchRecompile),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of material asset paths to recompile"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("import_texture"),
+		TEXT("Import a texture from disk into the project content"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::ImportTexture),
+		FParamSchemaBuilder()
+			.Required(TEXT("source_file"), TEXT("string"), TEXT("Absolute path to the image file on disk (e.g. D:/Textures/diffuse.png)"))
+			.Required(TEXT("dest_path"), TEXT("string"), TEXT("Content path for the imported texture (e.g. /Game/Textures/MyTexture)"))
+			.Optional(TEXT("dest_name"), TEXT("string"), TEXT("Override asset name (default: derived from dest_path)"))
+			.Optional(TEXT("compression"), TEXT("string"), TEXT("Compression setting: Default, Normalmap, NormalmapBC5, NormalmapLA, Grayscale, Alpha, Masks, HDR, etc. (default: Default)"), TEXT("Default"))
+			.Optional(TEXT("srgb"), TEXT("bool"), TEXT("sRGB color space"), TEXT("true"))
+			.Optional(TEXT("lod_group"), TEXT("string"), TEXT("LOD group: World, WorldNormalMap, WorldSpecular, Character, CharacterNormalMap, Weapon, UI, etc."))
+			.Optional(TEXT("max_size"), TEXT("integer"), TEXT("Max texture dimension (e.g. 2048, 4096). 0 means no limit."))
+			.Optional(TEXT("replace_existing"), TEXT("bool"), TEXT("Replace existing asset at dest_path"), TEXT("false"))
 			.Build());
 }
 
@@ -5927,6 +5976,581 @@ FMonolithActionResult FMonolithMaterialActions::GetFunctionInfo(const TSharedPtr
 	ResultJson->SetNumberField(TEXT("expression_count"), ExpressionsJson.Num());
 	ResultJson->SetNumberField(TEXT("input_count"), InputsJson.Num());
 	ResultJson->SetNumberField(TEXT("output_count"), OutputsJson.Num());
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Wave 7 — Batch & Advanced
+// ============================================================================
+
+// Helper: Parse an array field that may arrive as a JSON string (Claude Code quirk)
+static bool ParseJsonArrayField(const TSharedPtr<FJsonObject>& Params, const FString& FieldName,
+	TArray<TSharedPtr<FJsonValue>>& OutArray, FString& OutError)
+{
+	TSharedPtr<FJsonValue> Field = Params->TryGetField(FieldName);
+	if (!Field.IsValid())
+	{
+		OutError = FString::Printf(TEXT("Missing required field '%s'"), *FieldName);
+		return false;
+	}
+
+	if (Field->Type == EJson::Array)
+	{
+		OutArray = Field->AsArray();
+		return true;
+	}
+
+	// Claude Code JSON string serialization quirk — array may arrive as string
+	if (Field->Type == EJson::String)
+	{
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Field->AsString());
+		TSharedPtr<FJsonValue> Parsed;
+		if (FJsonSerializer::Deserialize(Reader, Parsed) && Parsed.IsValid() && Parsed->Type == EJson::Array)
+		{
+			OutArray = Parsed->AsArray();
+			return true;
+		}
+	}
+
+	OutError = FString::Printf(TEXT("'%s' must be a JSON array"), *FieldName);
+	return false;
+}
+
+// Helper: Extract string array from parsed JSON values
+static TArray<FString> JsonArrayToStringArray(const TArray<TSharedPtr<FJsonValue>>& JsonArray)
+{
+	TArray<FString> Result;
+	Result.Reserve(JsonArray.Num());
+	for (const TSharedPtr<FJsonValue>& Val : JsonArray)
+	{
+		if (Val.IsValid())
+		{
+			Result.Add(Val->AsString());
+		}
+	}
+	return Result;
+}
+
+// ============================================================================
+// Action: batch_set_material_property
+// Params: { "asset_paths": [...], plus all set_material_property fields }
+// Applies the same property changes to multiple materials in a single transaction.
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::BatchSetMaterialProperty(const TSharedPtr<FJsonObject>& Params)
+{
+	// Parse asset_paths array
+	TArray<TSharedPtr<FJsonValue>> PathsJsonArray;
+	FString ParseError;
+	if (!ParseJsonArrayField(Params, TEXT("asset_paths"), PathsJsonArray, ParseError))
+	{
+		return FMonolithActionResult::Error(ParseError);
+	}
+
+	TArray<FString> AssetPaths = JsonArrayToStringArray(PathsJsonArray);
+	if (AssetPaths.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("asset_paths array is empty"));
+	}
+
+	// Build a params object without asset_paths — just the properties
+	// We reuse SetMaterialProperty by forwarding per-asset, but we wrap in a single transaction
+	GEditor->BeginTransaction(FText::FromString(TEXT("BatchSetMaterialProperty")));
+
+	TArray<TSharedPtr<FJsonValue>> ResultsArray;
+
+	for (const FString& AssetPath : AssetPaths)
+	{
+		auto PerAssetResult = MakeShared<FJsonObject>();
+		PerAssetResult->SetStringField(TEXT("asset_path"), AssetPath);
+
+		UMaterial* Mat = LoadBaseMaterial(AssetPath);
+		if (!Mat)
+		{
+			PerAssetResult->SetBoolField(TEXT("success"), false);
+			PerAssetResult->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to load base material at '%s'"), *AssetPath));
+			ResultsArray.Add(MakeShared<FJsonValueObject>(PerAssetResult));
+			continue;
+		}
+
+		Mat->Modify();
+
+		TArray<TSharedPtr<FJsonValue>> ChangedArray;
+		int32 ChangeCount = 0;
+		TArray<FString> Errors;
+
+		auto RecordChange = [&](const FString& PropName, const FString& Value)
+		{
+			auto ChangeJson = MakeShared<FJsonObject>();
+			ChangeJson->SetStringField(TEXT("property"), PropName);
+			ChangeJson->SetStringField(TEXT("value"), Value);
+			ChangedArray.Add(MakeShared<FJsonValueObject>(ChangeJson));
+			ChangeCount++;
+		};
+
+		// Blend mode
+		if (Params->HasField(TEXT("blend_mode")))
+		{
+			FString Val = Params->GetStringField(TEXT("blend_mode"));
+			FString EnumError;
+			EBlendMode ParsedMode;
+			if (ParseEnum<EBlendMode>(Val, ParsedMode, EnumError))
+			{
+				Mat->BlendMode = ParsedMode;
+				RecordChange(TEXT("blend_mode"), Val);
+			}
+			else
+			{
+				Errors.Add(FString::Printf(TEXT("blend_mode: %s"), *EnumError));
+			}
+		}
+
+		// Shading model
+		if (Params->HasField(TEXT("shading_model")))
+		{
+			FString Val = Params->GetStringField(TEXT("shading_model"));
+			FString EnumError;
+			EMaterialShadingModel ParsedModel;
+			if (ParseEnum<EMaterialShadingModel>(Val, ParsedModel, EnumError))
+			{
+				Mat->SetShadingModel(ParsedModel);
+				RecordChange(TEXT("shading_model"), Val);
+			}
+			else
+			{
+				Errors.Add(FString::Printf(TEXT("shading_model: %s"), *EnumError));
+			}
+		}
+
+		// Material domain
+		if (Params->HasField(TEXT("material_domain")))
+		{
+			FString Val = Params->GetStringField(TEXT("material_domain"));
+			FString EnumError;
+			EMaterialDomain ParsedDomain;
+			if (ParseEnum<EMaterialDomain>(Val, ParsedDomain, EnumError))
+			{
+				Mat->MaterialDomain = ParsedDomain;
+				RecordChange(TEXT("material_domain"), Val);
+			}
+			else
+			{
+				Errors.Add(FString::Printf(TEXT("material_domain: %s"), *EnumError));
+			}
+		}
+
+		// Boolean properties
+		auto ApplyBoolProp = [&](const TCHAR* ParamName, auto Setter)
+		{
+			if (Params->HasField(ParamName))
+			{
+				bool Val = Params->GetBoolField(ParamName);
+				Setter(Val);
+				RecordChange(ParamName, Val ? TEXT("true") : TEXT("false"));
+			}
+		};
+
+		ApplyBoolProp(TEXT("two_sided"), [&](bool V) { Mat->TwoSided = V; });
+		ApplyBoolProp(TEXT("dithered_lod_transition"), [&](bool V) { Mat->DitheredLODTransition = V; });
+		ApplyBoolProp(TEXT("fully_rough"), [&](bool V) { Mat->bFullyRough = V; });
+		ApplyBoolProp(TEXT("cast_shadow_as_masked"), [&](bool V) { Mat->bCastDynamicShadowAsMasked = V; });
+
+		if (Params->HasField(TEXT("opacity_mask_clip_value")))
+		{
+			float Val = static_cast<float>(Params->GetNumberField(TEXT("opacity_mask_clip_value")));
+			Mat->OpacityMaskClipValue = Val;
+			RecordChange(TEXT("opacity_mask_clip_value"), FString::SanitizeFloat(Val));
+		}
+
+		// Usage flags
+		auto ApplyUsage = [&](const TCHAR* ParamName, EMaterialUsage Usage)
+		{
+			if (Params->HasField(ParamName))
+			{
+				bool Val = Params->GetBoolField(ParamName);
+				if (Val)
+				{
+					bool bRecompile = false;
+					UMaterialEditingLibrary::SetMaterialUsage(Mat, Usage, bRecompile);
+				}
+				RecordChange(ParamName, Val ? TEXT("true") : TEXT("false"));
+			}
+		};
+
+		ApplyUsage(TEXT("used_with_skeletal_mesh"), MATUSAGE_SkeletalMesh);
+		ApplyUsage(TEXT("used_with_particle_sprites"), MATUSAGE_ParticleSprites);
+		ApplyUsage(TEXT("used_with_niagara_sprites"), MATUSAGE_NiagaraSprites);
+		ApplyUsage(TEXT("used_with_niagara_meshes"), MATUSAGE_NiagaraMeshParticles);
+		ApplyUsage(TEXT("used_with_niagara_ribbons"), MATUSAGE_NiagaraRibbons);
+		ApplyUsage(TEXT("used_with_morph_targets"), MATUSAGE_MorphTargets);
+		ApplyUsage(TEXT("used_with_instanced_static_meshes"), MATUSAGE_InstancedStaticMeshes);
+		ApplyUsage(TEXT("used_with_static_lighting"), MATUSAGE_StaticLighting);
+
+		Mat->PreEditChange(nullptr);
+		Mat->PostEditChange();
+
+		// Save to disk so subsequent reads get fresh data
+		UEditorAssetLibrary::SaveAsset(AssetPath, false);
+
+		PerAssetResult->SetBoolField(TEXT("success"), Errors.Num() == 0);
+		PerAssetResult->SetNumberField(TEXT("changes"), ChangeCount);
+		PerAssetResult->SetArrayField(TEXT("changed"), ChangedArray);
+		if (Errors.Num() > 0)
+		{
+			TArray<TSharedPtr<FJsonValue>> ErrorsJson;
+			for (const FString& Err : Errors)
+			{
+				ErrorsJson.Add(MakeShared<FJsonValueString>(Err));
+			}
+			PerAssetResult->SetArrayField(TEXT("errors"), ErrorsJson);
+		}
+
+		ResultsArray.Add(MakeShared<FJsonValueObject>(PerAssetResult));
+	}
+
+	GEditor->EndTransaction();
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetNumberField(TEXT("material_count"), AssetPaths.Num());
+	ResultJson->SetArrayField(TEXT("results"), ResultsArray);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: batch_recompile
+// Params: { "asset_paths": [...] }
+// Recompile multiple materials and return per-material instruction counts.
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::BatchRecompile(const TSharedPtr<FJsonObject>& Params)
+{
+	// Parse asset_paths array
+	TArray<TSharedPtr<FJsonValue>> PathsJsonArray;
+	FString ParseError;
+	if (!ParseJsonArrayField(Params, TEXT("asset_paths"), PathsJsonArray, ParseError))
+	{
+		return FMonolithActionResult::Error(ParseError);
+	}
+
+	TArray<FString> AssetPaths = JsonArrayToStringArray(PathsJsonArray);
+	if (AssetPaths.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("asset_paths array is empty"));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ResultsArray;
+	int32 SuccessCount = 0;
+
+	for (const FString& AssetPath : AssetPaths)
+	{
+		auto PerAssetResult = MakeShared<FJsonObject>();
+		PerAssetResult->SetStringField(TEXT("asset_path"), AssetPath);
+
+		UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+		UMaterialInterface* MatInterface = LoadedAsset ? Cast<UMaterialInterface>(LoadedAsset) : nullptr;
+		if (!MatInterface)
+		{
+			PerAssetResult->SetBoolField(TEXT("success"), false);
+			PerAssetResult->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to load material at '%s'"), *AssetPath));
+			ResultsArray.Add(MakeShared<FJsonValueObject>(PerAssetResult));
+			continue;
+		}
+
+		UMaterial* BaseMat = MatInterface->GetMaterial();
+		if (!BaseMat)
+		{
+			PerAssetResult->SetBoolField(TEXT("success"), false);
+			PerAssetResult->SetStringField(TEXT("error"), TEXT("Could not resolve base material"));
+			ResultsArray.Add(MakeShared<FJsonValueObject>(PerAssetResult));
+			continue;
+		}
+
+		UMaterialEditingLibrary::RecompileMaterial(BaseMat);
+
+		// Retrieve instruction counts after recompile
+		FMaterialStatistics Stats = UMaterialEditingLibrary::GetStatistics(MatInterface);
+		PerAssetResult->SetBoolField(TEXT("success"), true);
+		PerAssetResult->SetNumberField(TEXT("vs_instructions"), Stats.NumVertexShaderInstructions);
+		PerAssetResult->SetNumberField(TEXT("ps_instructions"), Stats.NumPixelShaderInstructions);
+
+		SuccessCount++;
+		ResultsArray.Add(MakeShared<FJsonValueObject>(PerAssetResult));
+	}
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetNumberField(TEXT("material_count"), AssetPaths.Num());
+	ResultJson->SetNumberField(TEXT("success_count"), SuccessCount);
+	ResultJson->SetArrayField(TEXT("results"), ResultsArray);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: import_texture
+// Params: { "source_file", "dest_path", "dest_name?", "compression?",
+//           "srgb?", "lod_group?", "max_size?", "replace_existing?" }
+// Import a texture from disk using UAssetImportTask + IAssetTools.
+// ============================================================================
+
+// Helper: Parse TextureCompressionSettings from string
+static bool ParseTextureCompression(const FString& Str, TextureCompressionSettings& OutSetting)
+{
+	// Common shorthand mappings
+	static const TMap<FString, TextureCompressionSettings> Mappings = {
+		{ TEXT("default"),       TC_Default },
+		{ TEXT("dxt5"),          TC_Default },
+		{ TEXT("dxt1"),          TC_Default },
+		{ TEXT("normalmap"),     TC_Normalmap },
+		{ TEXT("grayscale"),     TC_Grayscale },
+		{ TEXT("alpha"),         TC_Alpha },
+		{ TEXT("masks"),         TC_Masks },
+		{ TEXT("hdr"),           TC_HDR },
+		{ TEXT("bc7"),           TC_BC7 },
+		{ TEXT("halfhdr"),       TC_HalfFloat },
+		{ TEXT("halffloat"),     TC_HalfFloat },
+		{ TEXT("displacementmap"), TC_Displacementmap },
+		{ TEXT("vectordisplacementmap"), TC_VectorDisplacementmap },
+	};
+
+	const TextureCompressionSettings* Found = Mappings.Find(Str.ToLower());
+	if (Found)
+	{
+		OutSetting = *Found;
+		return true;
+	}
+
+	// Try StaticEnum as fallback for full enum names like "TC_Default"
+	const UEnum* Enum = StaticEnum<TextureCompressionSettings>();
+	if (Enum)
+	{
+		int64 Value = Enum->GetValueByNameString(Str);
+		if (Value != INDEX_NONE)
+		{
+			OutSetting = static_cast<TextureCompressionSettings>(Value);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+// Helper: Parse TextureLODGroup from string
+static bool ParseTextureLODGroup(const FString& Str, TextureGroup& OutGroup)
+{
+	// Common shorthand mappings
+	static const TMap<FString, TextureGroup> Mappings = {
+		{ TEXT("world"),                TEXTUREGROUP_World },
+		{ TEXT("worldnormalmap"),        TEXTUREGROUP_WorldNormalMap },
+		{ TEXT("worldspecular"),         TEXTUREGROUP_WorldSpecular },
+		{ TEXT("character"),             TEXTUREGROUP_Character },
+		{ TEXT("characternormalmap"),    TEXTUREGROUP_CharacterNormalMap },
+		{ TEXT("characterspecular"),     TEXTUREGROUP_CharacterSpecular },
+		{ TEXT("weapon"),               TEXTUREGROUP_Weapon },
+		{ TEXT("weaponnormalmap"),       TEXTUREGROUP_WeaponNormalMap },
+		{ TEXT("weaponspecular"),        TEXTUREGROUP_WeaponSpecular },
+		{ TEXT("vehicle"),              TEXTUREGROUP_Vehicle },
+		{ TEXT("vehiclenormalmap"),      TEXTUREGROUP_VehicleNormalMap },
+		{ TEXT("vehiclespecular"),       TEXTUREGROUP_VehicleSpecular },
+		{ TEXT("effects"),              TEXTUREGROUP_Effects },
+		{ TEXT("ui"),                   TEXTUREGROUP_UI },
+		{ TEXT("skybox"),               TEXTUREGROUP_Skybox },
+	};
+
+	const TextureGroup* Found = Mappings.Find(Str.ToLower());
+	if (Found)
+	{
+		OutGroup = *Found;
+		return true;
+	}
+
+	// Try StaticEnum for full enum names
+	const UEnum* Enum = StaticEnum<TextureGroup>();
+	if (Enum)
+	{
+		int64 Value = Enum->GetValueByNameString(Str);
+		if (Value != INDEX_NONE)
+		{
+			OutGroup = static_cast<TextureGroup>(Value);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+FMonolithActionResult FMonolithMaterialActions::ImportTexture(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SourceFile = Params->GetStringField(TEXT("source_file"));
+	FString DestPath = Params->GetStringField(TEXT("dest_path"));
+
+	// Validate source file exists on disk
+	if (!FPlatformFileManager::Get().GetPlatformFile().FileExists(*SourceFile))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Source file not found: '%s'"), *SourceFile));
+	}
+
+	// Check if asset already exists
+	bool bReplaceExisting = Params->HasField(TEXT("replace_existing")) ? Params->GetBoolField(TEXT("replace_existing")) : false;
+	if (!bReplaceExisting && UEditorAssetLibrary::DoesAssetExist(DestPath))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset already exists at '%s'. Set replace_existing: true to overwrite."), *DestPath));
+	}
+
+	// Split dest_path into directory and asset name
+	FString DestDirectory = FPaths::GetPath(DestPath);
+	FString DestName = Params->HasField(TEXT("dest_name"))
+		? Params->GetStringField(TEXT("dest_name"))
+		: FPaths::GetBaseFilename(DestPath);
+
+	// Parse optional settings
+	TextureCompressionSettings Compression = TC_Default;
+	bool bHasCompression = false;
+	if (Params->HasField(TEXT("compression")))
+	{
+		FString CompressionStr = Params->GetStringField(TEXT("compression"));
+		if (!ParseTextureCompression(CompressionStr, Compression))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Invalid compression setting: '%s'. Valid: Default, Normalmap, NormalmapBC5, NormalmapLA, Grayscale, Alpha, Masks, HDR, BC7, HalfFloat"),
+				*CompressionStr));
+		}
+		bHasCompression = true;
+	}
+
+	bool bSRGB = Params->HasField(TEXT("srgb")) ? Params->GetBoolField(TEXT("srgb")) : true;
+
+	TextureGroup LODGroup = TEXTUREGROUP_World;
+	bool bHasLODGroup = false;
+	if (Params->HasField(TEXT("lod_group")))
+	{
+		FString LODGroupStr = Params->GetStringField(TEXT("lod_group"));
+		if (!ParseTextureLODGroup(LODGroupStr, LODGroup))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Invalid lod_group: '%s'. Valid: World, WorldNormalMap, WorldSpecular, Character, CharacterNormalMap, Weapon, UI, etc."),
+				*LODGroupStr));
+		}
+		bHasLODGroup = true;
+	}
+
+	int32 MaxSize = 0;
+	if (Params->HasField(TEXT("max_size")))
+	{
+		MaxSize = static_cast<int32>(Params->GetNumberField(TEXT("max_size")));
+	}
+
+	// Create and configure import task
+	UAssetImportTask* ImportTask = NewObject<UAssetImportTask>();
+	ImportTask->Filename = SourceFile;
+	ImportTask->DestinationPath = DestDirectory;
+	ImportTask->DestinationName = DestName;
+	ImportTask->bAutomated = true;
+	ImportTask->bReplaceExisting = bReplaceExisting;
+	ImportTask->bSave = true;
+
+	// Run import
+	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get();
+
+	TArray<UAssetImportTask*> Tasks;
+	Tasks.Add(ImportTask);
+	AssetTools.ImportAssetTasks(Tasks);
+
+	// Verify the import succeeded by loading the asset
+	FString FinalAssetPath = DestDirectory / DestName;
+	UObject* ImportedObj = UEditorAssetLibrary::LoadAsset(FinalAssetPath);
+	UTexture2D* Texture = ImportedObj ? Cast<UTexture2D>(ImportedObj) : nullptr;
+
+	if (!Texture)
+	{
+		// Try without explicit name (some importers use the source filename)
+		FString FallbackName = FPaths::GetBaseFilename(SourceFile);
+		FString FallbackPath = DestDirectory / FallbackName;
+		ImportedObj = UEditorAssetLibrary::LoadAsset(FallbackPath);
+		Texture = ImportedObj ? Cast<UTexture2D>(ImportedObj) : nullptr;
+		if (Texture)
+		{
+			FinalAssetPath = FallbackPath;
+		}
+	}
+
+	if (!Texture)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Import appeared to succeed but texture not found at '%s'. Check that the source file is a valid image format."),
+			*FinalAssetPath));
+	}
+
+	// Apply post-import settings — known UAssetImportTask quirk: some settings
+	// don't persist through the import pipeline, so we re-apply after loading.
+	bool bNeedsResave = false;
+
+	if (bHasCompression && Texture->CompressionSettings != Compression)
+	{
+		Texture->CompressionSettings = Compression;
+		bNeedsResave = true;
+	}
+
+	if (Texture->SRGB != bSRGB)
+	{
+		Texture->SRGB = bSRGB;
+		bNeedsResave = true;
+	}
+
+	if (bHasLODGroup && Texture->LODGroup != LODGroup)
+	{
+		Texture->LODGroup = LODGroup;
+		bNeedsResave = true;
+	}
+
+	if (MaxSize > 0 && Texture->MaxTextureSize != MaxSize)
+	{
+		Texture->MaxTextureSize = MaxSize;
+		bNeedsResave = true;
+	}
+
+	if (bNeedsResave)
+	{
+		Texture->Modify();
+		Texture->PostEditChange();
+		UEditorAssetLibrary::SaveAsset(FinalAssetPath, false);
+	}
+
+	// Build result
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), FinalAssetPath);
+	ResultJson->SetNumberField(TEXT("resolution_x"), Texture->GetSizeX());
+	ResultJson->SetNumberField(TEXT("resolution_y"), Texture->GetSizeY());
+
+	// Compression settings as readable string
+	const UEnum* CompressionEnum = StaticEnum<TextureCompressionSettings>();
+	if (CompressionEnum)
+	{
+		FString CompStr = CompressionEnum->GetNameStringByIndex(static_cast<int32>(Texture->CompressionSettings));
+		ResultJson->SetStringField(TEXT("compression_settings"), CompStr);
+	}
+
+	ResultJson->SetBoolField(TEXT("srgb"), Texture->SRGB);
+
+	// LOD group
+	const UEnum* LODGroupEnum = StaticEnum<TextureGroup>();
+	if (LODGroupEnum)
+	{
+		FString LODStr = LODGroupEnum->GetNameStringByIndex(static_cast<int32>(Texture->LODGroup));
+		ResultJson->SetStringField(TEXT("lod_group"), LODStr);
+	}
+
+	if (Texture->MaxTextureSize > 0)
+	{
+		ResultJson->SetNumberField(TEXT("max_size"), Texture->MaxTextureSize);
+	}
+
+	// Approximate size on disk — get the source resource size
+	int64 ResourceSize = Texture->GetResourceSizeBytes(EResourceSizeMode::EstimatedTotal);
+	ResultJson->SetNumberField(TEXT("estimated_size_kb"), static_cast<double>(ResourceSize) / 1024.0);
+
+	ResultJson->SetBoolField(TEXT("settings_reapplied"), bNeedsResave);
 
 	return FMonolithActionResult::Success(ResultJson);
 }

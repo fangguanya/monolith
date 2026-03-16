@@ -19,6 +19,7 @@ public class MonolithMaterial : ModuleRules
 			"UnrealEd",
 			"MaterialEditor",
 			"EditorScriptingUtilities",
+			"AssetTools",
 			"RenderCore",
 			"RHI",
 			"Slate",
