@@ -22,6 +22,11 @@ public:
 	static FMonolithActionResult HandleGetInterfaces(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetConstructionScript(const TSharedPtr<FJsonObject>& Params);
 
+	// Wave 3 — Discovery & Resolution
+	static FMonolithActionResult HandleSearchFunctions(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetNodeDetails(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetInterfaceFunctions(const TSharedPtr<FJsonObject>& Params);
+
 private:
 	static UBlueprint* LoadBlueprint(const TSharedPtr<FJsonObject>& Params, FString& OutAssetPath);
 };

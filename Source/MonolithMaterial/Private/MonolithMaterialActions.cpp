@@ -185,10 +185,11 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("scalar_parameters"), TEXT("object"), TEXT("Map of scalar param name to float value"))
 			.Optional(TEXT("vector_parameters"), TEXT("object"), TEXT("Map of vector param name to {R,G,B,A} object"))
 			.Optional(TEXT("texture_parameters"), TEXT("object"), TEXT("Map of texture param name to texture asset path"))
+			.Optional(TEXT("static_switch_parameters"), TEXT("object"), TEXT("Map of static switch param name to bool value"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("material"), TEXT("set_material_property"),
-		TEXT("Set top-level material properties (blend mode, shading model, domain, two-sided, opacity mask clip, etc.)"),
+		TEXT("Set top-level material properties (blend mode, shading model, domain, two-sided, opacity mask clip, usage flags, etc.)"),
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::SetMaterialProperty),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material asset path"))
@@ -198,10 +199,17 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("two_sided"), TEXT("bool"), TEXT("Enable two-sided rendering"))
 			.Optional(TEXT("opacity_mask_clip_value"), TEXT("number"), TEXT("Clip value for masked blend mode"))
 			.Optional(TEXT("dithered_lod_transition"), TEXT("bool"), TEXT("Enable dithered LOD transition"))
+			.Optional(TEXT("fully_rough"), TEXT("bool"), TEXT("Enable fully rough (disables specular)"))
+			.Optional(TEXT("cast_shadow_as_masked"), TEXT("bool"), TEXT("Cast shadow as masked"))
+			.Optional(TEXT("output_velocity"), TEXT("bool"), TEXT("Output per-pixel velocity"))
 			.Optional(TEXT("used_with_skeletal_mesh"), TEXT("bool"), TEXT("Mark as used with skeletal meshes"))
 			.Optional(TEXT("used_with_particle_sprites"), TEXT("bool"), TEXT("Mark as used with particle sprites"))
 			.Optional(TEXT("used_with_niagara_sprites"), TEXT("bool"), TEXT("Mark as used with Niagara sprites"))
 			.Optional(TEXT("used_with_niagara_meshes"), TEXT("bool"), TEXT("Mark as used with Niagara meshes"))
+			.Optional(TEXT("used_with_niagara_ribbons"), TEXT("bool"), TEXT("Mark as used with Niagara ribbons"))
+			.Optional(TEXT("used_with_morph_targets"), TEXT("bool"), TEXT("Mark as used with morph targets"))
+			.Optional(TEXT("used_with_instanced_static_meshes"), TEXT("bool"), TEXT("Mark as used with instanced static meshes"))
+			.Optional(TEXT("used_with_static_lighting"), TEXT("bool"), TEXT("Mark as used with static lighting"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("material"), TEXT("delete_expression"),
@@ -331,6 +339,48 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::GetMaterialProperties),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material or material instance asset path"))
+			.Build());
+
+	// --- Wave 4: Instance & property improvements ---
+
+	Registry.RegisterAction(TEXT("material"), TEXT("get_instance_parameters"),
+		TEXT("Read all parameter overrides from a material instance, with override detection vs parent"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::GetInstanceParameters),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material instance asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("set_instance_parameters"),
+		TEXT("Set multiple parameter overrides on a material instance in one call (batch)"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::SetInstanceParameters),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material instance asset path"))
+			.Required(TEXT("parameters"), TEXT("array"), TEXT("Array of {name, type (scalar/vector/texture/switch), value}"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("set_instance_parent"),
+		TEXT("Reparent a material instance to a new parent material, reporting lost/kept parameters"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::SetInstanceParent),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material instance asset path"))
+			.Required(TEXT("new_parent"), TEXT("string"), TEXT("Path to new parent material or material instance"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("clear_instance_parameter"),
+		TEXT("Remove a single parameter override (or all overrides) from a material instance"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::ClearInstanceParameter),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material instance asset path"))
+			.Optional(TEXT("parameter_name"), TEXT("string"), TEXT("Specific parameter to clear (omit for all)"))
+			.Optional(TEXT("parameter_type"), TEXT("string"), TEXT("scalar, vector, texture, switch, or all (default: all)"), TEXT("all"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("material"), TEXT("save_material"),
+		TEXT("Save a material or material instance asset to disk"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::SaveMaterial),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material asset path"))
+			.Optional(TEXT("only_if_dirty"), TEXT("bool"), TEXT("Only save if the asset has unsaved changes"), TEXT("true"))
 			.Build());
 }
 
@@ -2421,6 +2471,25 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterialInstance(const TSh
 		}
 	}
 
+	// Apply static switch parameter overrides
+	int32 SwitchCount = 0;
+	const TSharedPtr<FJsonObject>* SwitchParams = nullptr;
+	if (Params->TryGetObjectField(TEXT("static_switch_parameters"), SwitchParams))
+	{
+		for (const auto& Pair : (*SwitchParams)->Values)
+		{
+			bool bValue = Pair.Value->AsBool();
+			MIC->SetStaticSwitchParameterValueEditorOnly(FMaterialParameterInfo(*Pair.Key), bValue);
+			SwitchCount++;
+		}
+	}
+
+	// If static switches were set, update the static permutation
+	if (SwitchCount > 0)
+	{
+		UMaterialEditingLibrary::UpdateMaterialInstance(MIC);
+	}
+
 	FAssetRegistryModule::AssetCreated(MIC);
 	Pkg->MarkPackageDirty();
 
@@ -2431,6 +2500,7 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterialInstance(const TSh
 	ResultJson->SetNumberField(TEXT("scalar_overrides"), ScalarCount);
 	ResultJson->SetNumberField(TEXT("vector_overrides"), VectorCount);
 	ResultJson->SetNumberField(TEXT("texture_overrides"), TextureCount);
+	ResultJson->SetNumberField(TEXT("static_switch_overrides"), SwitchCount);
 
 	return FMonolithActionResult::Success(ResultJson);
 }
@@ -2561,6 +2631,59 @@ FMonolithActionResult FMonolithMaterialActions::SetMaterialProperty(const TShare
 		}
 		RecordChange(TEXT("used_with_niagara_meshes"), Val ? TEXT("true") : TEXT("false"));
 	}
+	if (Params->HasField(TEXT("used_with_niagara_ribbons")))
+	{
+		bool Val = Params->GetBoolField(TEXT("used_with_niagara_ribbons"));
+		if (Val)
+		{
+			bool bRecompile = false;
+			UMaterialEditingLibrary::SetMaterialUsage(Mat, MATUSAGE_NiagaraRibbons, bRecompile);
+		}
+		RecordChange(TEXT("used_with_niagara_ribbons"), Val ? TEXT("true") : TEXT("false"));
+	}
+	if (Params->HasField(TEXT("used_with_morph_targets")))
+	{
+		bool Val = Params->GetBoolField(TEXT("used_with_morph_targets"));
+		if (Val)
+		{
+			bool bRecompile = false;
+			UMaterialEditingLibrary::SetMaterialUsage(Mat, MATUSAGE_MorphTargets, bRecompile);
+		}
+		RecordChange(TEXT("used_with_morph_targets"), Val ? TEXT("true") : TEXT("false"));
+	}
+	if (Params->HasField(TEXT("used_with_instanced_static_meshes")))
+	{
+		bool Val = Params->GetBoolField(TEXT("used_with_instanced_static_meshes"));
+		if (Val)
+		{
+			bool bRecompile = false;
+			UMaterialEditingLibrary::SetMaterialUsage(Mat, MATUSAGE_InstancedStaticMeshes, bRecompile);
+		}
+		RecordChange(TEXT("used_with_instanced_static_meshes"), Val ? TEXT("true") : TEXT("false"));
+	}
+	if (Params->HasField(TEXT("used_with_static_lighting")))
+	{
+		bool Val = Params->GetBoolField(TEXT("used_with_static_lighting"));
+		if (Val)
+		{
+			bool bRecompile = false;
+			UMaterialEditingLibrary::SetMaterialUsage(Mat, MATUSAGE_StaticLighting, bRecompile);
+		}
+		RecordChange(TEXT("used_with_static_lighting"), Val ? TEXT("true") : TEXT("false"));
+	}
+	if (Params->HasField(TEXT("fully_rough")))
+	{
+		bool Val = Params->GetBoolField(TEXT("fully_rough"));
+		Mat->bFullyRough = Val;
+		RecordChange(TEXT("fully_rough"), Val ? TEXT("true") : TEXT("false"));
+	}
+	if (Params->HasField(TEXT("cast_shadow_as_masked")))
+	{
+		bool Val = Params->GetBoolField(TEXT("cast_shadow_as_masked"));
+		Mat->bCastDynamicShadowAsMasked = Val;
+		RecordChange(TEXT("cast_shadow_as_masked"), Val ? TEXT("true") : TEXT("false"));
+	}
+	// Note: bOutputVelocityOnBasePass removed in UE 5.7 — velocity output is now automatic
 
 	Mat->PreEditChange(nullptr);
 	Mat->PostEditChange();
@@ -3808,6 +3931,475 @@ FMonolithActionResult FMonolithMaterialActions::GetMaterialProperties(const TSha
 	{
 		ResultJson->SetBoolField(TEXT("is_instance"), false);
 	}
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: get_instance_parameters
+// Reads all parameter overrides from a MIC with override detection vs parent
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::GetInstanceParameters(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UMaterialInstanceConstant* MIC = LoadedAsset ? Cast<UMaterialInstanceConstant>(LoadedAsset) : nullptr;
+	if (!MIC)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load material instance at '%s'"), *AssetPath));
+	}
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+
+	// Parent info
+	if (MIC->Parent)
+	{
+		ResultJson->SetStringField(TEXT("parent"), MIC->Parent->GetPathName());
+	}
+
+	// Scalar parameters
+	TArray<TSharedPtr<FJsonValue>> ScalarArr;
+	for (const auto& Param : MIC->ScalarParameterValues)
+	{
+		auto ParamJson = MakeShared<FJsonObject>();
+		ParamJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		ParamJson->SetNumberField(TEXT("value"), Param.ParameterValue);
+		ParamJson->SetBoolField(TEXT("is_overridden"), true); // present in array = overridden
+		ScalarArr.Add(MakeShared<FJsonValueObject>(ParamJson));
+	}
+	ResultJson->SetArrayField(TEXT("scalar"), ScalarArr);
+
+	// Vector parameters
+	TArray<TSharedPtr<FJsonValue>> VectorArr;
+	for (const auto& Param : MIC->VectorParameterValues)
+	{
+		auto ParamJson = MakeShared<FJsonObject>();
+		ParamJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		auto ColorJson = MakeShared<FJsonObject>();
+		ColorJson->SetNumberField(TEXT("R"), Param.ParameterValue.R);
+		ColorJson->SetNumberField(TEXT("G"), Param.ParameterValue.G);
+		ColorJson->SetNumberField(TEXT("B"), Param.ParameterValue.B);
+		ColorJson->SetNumberField(TEXT("A"), Param.ParameterValue.A);
+		ParamJson->SetObjectField(TEXT("value"), ColorJson);
+		ParamJson->SetBoolField(TEXT("is_overridden"), true);
+		VectorArr.Add(MakeShared<FJsonValueObject>(ParamJson));
+	}
+	ResultJson->SetArrayField(TEXT("vector"), VectorArr);
+
+	// Texture parameters
+	TArray<TSharedPtr<FJsonValue>> TextureArr;
+	for (const auto& Param : MIC->TextureParameterValues)
+	{
+		auto ParamJson = MakeShared<FJsonObject>();
+		ParamJson->SetStringField(TEXT("name"), Param.ParameterInfo.Name.ToString());
+		ParamJson->SetStringField(TEXT("value"), Param.ParameterValue ? Param.ParameterValue->GetPathName() : TEXT("None"));
+		ParamJson->SetBoolField(TEXT("is_overridden"), true);
+		TextureArr.Add(MakeShared<FJsonValueObject>(ParamJson));
+	}
+	ResultJson->SetArrayField(TEXT("texture"), TextureArr);
+
+	// Static switch parameters — use GetAllStaticSwitchParameterInfo (proven API)
+	TArray<TSharedPtr<FJsonValue>> SwitchArr;
+	{
+		TArray<FMaterialParameterInfo> SwitchInfos;
+		TArray<FGuid> SwitchGuids;
+		MIC->GetAllStaticSwitchParameterInfo(SwitchInfos, SwitchGuids);
+
+		// Also get parent values to detect overrides
+		for (int32 i = 0; i < SwitchInfos.Num(); ++i)
+		{
+			bool Value = false;
+			FGuid OutGuid;
+			MIC->GetStaticSwitchParameterValue(SwitchInfos[i], Value, OutGuid);
+
+			// Check if overridden by comparing to parent
+			bool bIsOverridden = false;
+			if (MIC->Parent)
+			{
+				bool ParentValue = false;
+				FGuid ParentGuid;
+				if (MIC->Parent->GetStaticSwitchParameterValue(SwitchInfos[i], ParentValue, ParentGuid))
+				{
+					bIsOverridden = (Value != ParentValue);
+				}
+			}
+
+			auto ParamJson = MakeShared<FJsonObject>();
+			ParamJson->SetStringField(TEXT("name"), SwitchInfos[i].Name.ToString());
+			ParamJson->SetBoolField(TEXT("value"), Value);
+			ParamJson->SetBoolField(TEXT("is_overridden"), bIsOverridden);
+			SwitchArr.Add(MakeShared<FJsonValueObject>(ParamJson));
+		}
+	}
+	ResultJson->SetArrayField(TEXT("static_switch"), SwitchArr);
+
+	ResultJson->SetNumberField(TEXT("total_overrides"),
+		ScalarArr.Num() + VectorArr.Num() + TextureArr.Num() + SwitchArr.Num());
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: set_instance_parameters (batch)
+// Sets multiple parameter overrides in one call with a single update
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::SetInstanceParameters(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UMaterialInstanceConstant* MIC = LoadedAsset ? Cast<UMaterialInstanceConstant>(LoadedAsset) : nullptr;
+	if (!MIC)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load material instance at '%s'"), *AssetPath));
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* ParamArray = nullptr;
+	if (!Params->TryGetArrayField(TEXT("parameters"), ParamArray) || !ParamArray)
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required 'parameters' array"));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("SetInstanceParameters")));
+	MIC->Modify();
+
+	int32 SetCount = 0;
+	bool bHasStaticSwitches = false;
+	TArray<TSharedPtr<FJsonValue>> ErrorsArr;
+
+	for (const auto& ParamVal : *ParamArray)
+	{
+		const TSharedPtr<FJsonObject>* ParamObj = nullptr;
+		if (!ParamVal->TryGetObject(ParamObj) || !ParamObj)
+		{
+			auto ErrJson = MakeShared<FJsonObject>();
+			ErrJson->SetStringField(TEXT("error"), TEXT("Array element is not a JSON object"));
+			ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
+			continue;
+		}
+
+		FString Name = (*ParamObj)->GetStringField(TEXT("name"));
+		FString Type = (*ParamObj)->GetStringField(TEXT("type"));
+		FMaterialParameterInfo ParamInfo(*Name);
+
+		if (Name.IsEmpty() || Type.IsEmpty())
+		{
+			auto ErrJson = MakeShared<FJsonObject>();
+			ErrJson->SetStringField(TEXT("error"), TEXT("Parameter missing 'name' or 'type'"));
+			ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
+			continue;
+		}
+
+		if (Type.Equals(TEXT("scalar"), ESearchCase::IgnoreCase))
+		{
+			double NumVal = 0.0;
+			if ((*ParamObj)->TryGetNumberField(TEXT("value"), NumVal))
+			{
+				MIC->SetScalarParameterValueEditorOnly(ParamInfo, static_cast<float>(NumVal));
+				SetCount++;
+			}
+			else
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Scalar param '%s': missing or invalid 'value'"), *Name));
+				ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
+			}
+		}
+		else if (Type.Equals(TEXT("vector"), ESearchCase::IgnoreCase))
+		{
+			const TSharedPtr<FJsonObject>* ColorObj = nullptr;
+			if ((*ParamObj)->TryGetObjectField(TEXT("value"), ColorObj))
+			{
+				FLinearColor Color;
+				Color.R = (*ColorObj)->HasField(TEXT("R")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("R"))) : 0.f;
+				Color.G = (*ColorObj)->HasField(TEXT("G")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("G"))) : 0.f;
+				Color.B = (*ColorObj)->HasField(TEXT("B")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("B"))) : 0.f;
+				Color.A = (*ColorObj)->HasField(TEXT("A")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("A"))) : 1.f;
+				MIC->SetVectorParameterValueEditorOnly(ParamInfo, Color);
+				SetCount++;
+			}
+			else
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Vector param '%s': missing or invalid 'value' object"), *Name));
+				ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
+			}
+		}
+		else if (Type.Equals(TEXT("texture"), ESearchCase::IgnoreCase))
+		{
+			FString TexPath = (*ParamObj)->GetStringField(TEXT("value"));
+			UTexture* Tex = Cast<UTexture>(UEditorAssetLibrary::LoadAsset(TexPath));
+			if (Tex)
+			{
+				MIC->SetTextureParameterValueEditorOnly(ParamInfo, Tex);
+				SetCount++;
+			}
+			else
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Texture param '%s': failed to load texture at '%s'"), *Name, *TexPath));
+				ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
+			}
+		}
+		else if (Type.Equals(TEXT("switch"), ESearchCase::IgnoreCase))
+		{
+			bool bValue = false;
+			if ((*ParamObj)->TryGetBoolField(TEXT("value"), bValue))
+			{
+				MIC->SetStaticSwitchParameterValueEditorOnly(ParamInfo, bValue);
+				bHasStaticSwitches = true;
+				SetCount++;
+			}
+			else
+			{
+				auto ErrJson = MakeShared<FJsonObject>();
+				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Switch param '%s': missing or invalid 'value' bool"), *Name));
+				ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
+			}
+		}
+		else
+		{
+			auto ErrJson = MakeShared<FJsonObject>();
+			ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Unknown type '%s' for param '%s'. Valid: scalar, vector, texture, switch"), *Type, *Name));
+			ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
+		}
+	}
+
+	// Single update call at the end — handles static permutation recompile if needed
+	if (SetCount > 0)
+	{
+		UMaterialEditingLibrary::UpdateMaterialInstance(MIC);
+	}
+
+	MIC->MarkPackageDirty();
+	GEditor->EndTransaction();
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetNumberField(TEXT("set_count"), SetCount);
+	if (ErrorsArr.Num() > 0)
+	{
+		ResultJson->SetArrayField(TEXT("errors"), ErrorsArr);
+	}
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: set_instance_parent
+// Reparent a material instance, reporting lost/kept parameters
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::SetInstanceParent(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString NewParentPath = Params->GetStringField(TEXT("new_parent"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UMaterialInstanceConstant* MIC = LoadedAsset ? Cast<UMaterialInstanceConstant>(LoadedAsset) : nullptr;
+	if (!MIC)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load material instance at '%s'"), *AssetPath));
+	}
+
+	UObject* NewParentObj = UEditorAssetLibrary::LoadAsset(NewParentPath);
+	UMaterialInterface* NewParent = NewParentObj ? Cast<UMaterialInterface>(NewParentObj) : nullptr;
+	if (!NewParent)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load new parent material at '%s'"), *NewParentPath));
+	}
+
+	// Snapshot current override names before reparenting
+	TSet<FString> OldParamNames;
+	for (const auto& P : MIC->ScalarParameterValues) OldParamNames.Add(P.ParameterInfo.Name.ToString());
+	for (const auto& P : MIC->VectorParameterValues) OldParamNames.Add(P.ParameterInfo.Name.ToString());
+	for (const auto& P : MIC->TextureParameterValues) OldParamNames.Add(P.ParameterInfo.Name.ToString());
+	// Also snapshot static switch names
+	{
+		TArray<FMaterialParameterInfo> SwitchInfos;
+		TArray<FGuid> SwitchGuids;
+		MIC->GetAllStaticSwitchParameterInfo(SwitchInfos, SwitchGuids);
+		for (const auto& Info : SwitchInfos) OldParamNames.Add(Info.Name.ToString());
+	}
+
+	FString OldParentPath = MIC->Parent ? MIC->Parent->GetPathName() : TEXT("None");
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("SetInstanceParent")));
+	MIC->Modify();
+	MIC->SetParentEditorOnly(NewParent, true);
+	UMaterialEditingLibrary::UpdateMaterialInstance(MIC);
+	MIC->MarkPackageDirty();
+	GEditor->EndTransaction();
+
+	// After reparenting, check which parameters from the new parent exist
+	// to determine what was kept vs lost
+	TArray<TSharedPtr<FJsonValue>> KeptArr, LostArr;
+
+	// Gather all parameter names the new parent exposes
+	TSet<FString> NewParentParamNames;
+	{
+		TArray<FMaterialParameterInfo> Infos;
+		TArray<FGuid> Guids;
+		NewParent->GetAllScalarParameterInfo(Infos, Guids);
+		for (const auto& Info : Infos) NewParentParamNames.Add(Info.Name.ToString());
+		Infos.Reset(); Guids.Reset();
+		NewParent->GetAllVectorParameterInfo(Infos, Guids);
+		for (const auto& Info : Infos) NewParentParamNames.Add(Info.Name.ToString());
+		Infos.Reset(); Guids.Reset();
+		NewParent->GetAllTextureParameterInfo(Infos, Guids);
+		for (const auto& Info : Infos) NewParentParamNames.Add(Info.Name.ToString());
+		Infos.Reset(); Guids.Reset();
+		NewParent->GetAllStaticSwitchParameterInfo(Infos, Guids);
+		for (const auto& Info : Infos) NewParentParamNames.Add(Info.Name.ToString());
+	}
+
+	for (const FString& Name : OldParamNames)
+	{
+		if (NewParentParamNames.Contains(Name))
+		{
+			KeptArr.Add(MakeShared<FJsonValueString>(Name));
+		}
+		else
+		{
+			LostArr.Add(MakeShared<FJsonValueString>(Name));
+		}
+	}
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetStringField(TEXT("old_parent"), OldParentPath);
+	ResultJson->SetStringField(TEXT("new_parent"), NewParent->GetPathName());
+	ResultJson->SetArrayField(TEXT("kept_parameters"), KeptArr);
+	ResultJson->SetArrayField(TEXT("lost_parameters"), LostArr);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: clear_instance_parameter
+// Remove a single override (or all overrides) from a material instance
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::ClearInstanceParameter(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	UMaterialInstanceConstant* MIC = LoadedAsset ? Cast<UMaterialInstanceConstant>(LoadedAsset) : nullptr;
+	if (!MIC)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load material instance at '%s'"), *AssetPath));
+	}
+
+	FString ParamName = Params->HasField(TEXT("parameter_name")) ? Params->GetStringField(TEXT("parameter_name")) : TEXT("");
+	FString ParamType = Params->HasField(TEXT("parameter_type")) ? Params->GetStringField(TEXT("parameter_type")) : TEXT("all");
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("ClearInstanceParameter")));
+	MIC->Modify();
+
+	int32 ClearedCount = 0;
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+
+	if (ParamName.IsEmpty())
+	{
+		// Clear ALL overrides
+		int32 TotalBefore = MIC->ScalarParameterValues.Num() + MIC->VectorParameterValues.Num()
+			+ MIC->TextureParameterValues.Num();
+		UMaterialEditingLibrary::ClearAllMaterialInstanceParameters(MIC);
+		ClearedCount = TotalBefore;
+		ResultJson->SetStringField(TEXT("cleared"), TEXT("all"));
+	}
+	else
+	{
+		// Clear a specific parameter by name and type
+		bool bClearScalar = ParamType.Equals(TEXT("scalar"), ESearchCase::IgnoreCase) || ParamType.Equals(TEXT("all"), ESearchCase::IgnoreCase);
+		bool bClearVector = ParamType.Equals(TEXT("vector"), ESearchCase::IgnoreCase) || ParamType.Equals(TEXT("all"), ESearchCase::IgnoreCase);
+		bool bClearTexture = ParamType.Equals(TEXT("texture"), ESearchCase::IgnoreCase) || ParamType.Equals(TEXT("all"), ESearchCase::IgnoreCase);
+		bool bClearSwitch = ParamType.Equals(TEXT("switch"), ESearchCase::IgnoreCase) || ParamType.Equals(TEXT("all"), ESearchCase::IgnoreCase);
+
+		if (bClearScalar)
+		{
+			ClearedCount += MIC->ScalarParameterValues.RemoveAll([&](const FScalarParameterValue& P)
+			{
+				return P.ParameterInfo.Name.ToString() == ParamName;
+			});
+		}
+		if (bClearVector)
+		{
+			ClearedCount += MIC->VectorParameterValues.RemoveAll([&](const FVectorParameterValue& P)
+			{
+				return P.ParameterInfo.Name.ToString() == ParamName;
+			});
+		}
+		if (bClearTexture)
+		{
+			ClearedCount += MIC->TextureParameterValues.RemoveAll([&](const FTextureParameterValue& P)
+			{
+				return P.ParameterInfo.Name.ToString() == ParamName;
+			});
+		}
+		if (bClearSwitch)
+		{
+			// Static switches: get params, unset the override flag, then update permutation
+			FStaticParameterSet StaticParams;
+			MIC->GetStaticParameterValues(StaticParams);
+			bool bModifiedStatic = false;
+			for (auto& SP : StaticParams.StaticSwitchParameters)
+			{
+				if (SP.ParameterInfo.Name.ToString() == ParamName && SP.bOverride)
+				{
+					SP.bOverride = false;
+					bModifiedStatic = true;
+					ClearedCount++;
+				}
+			}
+			if (bModifiedStatic)
+			{
+				MIC->UpdateStaticPermutation(StaticParams);
+			}
+		}
+
+		ResultJson->SetStringField(TEXT("cleared"), ParamName);
+		ResultJson->SetStringField(TEXT("type_filter"), ParamType);
+	}
+
+	MIC->MarkPackageDirty();
+	GEditor->EndTransaction();
+
+	ResultJson->SetNumberField(TEXT("cleared_count"), ClearedCount);
+
+	return FMonolithActionResult::Success(ResultJson);
+}
+
+// ============================================================================
+// Action: save_material
+// Save a material asset to disk
+// ============================================================================
+
+FMonolithActionResult FMonolithMaterialActions::SaveMaterial(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	bool bOnlyIfDirty = Params->HasField(TEXT("only_if_dirty")) ? Params->GetBoolField(TEXT("only_if_dirty")) : true;
+
+	// Verify asset exists
+	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
+	if (!LoadedAsset)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
+	}
+
+	bool bWasDirty = LoadedAsset->GetPackage()->IsDirty();
+	bool bSaved = UEditorAssetLibrary::SaveAsset(AssetPath, bOnlyIfDirty);
+
+	auto ResultJson = MakeShared<FJsonObject>();
+	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
+	ResultJson->SetBoolField(TEXT("saved"), bSaved);
+	ResultJson->SetBoolField(TEXT("was_dirty"), bWasDirty);
 
 	return FMonolithActionResult::Success(ResultJson);
 }

@@ -19,6 +19,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Editor.h"
+#include "UObject/Package.h"
 
 // ============================================================
 //  Registration
@@ -95,6 +96,16 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Required(TEXT("node_id"),     TEXT("string"), TEXT("Node ID"))
 			.Required(TEXT("position"),    TEXT("array"),  TEXT("New position as [x, y]"))
 			.Optional(TEXT("graph_name"),  TEXT("string"), TEXT("Graph name (searches all graphs if omitted)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("resolve_node"),
+		TEXT("Dry-run node creation — returns resolved type, class, function, and all pins with types/defaults/direction without modifying any asset. Useful for discovering what pins a node will have before adding it."),
+		FMonolithActionHandler::CreateStatic(&HandleResolveNode),
+		FParamSchemaBuilder()
+			.Required(TEXT("node_type"),     TEXT("string"), TEXT("Node type: CallFunction, VariableGet, VariableSet, Branch, CustomEvent (same aliases as add_node)"))
+			.Optional(TEXT("function_name"), TEXT("string"), TEXT("Function name for CallFunction nodes"))
+			.Optional(TEXT("target_class"),  TEXT("string"), TEXT("Class to search for the function (optional for CallFunction)"))
+			.Optional(TEXT("variable_name"), TEXT("string"), TEXT("Variable name hint for VariableGet/VariableSet (uses wildcard if omitted)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("batch_execute"),
@@ -903,4 +914,234 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 	}
 
 	return FMonolithActionResult::Success(Final);
+}
+
+// ============================================================
+//  resolve_node
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSharedPtr<FJsonObject>& Params)
+{
+	FString NodeType = Params->GetStringField(TEXT("node_type"));
+	if (NodeType.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: node_type"));
+	}
+
+	// Apply same alias normalization as add_node
+	{
+		static const TMap<FString, FString> Aliases = {
+			{TEXT("function"),       TEXT("CallFunction")},
+			{TEXT("call_function"),  TEXT("CallFunction")},
+			{TEXT("call"),           TEXT("CallFunction")},
+			{TEXT("func"),           TEXT("CallFunction")},
+			{TEXT("get"),            TEXT("VariableGet")},
+			{TEXT("variable_get"),   TEXT("VariableGet")},
+			{TEXT("set"),            TEXT("VariableSet")},
+			{TEXT("variable_set"),   TEXT("VariableSet")},
+			{TEXT("event"),          TEXT("CustomEvent")},
+			{TEXT("custom_event"),   TEXT("CustomEvent")},
+			{TEXT("branch"),         TEXT("Branch")},
+			{TEXT("if"),             TEXT("Branch")},
+			{TEXT("sequence"),       TEXT("Sequence")},
+		};
+		FString Lower = NodeType.ToLower();
+		if (const FString* Canonical = Aliases.Find(Lower))
+		{
+			NodeType = *Canonical;
+		}
+	}
+
+	TArray<FString> Warnings;
+
+	// Create a transient graph to host the node — some node types behave differently
+	// without a schema on the outer graph, so we set it explicitly.
+	UEdGraph* TempGraph = NewObject<UEdGraph>(GetTransientPackage());
+	TempGraph->Schema = UEdGraphSchema_K2::StaticClass();
+
+	UEdGraphNode* Node = nullptr;
+
+	if (NodeType == TEXT("CallFunction"))
+	{
+		FString FuncName = Params->GetStringField(TEXT("function_name"));
+		if (FuncName.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("CallFunction requires 'function_name'"));
+		}
+
+		FString TargetClassName = Params->GetStringField(TEXT("target_class"));
+
+		TArray<FName> Candidates;
+		Candidates.Add(FName(*FuncName));
+		if (!FuncName.StartsWith(TEXT("K2_")))
+		{
+			Candidates.Add(FName(*FString::Printf(TEXT("K2_%s"), *FuncName)));
+		}
+
+		UFunction* Func = nullptr;
+		if (!TargetClassName.IsEmpty())
+		{
+			UClass* TargetClass = FindFirstObject<UClass>(*TargetClassName, EFindFirstObjectOptions::NativeFirst);
+			if (!TargetClass && !TargetClassName.StartsWith(TEXT("U")))
+				TargetClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *TargetClassName), EFindFirstObjectOptions::NativeFirst);
+			if (!TargetClass && TargetClassName.StartsWith(TEXT("U")))
+				TargetClass = FindFirstObject<UClass>(*TargetClassName.Mid(1), EFindFirstObjectOptions::NativeFirst);
+
+			if (TargetClass)
+			{
+				for (const FName& C : Candidates)
+				{
+					Func = TargetClass->FindFunctionByName(C);
+					if (Func) break;
+				}
+			}
+			if (!Func)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Function '%s' not found on class '%s'"), *FuncName, *TargetClassName));
+			}
+		}
+		else
+		{
+			for (TObjectIterator<UClass> It; It && !Func; ++It)
+			{
+				for (const FName& C : Candidates)
+				{
+					Func = It->FindFunctionByName(C);
+					if (Func) break;
+				}
+			}
+			if (!Func)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Function '%s' not found in any loaded class"), *FuncName));
+			}
+		}
+
+		UK2Node_CallFunction* CallNode = NewObject<UK2Node_CallFunction>(TempGraph);
+		CallNode->SetFromFunction(Func);
+		CallNode->AllocateDefaultPins();
+		Node = CallNode;
+	}
+	else if (NodeType == TEXT("VariableGet"))
+	{
+		// For a dry-run VariableGet, we use a wildcard self-member reference.
+		// If variable_name is provided it's recorded in the response but the pin
+		// layout is identical regardless — VariableGet always has one output data pin.
+		UK2Node_VariableGet* VarNode = NewObject<UK2Node_VariableGet>(TempGraph);
+		FString VarName = Params->GetStringField(TEXT("variable_name"));
+		if (VarName.IsEmpty()) VarName = TEXT("Variable");
+		VarNode->VariableReference.SetSelfMember(FName(*VarName));
+		VarNode->AllocateDefaultPins();
+		Node = VarNode;
+		Warnings.Add(TEXT("VariableGet pin types reflect a wildcard — actual type depends on the specific variable in the target Blueprint"));
+	}
+	else if (NodeType == TEXT("VariableSet"))
+	{
+		UK2Node_VariableSet* VarNode = NewObject<UK2Node_VariableSet>(TempGraph);
+		FString VarName = Params->GetStringField(TEXT("variable_name"));
+		if (VarName.IsEmpty()) VarName = TEXT("Variable");
+		VarNode->VariableReference.SetSelfMember(FName(*VarName));
+		VarNode->AllocateDefaultPins();
+		Node = VarNode;
+		Warnings.Add(TEXT("VariableSet pin types reflect a wildcard — actual type depends on the specific variable in the target Blueprint"));
+	}
+	else if (NodeType == TEXT("Branch"))
+	{
+		UK2Node_IfThenElse* BranchNode = NewObject<UK2Node_IfThenElse>(TempGraph);
+		BranchNode->AllocateDefaultPins();
+		Node = BranchNode;
+	}
+	else if (NodeType == TEXT("CustomEvent"))
+	{
+		UK2Node_CustomEvent* EventNode = NewObject<UK2Node_CustomEvent>(TempGraph);
+		FString EventName = Params->GetStringField(TEXT("event_name"));
+		if (EventName.IsEmpty()) EventName = TEXT("MyEvent");
+		EventNode->CustomFunctionName = FName(*EventName);
+		EventNode->AllocateDefaultPins();
+		Node = EventNode;
+	}
+	else if (NodeType == TEXT("Sequence"))
+	{
+		UK2Node_ExecutionSequence* SeqNode = NewObject<UK2Node_ExecutionSequence>(TempGraph);
+		SeqNode->AllocateDefaultPins();
+		Node = SeqNode;
+	}
+	else
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Unsupported node_type for resolve_node: '%s'. Supported: CallFunction, VariableGet, VariableSet, Branch, CustomEvent, Sequence"), *NodeType));
+	}
+
+	if (!Node)
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to create transient node"));
+	}
+
+	// Serialize pins
+	TArray<TSharedPtr<FJsonValue>> PinsArr;
+	for (const UEdGraphPin* Pin : Node->Pins)
+	{
+		if (!Pin || Pin->bHidden) continue;
+
+		TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
+		PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+		PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+		PinObj->SetStringField(TEXT("type"),
+			MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
+			MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+		PinObj->SetBoolField(TEXT("is_exec"), Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec);
+
+		if (!Pin->DefaultValue.IsEmpty())
+		{
+			PinObj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+		}
+		if (Pin->DefaultObject)
+		{
+			PinObj->SetStringField(TEXT("default_object"), Pin->DefaultObject->GetPathName());
+		}
+
+		PinsArr.Add(MakeShared<FJsonValueObject>(PinObj));
+	}
+
+	// Determine resolved_function for CallFunction nodes
+	FString ResolvedFunction;
+	FString ResolvedClass;
+	if (UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node))
+	{
+		ResolvedFunction = CallNode->FunctionReference.GetMemberName().ToString();
+		if (UClass* OwnerClass = CallNode->FunctionReference.GetMemberParentClass())
+		{
+			ResolvedClass = OwnerClass->GetName();
+		}
+	}
+
+	// Build response
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("resolved_type"), NodeType);
+	Root->SetStringField(TEXT("resolved_class"), Node->GetClass()->GetName());
+	if (!ResolvedFunction.IsEmpty())
+	{
+		Root->SetStringField(TEXT("resolved_function"), ResolvedFunction);
+	}
+	if (!ResolvedClass.IsEmpty())
+	{
+		Root->SetStringField(TEXT("resolved_function_class"), ResolvedClass);
+	}
+	Root->SetStringField(TEXT("node_title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+	Root->SetArrayField(TEXT("pins"), PinsArr);
+	Root->SetNumberField(TEXT("pin_count"), PinsArr.Num());
+
+	// Warnings
+	TArray<TSharedPtr<FJsonValue>> WarnArr;
+	for (const FString& W : Warnings)
+	{
+		WarnArr.Add(MakeShared<FJsonValueString>(W));
+	}
+	Root->SetArrayField(TEXT("warnings"), WarnArr);
+
+	// Mark transient objects for GC
+	TempGraph->MarkAsGarbage();
+
+	return FMonolithActionResult::Success(Root);
 }

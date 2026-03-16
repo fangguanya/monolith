@@ -57,6 +57,13 @@ public:
 	static FMonolithActionResult MoveExpression(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult GetMaterialProperties(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Wave 4: Instance & property improvements ---
+	static FMonolithActionResult GetInstanceParameters(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult SetInstanceParameters(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult SetInstanceParent(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult ClearInstanceParameter(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult SaveMaterial(const TSharedPtr<FJsonObject>& Params);
+
 private:
 	/** Load a UMaterial from an asset path. Returns nullptr on failure. */
 	static UMaterial* LoadBaseMaterial(const FString& AssetPath);

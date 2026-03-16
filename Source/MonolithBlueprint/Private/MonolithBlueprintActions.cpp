@@ -8,6 +8,8 @@
 #include "Engine/SCS_Node.h"
 #include "Components/SceneComponent.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "UObject/Class.h"
+#include "UObject/UObjectIterator.h"
 
 // --- Registration ---
 
@@ -110,6 +112,33 @@ void FMonolithBlueprintActions::RegisterActions()
 		FMonolithActionHandler::CreateStatic(&HandleGetConstructionScript),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("search_functions"),
+		TEXT("Search for Blueprint-callable functions across all loaded C++ classes. Returns function names, classes, param lists. Results are cached on first call for the session. At least one of 'query' or 'class_filter' is required."),
+		FMonolithActionHandler::CreateStatic(&HandleSearchFunctions),
+		FParamSchemaBuilder()
+			.Optional(TEXT("query"),             TEXT("string"),  TEXT("Search string matched against function name, class name, and category (case-insensitive contains). Required if class_filter is empty."))
+			.Optional(TEXT("class_filter"),      TEXT("string"),  TEXT("Restrict results to a specific class name (case-insensitive contains). Required if query is empty."))
+			.Optional(TEXT("include_inherited"), TEXT("boolean"), TEXT("Include inherited functions (default: true)"))
+			.Optional(TEXT("pure_only"),         TEXT("boolean"), TEXT("Only return pure (no exec pins) functions (default: false)"))
+			.Optional(TEXT("limit"),             TEXT("integer"), TEXT("Max results to return (default: 50)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_node_details"),
+		TEXT("Get full pin dump for a single node by node_id. Returns same data as get_graph_data for one node, including orphaned pin flag."),
+		FMonolithActionHandler::CreateStatic(&HandleGetNodeDetails),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Required(TEXT("node_id"),    TEXT("string"), TEXT("Node ID (from get_graph_data or add_node response)"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph name to narrow search (searches all graphs if omitted)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_interface_functions"),
+		TEXT("Query the function signatures required by a Blueprint interface. Works for both C++ and Blueprint interfaces."),
+		FMonolithActionHandler::CreateStatic(&HandleGetInterfaceFunctions),
+		FParamSchemaBuilder()
+			.Required(TEXT("interface_class"), TEXT("string"), TEXT("Interface class name (e.g. BPI_Interactable or IInteractable)"))
 			.Build());
 }
 
@@ -1016,6 +1045,395 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetConstructionScript(con
 	}
 	Root->SetArrayField(TEXT("nodes"), NodesArr);
 	Root->SetNumberField(TEXT("node_count"), NodesArr.Num());
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  search_functions  (Wave 3)
+// ============================================================
+
+namespace
+{
+	// Cache entry for a single BP-callable function
+	struct FFunctionCacheEntry
+	{
+		FString FunctionName;    // bare name, e.g. K2_GetActorLocation
+		FString ClassName;       // e.g. Actor
+		FString Category;
+		bool bIsPure;
+		bool bIsStatic;
+		TArray<TSharedPtr<FJsonObject>> Inputs;
+		TArray<TSharedPtr<FJsonObject>> Outputs;
+	};
+
+	// Build and cache the full list of BP-callable functions across all loaded C++ classes.
+	// Called once per editor session; class/function list is stable after module load.
+	static TArray<FFunctionCacheEntry>& GetFunctionCache()
+	{
+		static TArray<FFunctionCacheEntry> Cache;
+		static bool bBuilt = false;
+		if (bBuilt) return Cache;
+		bBuilt = true;
+
+		for (TObjectIterator<UClass> ClassIt; ClassIt; ++ClassIt)
+		{
+			UClass* Class = *ClassIt;
+			if (!Class) continue;
+
+			// Skip Blueprint-generated classes — they duplicate native entries and bloat the cache
+			if (Class->HasAnyClassFlags(CLASS_CompiledFromBlueprint)) continue;
+
+			// Skip abstract interface classes (their functions appear on implementing classes)
+			// but DO include interface classes themselves — callers may want to discover them
+			const FString ClassName = Class->GetName();
+
+			for (TFieldIterator<UFunction> FuncIt(Class, EFieldIterationFlags::None); FuncIt; ++FuncIt)
+			{
+				UFunction* Func = *FuncIt;
+				if (!Func) continue;
+
+				// Must be Blueprint-callable
+				if (!Func->HasAnyFunctionFlags(FUNC_BlueprintCallable)) continue;
+
+				// Skip deprecated functions
+				if (Func->HasMetaData(TEXT("DeprecatedFunction"))) continue;
+
+				// Only include functions owned by this class (not inherited ones in this iteration pass)
+				// We'll add inherited as a separate pass below if requested
+				if (Func->GetOwnerClass() != Class) continue;
+
+				FFunctionCacheEntry Entry;
+				Entry.FunctionName = Func->GetName();
+				Entry.ClassName    = ClassName;
+				Entry.Category     = Func->GetMetaData(TEXT("Category"));
+				Entry.bIsPure      = Func->HasAnyFunctionFlags(FUNC_BlueprintPure);
+				Entry.bIsStatic    = Func->HasAnyFunctionFlags(FUNC_Static);
+
+				// Collect parameters
+				for (TFieldIterator<FProperty> PropIt(Func); PropIt && (PropIt->PropertyFlags & CPF_Parm); ++PropIt)
+				{
+					FProperty* Prop = *PropIt;
+					if (!Prop) continue;
+
+					// Build a simple {name, type} object
+					TSharedPtr<FJsonObject> ParamObj = MakeShared<FJsonObject>();
+					ParamObj->SetStringField(TEXT("name"), Prop->GetName());
+					ParamObj->SetStringField(TEXT("type"), Prop->GetCPPType());
+
+					if (Prop->PropertyFlags & CPF_ReturnParm)
+					{
+						Entry.Outputs.Add(ParamObj);
+					}
+					else if (Prop->PropertyFlags & CPF_OutParm)
+					{
+						Entry.Outputs.Add(ParamObj);
+					}
+					else
+					{
+						Entry.Inputs.Add(ParamObj);
+					}
+				}
+
+				Cache.Add(MoveTemp(Entry));
+			}
+		}
+
+		return Cache;
+	}
+} // anonymous namespace
+
+FMonolithActionResult FMonolithBlueprintActions::HandleSearchFunctions(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Query       = Params->GetStringField(TEXT("query"));
+	FString ClassFilter = Params->GetStringField(TEXT("class_filter"));
+
+	if (Query.IsEmpty() && ClassFilter.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("At least one of 'query' or 'class_filter' is required to avoid a full scan"));
+	}
+
+	bool bPureOnly = false;
+	Params->TryGetBoolField(TEXT("pure_only"), bPureOnly);
+
+	// include_inherited controls whether the cache is built with inherited entries exposed.
+	// The cache itself only stores functions owned by their declaring class (no duplication).
+	// Searches always hit all entries; include_inherited currently controls a future filter path.
+	// For now we always search the full cache and let class_filter narrow it.
+
+	int32 Limit = 50;
+	{
+		double LimitNum = 0.0;
+		if (Params->TryGetNumberField(TEXT("limit"), LimitNum) && LimitNum > 0)
+		{
+			Limit = (int32)LimitNum;
+		}
+	}
+
+	const FString QueryLower       = Query.ToLower();
+	const FString ClassFilterLower = ClassFilter.ToLower();
+
+	const TArray<FFunctionCacheEntry>& Cache = GetFunctionCache();
+
+	TArray<TSharedPtr<FJsonValue>> Results;
+	for (const FFunctionCacheEntry& Entry : Cache)
+	{
+		if (Results.Num() >= Limit) break;
+
+		// Class filter
+		if (!ClassFilterLower.IsEmpty() && !Entry.ClassName.ToLower().Contains(ClassFilterLower))
+		{
+			continue;
+		}
+
+		// Pure filter
+		if (bPureOnly && !Entry.bIsPure) continue;
+
+		// Query match — function name, class name, or category
+		if (!QueryLower.IsEmpty())
+		{
+			bool bMatch = Entry.FunctionName.ToLower().Contains(QueryLower) ||
+			              Entry.ClassName.ToLower().Contains(QueryLower) ||
+			              Entry.Category.ToLower().Contains(QueryLower);
+			if (!bMatch) continue;
+		}
+
+		// Build result object
+		TSharedPtr<FJsonObject> RObj = MakeShared<FJsonObject>();
+		RObj->SetStringField(TEXT("function_name"), Entry.FunctionName);
+		RObj->SetStringField(TEXT("class_name"),    Entry.ClassName);
+		RObj->SetStringField(TEXT("category"),      Entry.Category);
+		RObj->SetBoolField(TEXT("is_pure"),         Entry.bIsPure);
+		RObj->SetBoolField(TEXT("is_static"),       Entry.bIsStatic);
+
+		// K2 name: if the function starts with K2_, report both forms
+		FString K2Name = Entry.FunctionName;
+		if (K2Name.StartsWith(TEXT("K2_")))
+		{
+			RObj->SetStringField(TEXT("k2_name"),      Entry.FunctionName);
+			RObj->SetStringField(TEXT("friendly_name"), Entry.FunctionName.Mid(3));
+		}
+		else
+		{
+			RObj->SetStringField(TEXT("k2_name"), Entry.FunctionName);
+		}
+
+		TArray<TSharedPtr<FJsonValue>> InputsArr;
+		for (const auto& P : Entry.Inputs)
+		{
+			InputsArr.Add(MakeShared<FJsonValueObject>(P));
+		}
+		RObj->SetArrayField(TEXT("inputs"), InputsArr);
+
+		TArray<TSharedPtr<FJsonValue>> OutputsArr;
+		for (const auto& P : Entry.Outputs)
+		{
+			OutputsArr.Add(MakeShared<FJsonValueObject>(P));
+		}
+		RObj->SetArrayField(TEXT("outputs"), OutputsArr);
+
+		Results.Add(MakeShared<FJsonValueObject>(RObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetArrayField(TEXT("results"), Results);
+	Root->SetNumberField(TEXT("count"), Results.Num());
+	Root->SetNumberField(TEXT("cache_size"), Cache.Num());
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  get_node_details  (Wave 3)
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintActions::HandleGetNodeDetails(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = LoadBlueprint(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString NodeId = Params->GetStringField(TEXT("node_id"));
+	if (NodeId.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: node_id"));
+	}
+
+	FString GraphName = Params->GetStringField(TEXT("graph_name"));
+	UEdGraphNode* Node = MonolithBlueprintInternal::FindNodeById(BP, GraphName, NodeId);
+	if (!Node)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Node not found: %s"), *NodeId));
+	}
+
+	// Use the existing SerializeNode for the base data, then augment with orphan info
+	TSharedPtr<FJsonObject> NodeObj = MonolithBlueprintInternal::SerializeNode(Node);
+
+	// Add orphan flag per pin — SerializeNode already includes pins but without bOrphanedPin
+	// Rebuild the pins array with the extra field rather than patching the existing one
+	TArray<TSharedPtr<FJsonValue>> PinsArr;
+	for (const UEdGraphPin* Pin : Node->Pins)
+	{
+		if (!Pin || Pin->bHidden) continue;
+
+		TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
+		PinObj->SetStringField(TEXT("id"),        Pin->PinId.ToString());
+		PinObj->SetStringField(TEXT("name"),      Pin->PinName.ToString());
+		PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
+		PinObj->SetStringField(TEXT("type"),
+			MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
+			MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+		PinObj->SetBoolField(TEXT("is_exec"),     Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec);
+		PinObj->SetBoolField(TEXT("is_orphaned"), Pin->bOrphanedPin);
+
+		if (!Pin->DefaultValue.IsEmpty())
+		{
+			PinObj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+		}
+		if (Pin->DefaultObject)
+		{
+			PinObj->SetStringField(TEXT("default_object"), Pin->DefaultObject->GetPathName());
+		}
+
+		TArray<TSharedPtr<FJsonValue>> ConnArr;
+		for (const UEdGraphPin* Linked : Pin->LinkedTo)
+		{
+			if (!Linked || !Linked->GetOwningNode()) continue;
+			FString ConnId = FString::Printf(TEXT("%s.%s"),
+				*Linked->GetOwningNode()->GetName(),
+				*Linked->PinName.ToString());
+			ConnArr.Add(MakeShared<FJsonValueString>(ConnId));
+		}
+		PinObj->SetArrayField(TEXT("connected_to"), ConnArr);
+
+		PinsArr.Add(MakeShared<FJsonValueObject>(PinObj));
+	}
+
+	// Override the pins array with the augmented version
+	NodeObj->SetArrayField(TEXT("pins"), PinsArr);
+
+	// Add graph context
+	UEdGraph* OwningGraph = Node->GetGraph();
+	if (OwningGraph)
+	{
+		NodeObj->SetStringField(TEXT("graph_name"), OwningGraph->GetName());
+	}
+	NodeObj->SetStringField(TEXT("asset_path"), AssetPath);
+
+	return FMonolithActionResult::Success(NodeObj);
+}
+
+// ============================================================
+//  get_interface_functions  (Wave 3)
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintActions::HandleGetInterfaceFunctions(const TSharedPtr<FJsonObject>& Params)
+{
+	FString InterfaceClassName = Params->GetStringField(TEXT("interface_class"));
+	if (InterfaceClassName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: interface_class"));
+	}
+
+	// Resolve class — try as-is, then with U/I prefix variants
+	UClass* InterfaceClass = FindFirstObject<UClass>(*InterfaceClassName, EFindFirstObjectOptions::NativeFirst);
+	if (!InterfaceClass)
+	{
+		// Try with U prefix (C++ convention for UInterface base)
+		InterfaceClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *InterfaceClassName), EFindFirstObjectOptions::NativeFirst);
+	}
+	if (!InterfaceClass)
+	{
+		// Strip leading I (BP convention: BPI_Foo -> search for UBPI_Foo)
+		if (InterfaceClassName.StartsWith(TEXT("I")))
+		{
+			InterfaceClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *InterfaceClassName.Mid(1)), EFindFirstObjectOptions::NativeFirst);
+		}
+	}
+
+	if (!InterfaceClass)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Interface class not found: '%s'. Try the full class name including prefix (e.g. BPI_Interactable, IMyInterface)"),
+			*InterfaceClassName));
+	}
+
+	if (!InterfaceClass->HasAnyClassFlags(CLASS_Interface))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("'%s' is not an interface class"), *InterfaceClassName));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> FunctionsArr;
+
+	// Iterate functions on the interface class (not inherited — interface functions are declared here)
+	for (TFieldIterator<UFunction> FuncIt(InterfaceClass, EFieldIterationFlags::None); FuncIt; ++FuncIt)
+	{
+		UFunction* Func = *FuncIt;
+		if (!Func) continue;
+		if (Func->GetOwnerClass() != InterfaceClass) continue;
+
+		// Interface functions are BlueprintCallable or BlueprintImplementableEvent
+		if (!Func->HasAnyFunctionFlags(FUNC_BlueprintCallable | FUNC_BlueprintEvent)) continue;
+
+		TSharedPtr<FJsonObject> FObj = MakeShared<FJsonObject>();
+		FObj->SetStringField(TEXT("name"), Func->GetName());
+		FObj->SetBoolField(TEXT("is_const"), Func->HasAnyFunctionFlags(FUNC_Const));
+
+		// A function becomes an event in BP if it has no return/out params
+		// (Blueprint fires it as a one-way event rather than a callable function)
+		bool bHasOutParms = false;
+		for (TFieldIterator<FProperty> PropIt(Func); PropIt && (PropIt->PropertyFlags & CPF_Parm); ++PropIt)
+		{
+			if (PropIt->PropertyFlags & (CPF_ReturnParm | CPF_OutParm))
+			{
+				bHasOutParms = true;
+				break;
+			}
+		}
+		FObj->SetBoolField(TEXT("is_event"), !bHasOutParms && Func->HasAnyFunctionFlags(FUNC_BlueprintEvent));
+
+		// Collect inputs and outputs
+		TArray<TSharedPtr<FJsonValue>> InputsArr;
+		TArray<TSharedPtr<FJsonValue>> OutputsArr;
+
+		for (TFieldIterator<FProperty> PropIt(Func); PropIt && (PropIt->PropertyFlags & CPF_Parm); ++PropIt)
+		{
+			FProperty* Prop = *PropIt;
+			if (!Prop) continue;
+
+			TSharedPtr<FJsonObject> ParamObj = MakeShared<FJsonObject>();
+			ParamObj->SetStringField(TEXT("name"), Prop->GetName());
+			ParamObj->SetStringField(TEXT("type"), Prop->GetCPPType());
+
+			if (Prop->PropertyFlags & CPF_ReturnParm)
+			{
+				OutputsArr.Add(MakeShared<FJsonValueObject>(ParamObj));
+			}
+			else if (Prop->PropertyFlags & CPF_OutParm)
+			{
+				OutputsArr.Add(MakeShared<FJsonValueObject>(ParamObj));
+			}
+			else
+			{
+				InputsArr.Add(MakeShared<FJsonValueObject>(ParamObj));
+			}
+		}
+
+		FObj->SetArrayField(TEXT("inputs"),  InputsArr);
+		FObj->SetArrayField(TEXT("outputs"), OutputsArr);
+
+		FunctionsArr.Add(MakeShared<FJsonValueObject>(FObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("interface_name"), InterfaceClass->GetName());
+	Root->SetStringField(TEXT("interface_path"), InterfaceClass->GetPathName());
+	Root->SetArrayField(TEXT("functions"),       FunctionsArr);
+	Root->SetNumberField(TEXT("function_count"), FunctionsArr.Num());
 
 	return FMonolithActionResult::Success(Root);
 }

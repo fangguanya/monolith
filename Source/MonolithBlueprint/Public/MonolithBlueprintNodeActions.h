@@ -14,4 +14,7 @@ public:
 	static FMonolithActionResult HandleSetPinDefault(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetNodePosition(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleBatchExecute(const TSharedPtr<FJsonObject>& Params);
+
+	// Wave 3 — Discovery & Resolution
+	static FMonolithActionResult HandleResolveNode(const TSharedPtr<FJsonObject>& Params);
 };

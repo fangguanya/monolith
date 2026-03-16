@@ -5,7 +5,7 @@ description: Use when creating, editing, or inspecting Unreal Engine materials v
 
 # Unreal Material Workflows
 
-You have access to **Monolith** with 31 material actions via `material_query()`.
+You have access to **Monolith** with 36 material actions via `material_query()`.
 
 ## Discovery
 
@@ -27,7 +27,7 @@ All asset paths follow UE content browser format (no .uasset extension):
 
 - `asset_path` — the material asset path (NOT `asset`)
 
-## Action Reference (31 actions)
+## Action Reference (36 actions)
 
 ### Read Actions (13)
 | Action | Key Params | Purpose |
@@ -45,6 +45,15 @@ All asset paths follow UE content browser format (no .uasset extension):
 | `get_thumbnail` | `asset_path`, `save_to_file`? | Get thumbnail. Use `save_to_file: true` — inline base64 wastes context |
 | `validate_material` | `asset_path`, `fix_issues`? | Check for broken connections, unused nodes, errors |
 | `render_preview` | `asset_path` | Trigger material compilation and preview |
+
+### Instance Actions (5)
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `get_instance_parameters` | `asset_path` | Read all parameter overrides from a MIC — scalar, vector, texture, static switch with override detection |
+| `set_instance_parameters` | `asset_path`, `parameters` (array of `{name, type, value}`) | Batch-set multiple instance parameters in one call. Single recompile at end |
+| `set_instance_parent` | `asset_path`, `new_parent` | Reparent a material instance. Reports lost/kept parameters |
+| `clear_instance_parameter` | `asset_path`, `parameter_name`, `parameter_type`? | Remove a single override (reverts to parent). Use type `"all"` to clear everything |
+| `save_material` | `asset_path`, `only_if_dirty`? | Save material to disk. One-liner |
 
 ### Write Actions (18)
 | Action | Key Params | Purpose |

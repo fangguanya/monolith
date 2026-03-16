@@ -5,7 +5,7 @@ description: Use when working with Unreal Engine Blueprints via Monolith MCP —
 
 # Unreal Blueprint Workflows
 
-You have access to **Monolith** with 48 Blueprint actions via `blueprint_query()`.
+You have access to **Monolith** with 52 Blueprint actions via `blueprint_query()`.
 
 ## Discovery
 
@@ -24,7 +24,7 @@ monolith_discover({ namespace: "blueprint" })
 
 ## Action Reference
 
-### Read Actions (13)
+### Read Actions (17)
 
 | Action | Key Params | Purpose |
 |--------|-----------|---------|
@@ -42,6 +42,15 @@ monolith_discover({ namespace: "blueprint" })
 | `get_interfaces` | `asset_path` | Implemented interfaces (direct + inherited) |
 | `get_construction_script` | `asset_path` | Construction script graph data |
 | `get_cdo_properties` | `asset_path`, `category_filter`?, `include_parent_defaults`? | Read all UPROPERTY defaults from Blueprint CDO or UObject asset |
+| `get_node_details` | `asset_path`, `node_id`, `graph_name`? | Full pin dump for a single node — faster than fetching entire graph |
+| `search_functions` | `query`, `class_filter`?, `pure_only`?, `limit`? | Find BP-callable functions by name/keyword. Static cache — first call ~100ms, then instant |
+| `get_interface_functions` | `interface_class` | Query what functions an interface requires — names, params, is_event |
+
+### Discovery & Resolution (1)
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `resolve_node` | `node_type`, `function_name`?, `target_class`?, `variable_name`? | Dry-run node creation — returns resolved type, class, all pins with types. No asset modification |
 
 ### Variable CRUD (7)
 
