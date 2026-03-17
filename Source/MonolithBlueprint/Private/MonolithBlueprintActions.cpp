@@ -1218,13 +1218,24 @@ FMonolithActionResult FMonolithBlueprintActions::HandleSearchFunctions(const TSh
 		// Pure filter
 		if (bPureOnly && !Entry.bIsPure) continue;
 
-		// Query match — function name, class name, or category
+		// Query match — split on spaces and AND all tokens across function/class/category
 		if (!QueryLower.IsEmpty())
 		{
-			bool bMatch = Entry.FunctionName.ToLower().Contains(QueryLower) ||
-			              Entry.ClassName.ToLower().Contains(QueryLower) ||
-			              Entry.Category.ToLower().Contains(QueryLower);
-			if (!bMatch) continue;
+			TArray<FString> Tokens;
+			QueryLower.ParseIntoArray(Tokens, TEXT(" "), true);
+			FString FuncLower = Entry.FunctionName.ToLower();
+			FString ClassLower = Entry.ClassName.ToLower();
+			FString CatLower = Entry.Category.ToLower();
+			bool bAllTokensMatch = true;
+			for (const FString& Token : Tokens)
+			{
+				if (!FuncLower.Contains(Token) && !ClassLower.Contains(Token) && !CatLower.Contains(Token))
+				{
+					bAllTokensMatch = false;
+					break;
+				}
+			}
+			if (!bAllTokensMatch) continue;
 		}
 
 		// Build result object
@@ -1386,7 +1397,9 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetInterfaceFunctions(con
 	if (!InterfaceClass)
 	{
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Interface class not found: '%s'. Try the full class name including prefix (e.g. BPI_Interactable, IMyInterface)"),
+			TEXT("Interface class not found: '%s'. Tried as-is, with 'U' prefix, and with 'I' stripped + 'U' prepended. "
+			     "For C++ interfaces use the I-prefixed name (e.g. IGameplayTagAssetInterface). "
+			     "For Blueprint interfaces use the asset name (e.g. BPI_Interactable)."),
 			*InterfaceClassName));
 	}
 
