@@ -1206,7 +1206,9 @@ FMonolithActionResult FMonolithMaterialActions::BuildMaterialGraph(const TShared
 			}
 			const TSharedPtr<FJsonObject>& OutObj = *OutObjPtr;
 
-			FString FromId = OutObj->GetStringField(TEXT("from"));
+			// Accept both "from" (export format) and "from_expression" (connect_expressions style)
+			FString FromId = OutObj->HasField(TEXT("from")) ? OutObj->GetStringField(TEXT("from"))
+			               : OutObj->HasField(TEXT("from_expression")) ? OutObj->GetStringField(TEXT("from_expression")) : TEXT("");
 			FString FromPin = OutObj->HasField(TEXT("from_pin")) ? OutObj->GetStringField(TEXT("from_pin")) : TEXT("");
 			FString ToProp = OutObj->GetStringField(TEXT("to_property"));
 
@@ -2896,7 +2898,16 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameter(const TShar
 		return FMonolithActionResult::Error(TEXT("Must provide one of: scalar_value, vector_value, texture_value, switch_value"));
 	}
 
-	MIC->MarkPackageDirty();
+	// Static switches need UpdateMaterialInstance to compile the permutation and persist correctly.
+	// For all other param types MarkPackageDirty is sufficient.
+	if (SetType == TEXT("static_switch"))
+	{
+		UMaterialEditingLibrary::UpdateMaterialInstance(MIC);
+	}
+	else
+	{
+		MIC->MarkPackageDirty();
+	}
 
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
@@ -3368,6 +3379,7 @@ FMonolithActionResult FMonolithMaterialActions::AutoLayout(const TSharedPtr<FJso
 		UMaterialEditingLibrary::LayoutMaterialFunctionExpressions(MatFunc);
 		ResultJson->SetStringField(TEXT("type"), TEXT("MaterialFunction"));
 		ResultJson->SetNumberField(TEXT("expression_count"), ExprCount);
+		ResultJson->SetBoolField(TEXT("positions_changed"), true);  // UX #3
 		return FMonolithActionResult::Success(ResultJson);
 	}
 
@@ -3379,6 +3391,7 @@ FMonolithActionResult FMonolithMaterialActions::AutoLayout(const TSharedPtr<FJso
 		UMaterialEditingLibrary::LayoutMaterialExpressions(Mat);
 		ResultJson->SetStringField(TEXT("type"), TEXT("Material"));
 		ResultJson->SetNumberField(TEXT("expression_count"), ExprCount);
+		ResultJson->SetBoolField(TEXT("positions_changed"), true);  // UX #3
 		return FMonolithActionResult::Success(ResultJson);
 	}
 
@@ -3919,6 +3932,9 @@ FMonolithActionResult FMonolithMaterialActions::GetMaterialProperties(const TSha
 		ResultJson->SetNumberField(TEXT("opacity_mask_clip_value"), BaseMat->OpacityMaskClipValue);
 		ResultJson->SetBoolField(TEXT("dithered_lod_transition"), BaseMat->DitheredLODTransition != 0);
 		ResultJson->SetNumberField(TEXT("expression_count"), BaseMat->GetExpressions().Num());
+		// BUG #1: optimization flags missing from read path
+		ResultJson->SetBoolField(TEXT("fully_rough"), BaseMat->bFullyRough != 0);
+		ResultJson->SetBoolField(TEXT("cast_shadow_as_masked"), BaseMat->bCastDynamicShadowAsMasked != 0);
 	}
 
 	// Is it translucent?
@@ -4039,15 +4055,19 @@ FMonolithActionResult FMonolithMaterialActions::GetInstanceParameters(const TSha
 			FGuid OutGuid;
 			MIC->GetStaticSwitchParameterValue(SwitchInfos[i], Value, OutGuid);
 
-			// Check if overridden by comparing to parent
+			// Check if overridden by inspecting the bOverride flag via public GetStaticParameters() API.
+			// Value comparison against parent is wrong: a switch explicitly set to the same value as the
+			// parent would incorrectly show is_overridden=false.
 			bool bIsOverridden = false;
-			if (MIC->Parent)
 			{
-				bool ParentValue = false;
-				FGuid ParentGuid;
-				if (MIC->Parent->GetStaticSwitchParameterValue(SwitchInfos[i], ParentValue, ParentGuid))
+				FStaticParameterSet StaticParams = MIC->GetStaticParameters();
+				for (const FStaticSwitchParameter& SP : StaticParams.StaticSwitchParameters)
 				{
-					bIsOverridden = (Value != ParentValue);
+					if (SP.ParameterInfo == SwitchInfos[i])
+					{
+						bIsOverridden = SP.bOverride;
+						break;
+					}
 				}
 			}
 
@@ -4060,8 +4080,19 @@ FMonolithActionResult FMonolithMaterialActions::GetInstanceParameters(const TSha
 	}
 	ResultJson->SetArrayField(TEXT("static_switch"), SwitchArr);
 
+	// MINOR #1: only count switch params that are actually overridden (SwitchArr contains all parent params)
+	int32 OverriddenSwitchCount = 0;
+	for (const TSharedPtr<FJsonValue>& SwitchVal : SwitchArr)
+	{
+		bool bOverridden = false;
+		if (SwitchVal.IsValid())
+		{
+			SwitchVal->AsObject()->TryGetBoolField(TEXT("is_overridden"), bOverridden);
+		}
+		if (bOverridden) OverriddenSwitchCount++;
+	}
 	ResultJson->SetNumberField(TEXT("total_overrides"),
-		ScalarArr.Num() + VectorArr.Num() + TextureArr.Num() + SwitchArr.Num());
+		ScalarArr.Num() + VectorArr.Num() + TextureArr.Num() + OverriddenSwitchCount);
 
 	return FMonolithActionResult::Success(ResultJson);
 }
@@ -4094,6 +4125,7 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameters(const TSha
 	int32 SetCount = 0;
 	bool bHasStaticSwitches = false;
 	TArray<TSharedPtr<FJsonValue>> ErrorsArr;
+	TArray<TSharedPtr<FJsonValue>> ResultsArr;  // MINOR #3: per-param results
 
 	for (const auto& ParamVal : *ParamArray)
 	{
@@ -4118,6 +4150,9 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameters(const TSha
 			continue;
 		}
 
+		bool bParamSuccess = false;
+		FString ParamError;
+
 		if (Type.Equals(TEXT("scalar"), ESearchCase::IgnoreCase))
 		{
 			double NumVal = 0.0;
@@ -4125,11 +4160,13 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameters(const TSha
 			{
 				MIC->SetScalarParameterValueEditorOnly(ParamInfo, static_cast<float>(NumVal));
 				SetCount++;
+				bParamSuccess = true;
 			}
 			else
 			{
+				ParamError = FString::Printf(TEXT("Scalar param '%s': missing or invalid 'value'"), *Name);
 				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Scalar param '%s': missing or invalid 'value'"), *Name));
+				ErrJson->SetStringField(TEXT("error"), ParamError);
 				ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
 			}
 		}
@@ -4145,11 +4182,13 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameters(const TSha
 				Color.A = (*ColorObj)->HasField(TEXT("A")) ? static_cast<float>((*ColorObj)->GetNumberField(TEXT("A"))) : 1.f;
 				MIC->SetVectorParameterValueEditorOnly(ParamInfo, Color);
 				SetCount++;
+				bParamSuccess = true;
 			}
 			else
 			{
+				ParamError = FString::Printf(TEXT("Vector param '%s': missing or invalid 'value' object"), *Name);
 				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Vector param '%s': missing or invalid 'value' object"), *Name));
+				ErrJson->SetStringField(TEXT("error"), ParamError);
 				ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
 			}
 		}
@@ -4161,11 +4200,13 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameters(const TSha
 			{
 				MIC->SetTextureParameterValueEditorOnly(ParamInfo, Tex);
 				SetCount++;
+				bParamSuccess = true;
 			}
 			else
 			{
+				ParamError = FString::Printf(TEXT("Texture param '%s': failed to load texture at '%s'"), *Name, *TexPath);
 				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Texture param '%s': failed to load texture at '%s'"), *Name, *TexPath));
+				ErrJson->SetStringField(TEXT("error"), ParamError);
 				ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
 			}
 		}
@@ -4177,20 +4218,34 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameters(const TSha
 				MIC->SetStaticSwitchParameterValueEditorOnly(ParamInfo, bValue);
 				bHasStaticSwitches = true;
 				SetCount++;
+				bParamSuccess = true;
 			}
 			else
 			{
+				ParamError = FString::Printf(TEXT("Switch param '%s': missing or invalid 'value' bool"), *Name);
 				auto ErrJson = MakeShared<FJsonObject>();
-				ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Switch param '%s': missing or invalid 'value' bool"), *Name));
+				ErrJson->SetStringField(TEXT("error"), ParamError);
 				ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
 			}
 		}
 		else
 		{
+			ParamError = FString::Printf(TEXT("Unknown type '%s' for param '%s'. Valid: scalar, vector, texture, switch"), *Type, *Name);
 			auto ErrJson = MakeShared<FJsonObject>();
-			ErrJson->SetStringField(TEXT("error"), FString::Printf(TEXT("Unknown type '%s' for param '%s'. Valid: scalar, vector, texture, switch"), *Type, *Name));
+			ErrJson->SetStringField(TEXT("error"), ParamError);
 			ErrorsArr.Add(MakeShared<FJsonValueObject>(ErrJson));
 		}
+
+		// MINOR #3: record per-param result
+		auto ResJson = MakeShared<FJsonObject>();
+		ResJson->SetStringField(TEXT("name"), Name);
+		ResJson->SetStringField(TEXT("type"), Type);
+		ResJson->SetBoolField(TEXT("success"), bParamSuccess);
+		if (!bParamSuccess && !ParamError.IsEmpty())
+		{
+			ResJson->SetStringField(TEXT("error"), ParamError);
+		}
+		ResultsArr.Add(MakeShared<FJsonValueObject>(ResJson));
 	}
 
 	// Single update call at the end — handles static permutation recompile if needed
@@ -4205,6 +4260,7 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameters(const TSha
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
 	ResultJson->SetNumberField(TEXT("set_count"), SetCount);
+	ResultJson->SetArrayField(TEXT("results"), ResultsArr);  // MINOR #3
 	if (ErrorsArr.Num() > 0)
 	{
 		ResultJson->SetArrayField(TEXT("errors"), ErrorsArr);
@@ -4331,10 +4387,41 @@ FMonolithActionResult FMonolithMaterialActions::ClearInstanceParameter(const TSh
 
 	if (ParamName.IsEmpty())
 	{
-		// Clear ALL overrides
+		// Clear ALL overrides — count all types before clearing (MINOR #2: include static switches)
+		int32 SwitchCountBefore = 0;
+		{
+			FStaticParameterSet StaticParams;
+			MIC->GetStaticParameterValues(StaticParams);
+			for (const auto& SP : StaticParams.StaticSwitchParameters)
+			{
+				if (SP.bOverride) SwitchCountBefore++;
+			}
+		}
 		int32 TotalBefore = MIC->ScalarParameterValues.Num() + MIC->VectorParameterValues.Num()
-			+ MIC->TextureParameterValues.Num();
+			+ MIC->TextureParameterValues.Num() + SwitchCountBefore;
 		UMaterialEditingLibrary::ClearAllMaterialInstanceParameters(MIC);
+
+		// ClearAllMaterialInstanceParameters only clears dynamic params (scalar/vector/texture).
+		// Static switches must be cleared manually.
+		if (SwitchCountBefore > 0)
+		{
+			FStaticParameterSet StaticParams;
+			MIC->GetStaticParameterValues(StaticParams);
+			bool bModifiedStatic = false;
+			for (auto& SP : StaticParams.StaticSwitchParameters)
+			{
+				if (SP.bOverride)
+				{
+					SP.bOverride = false;
+					bModifiedStatic = true;
+				}
+			}
+			if (bModifiedStatic)
+			{
+				MIC->UpdateStaticPermutation(StaticParams);
+			}
+		}
+
 		ClearedCount = TotalBefore;
 		ResultJson->SetStringField(TEXT("cleared"), TEXT("all"));
 	}
@@ -5220,6 +5307,8 @@ FMonolithActionResult FMonolithMaterialActions::ListMaterialInstances(const TSha
 	ResultJson->SetNumberField(TEXT("instance_count"), InstancesArray.Num());
 	ResultJson->SetArrayField(TEXT("instances"), InstancesArray);
 	ResultJson->SetBoolField(TEXT("recursive"), bRecursive);
+	// UX #1: clarify that unsaved assets won't appear
+	ResultJson->SetStringField(TEXT("note"), TEXT("Only includes assets saved to disk and registered with the Asset Registry"));
 
 	return FMonolithActionResult::Success(ResultJson);
 }
@@ -5255,6 +5344,9 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 			const TSharedPtr<FJsonObject>& NodeObj = *NodeObjPtr;
 
 			FString Id = NodeObj->GetStringField(TEXT("id"));
+			// BUG #3: also read optional user-provided name alias for connection resolution
+			FString UserName;
+			NodeObj->TryGetStringField(TEXT("name"), UserName);
 			FString ShortClass = NodeObj->GetStringField(TEXT("class"));
 
 			FString FullClassName = ShortClass;
@@ -5341,6 +5433,11 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 			}
 
 			IdToExpr.Add(Id, NewExpr);
+			// BUG #3: if node spec had a 'name' alias, register it too so connections can reference by either id or name
+			if (!UserName.IsEmpty() && UserName != Id)
+			{
+				IdToExpr.Add(UserName, NewExpr);
+			}
 			OutNodesCreated++;
 		}
 	}
@@ -5359,6 +5456,9 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 			const TSharedPtr<FJsonObject>& CustomObj = *CustomObjPtr;
 
 			FString Id = CustomObj->GetStringField(TEXT("id"));
+			// BUG #3: also read optional user-provided name alias
+			FString CustomUserName;
+			CustomObj->TryGetStringField(TEXT("name"), CustomUserName);
 
 			int32 PosX = 0, PosY = 0;
 			const TArray<TSharedPtr<FJsonValue>>* PosArray = nullptr;
@@ -5430,6 +5530,11 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 
 			CustomExpr->RebuildOutputs();
 			IdToExpr.Add(Id, CustomExpr);
+			// BUG #3: register name alias if provided
+			if (!CustomUserName.IsEmpty() && CustomUserName != Id)
+			{
+				IdToExpr.Add(CustomUserName, CustomExpr);
+			}
 			OutNodesCreated++;
 		}
 	}
@@ -5447,10 +5552,16 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 			}
 			const TSharedPtr<FJsonObject>& ConnObj = *ConnObjPtr;
 
-			FString FromId = ConnObj->GetStringField(TEXT("from"));
-			FString ToId = ConnObj->GetStringField(TEXT("to"));
-			FString FromPin = ConnObj->HasField(TEXT("from_pin")) ? ConnObj->GetStringField(TEXT("from_pin")) : TEXT("");
-			FString ToPin = ConnObj->HasField(TEXT("to_pin")) ? ConnObj->GetStringField(TEXT("to_pin")) : TEXT("");
+			// Accept both "from"/"to" (export format) and "from_expression"/"to_expression" (connect_expressions style)
+			FString FromId = ConnObj->HasField(TEXT("from")) ? ConnObj->GetStringField(TEXT("from"))
+			               : ConnObj->HasField(TEXT("from_expression")) ? ConnObj->GetStringField(TEXT("from_expression")) : TEXT("");
+			FString ToId   = ConnObj->HasField(TEXT("to")) ? ConnObj->GetStringField(TEXT("to"))
+			               : ConnObj->HasField(TEXT("to_expression")) ? ConnObj->GetStringField(TEXT("to_expression")) : TEXT("");
+			// Accept both "from_pin"/"to_pin" (export format) and "from_output"/"to_input" (connect_expressions style)
+			FString FromPin = ConnObj->HasField(TEXT("from_pin")) ? ConnObj->GetStringField(TEXT("from_pin"))
+			                : ConnObj->HasField(TEXT("from_output")) ? ConnObj->GetStringField(TEXT("from_output")) : TEXT("");
+			FString ToPin   = ConnObj->HasField(TEXT("to_pin")) ? ConnObj->GetStringField(TEXT("to_pin"))
+			                : ConnObj->HasField(TEXT("to_input")) ? ConnObj->GetStringField(TEXT("to_input")) : TEXT("");
 
 			UMaterialExpression** FromPtr = IdToExpr.Find(FromId);
 			UMaterialExpression** ToPtr = IdToExpr.Find(ToId);
@@ -5712,6 +5823,23 @@ FMonolithActionResult FMonolithMaterialActions::BuildFunctionGraph(const TShared
 			if (InputObj->HasField(TEXT("type")))
 			{
 				FString TypeStr = InputObj->GetStringField(TEXT("type"));
+
+				// UX #2: normalize type shorthands before enum lookup
+				if (TypeStr.Equals(TEXT("float"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("scalar"), ESearchCase::IgnoreCase))
+					TypeStr = TEXT("FunctionInput_Scalar");
+				else if (TypeStr.Equals(TEXT("float2"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("vector2"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("vec2"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("Vector2"), ESearchCase::IgnoreCase))
+					TypeStr = TEXT("FunctionInput_Vector2");
+				else if (TypeStr.Equals(TEXT("float3"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("vector3"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("vec3"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("Vector3"), ESearchCase::IgnoreCase))
+					TypeStr = TEXT("FunctionInput_Vector3");
+				else if (TypeStr.Equals(TEXT("float4"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("vector4"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("vec4"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("Vector4"), ESearchCase::IgnoreCase))
+					TypeStr = TEXT("FunctionInput_Vector4");
+				else if (TypeStr.Equals(TEXT("bool"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("staticbool"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("StaticBool"), ESearchCase::IgnoreCase))
+					TypeStr = TEXT("FunctionInput_StaticBool");
+				else if (TypeStr.Equals(TEXT("texture2d"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("Texture2D"), ESearchCase::IgnoreCase))
+					TypeStr = TEXT("FunctionInput_Texture2D");
+				else if (TypeStr.Equals(TEXT("texturecube"), ESearchCase::IgnoreCase) || TypeStr.Equals(TEXT("TextureCube"), ESearchCase::IgnoreCase))
+					TypeStr = TEXT("FunctionInput_TextureCube");
+
 				FString EnumError;
 				EFunctionInputType InputType;
 				if (ParseEnum<EFunctionInputType>(TypeStr, InputType, EnumError))
@@ -5720,6 +5848,8 @@ FMonolithActionResult FMonolithMaterialActions::BuildFunctionGraph(const TShared
 				}
 				else
 				{
+					// BUG #2: explicitly set Scalar so behavior matches the warning
+					FuncInput->InputType = FunctionInput_Scalar;
 					auto ErrJson = MakeShared<FJsonObject>();
 					ErrJson->SetStringField(TEXT("input"), InputName);
 					ErrJson->SetStringField(TEXT("warning"), FString::Printf(TEXT("input type: %s — defaulting to Scalar"), *EnumError));
