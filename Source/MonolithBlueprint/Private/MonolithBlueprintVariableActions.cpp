@@ -316,6 +316,16 @@ FMonolithActionResult FMonolithBlueprintVariableActions::HandleAddVariable(const
 
 	FString DefaultValue = Params->GetStringField(TEXT("default_value"));
 
+	// Check for existing variable with same name
+	for (const FBPVariableDescription& Existing : BP->NewVariables)
+	{
+		if (Existing.VarName == VarName)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("A variable named '%s' already exists in this Blueprint"), *Name));
+		}
+	}
+
 	// Add the variable
 	FBlueprintEditorUtils::AddMemberVariable(BP, VarName, PinType, DefaultValue);
 
@@ -759,6 +769,12 @@ FMonolithActionResult FMonolithBlueprintVariableActions::HandleAddReplicatedVari
 	// Parse replication condition string -> ELifetimeCondition
 	FString ConditionStr = Params->GetStringField(TEXT("replication_condition"));
 	if (ConditionStr.IsEmpty()) ConditionStr = TEXT("None");
+
+	// Accept both "COND_OwnerOnly" and "OwnerOnly" forms
+	if (ConditionStr.StartsWith(TEXT("COND_"), ESearchCase::IgnoreCase))
+	{
+		ConditionStr = ConditionStr.Mid(5);
+	}
 
 	ELifetimeCondition LifetimeCondition = COND_None;
 	{

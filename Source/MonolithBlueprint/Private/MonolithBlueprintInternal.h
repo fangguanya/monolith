@@ -12,6 +12,7 @@
 #include "K2Node_Event.h"
 #include "K2Node_IfThenElse.h"
 #include "K2Node_Variable.h"
+#include "K2Node_CustomEvent.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_MacroInstance.h"
@@ -383,6 +384,9 @@ namespace MonolithBlueprintInternal
 		}
 		return nullptr;
 	}
+
+	/** Returns true if a UK2Node_CustomEvent with the given name already exists in any graph of the Blueprint */
+	bool HasCustomEventNamed(UBlueprint* BP, FName EventName);
 
 	// Parse MCP-friendly type string to FEdGraphPinType
 	inline FEdGraphPinType ParsePinTypeFromString(const FString& TypeStr)

@@ -194,7 +194,8 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleValidateBlueprint(
 				TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
 				NodeObj->SetStringField(TEXT("node_id"), Node->GetName());
 				NodeObj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
-				NodeObj->SetStringField(TEXT("graph"), Node->GetGraph()->GetName());
+				UEdGraph* DNodeGraph = Node->GetGraph();
+				NodeObj->SetStringField(TEXT("graph"), DNodeGraph ? DNodeGraph->GetName() : TEXT("(orphaned)"));
 				DisconnectedNodes.Add(MakeShared<FJsonValueObject>(NodeObj));
 			}
 		}
@@ -215,9 +216,88 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleValidateBlueprint(
 				ErrObj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 				ErrObj->SetStringField(TEXT("message"), Node->ErrorMsg);
 				ErrObj->SetStringField(TEXT("severity"), Node->ErrorType == EMessageSeverity::Error ? TEXT("error") : TEXT("warning"));
-				ErrObj->SetStringField(TEXT("graph"), Node->GetGraph()->GetName());
+				UEdGraph* ErrNodeGraph = Node->GetGraph();
+				ErrObj->SetStringField(TEXT("graph"), ErrNodeGraph ? ErrNodeGraph->GetName() : TEXT("(orphaned)"));
 				NodeErrors.Add(MakeShared<FJsonValueObject>(ErrObj));
 			}
+		}
+	}
+
+	// --- Unimplemented interface functions ---
+	TArray<TSharedPtr<FJsonValue>> UnimplementedFuncs;
+
+	// Collect all overridden event names across all graphs
+	TSet<FName> OverriddenFuncNames;
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		if (!Graph) continue;
+		TArray<UK2Node_Event*> EventNodes;
+		Graph->GetNodesOfClass<UK2Node_Event>(EventNodes);
+		for (UK2Node_Event* EN : EventNodes)
+		{
+			if (EN && EN->bOverrideFunction)
+			{
+				OverriddenFuncNames.Add(EN->EventReference.GetMemberName());
+			}
+		}
+	}
+
+	for (const FBPInterfaceDescription& InterfaceDesc : BP->ImplementedInterfaces)
+	{
+		UClass* InterfaceClass = InterfaceDesc.Interface;
+		if (!InterfaceClass) continue;
+
+		// Collect names of graphs implemented for this interface
+		TSet<FName> ImplementedGraphNames;
+		for (UEdGraph* Graph : InterfaceDesc.Graphs)
+		{
+			if (Graph) ImplementedGraphNames.Add(Graph->GetFName());
+		}
+
+		for (TFieldIterator<UFunction> FuncIt(InterfaceClass, EFieldIteratorFlags::ExcludeSuper); FuncIt; ++FuncIt)
+		{
+			UFunction* Func = *FuncIt;
+			if (!Func || !Func->HasAnyFunctionFlags(FUNC_BlueprintEvent)) continue;
+
+			FName FuncName = Func->GetFName();
+			if (!ImplementedGraphNames.Contains(FuncName) && !OverriddenFuncNames.Contains(FuncName))
+			{
+				TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+				Entry->SetStringField(TEXT("interface"), InterfaceClass->GetName());
+				Entry->SetStringField(TEXT("function"), FuncName.ToString());
+				UnimplementedFuncs.Add(MakeShared<FJsonValueObject>(Entry));
+			}
+		}
+	}
+
+	// --- Duplicate custom events ---
+	TArray<TSharedPtr<FJsonValue>> DuplicateEvents;
+	TMap<FName, TArray<FString>> EventNameToGraphs;
+	for (UEdGraph* Graph : AllGraphs)
+	{
+		if (!Graph) continue;
+		TArray<UK2Node_CustomEvent*> CustomEventNodes;
+		Graph->GetNodesOfClass<UK2Node_CustomEvent>(CustomEventNodes);
+		for (UK2Node_CustomEvent* CE : CustomEventNodes)
+		{
+			if (!CE || CE->CustomFunctionName.IsNone()) continue;
+			EventNameToGraphs.FindOrAdd(CE->CustomFunctionName).Add(Graph->GetName());
+		}
+	}
+	for (auto& Pair : EventNameToGraphs)
+	{
+		if (Pair.Value.Num() > 1)
+		{
+			TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("event_name"), Pair.Key.ToString());
+			Entry->SetNumberField(TEXT("count"), Pair.Value.Num());
+			TArray<TSharedPtr<FJsonValue>> GraphArr;
+			for (const FString& GN : Pair.Value)
+			{
+				GraphArr.Add(MakeShared<FJsonValueString>(GN));
+			}
+			Entry->SetArrayField(TEXT("graphs"), GraphArr);
+			DuplicateEvents.Add(MakeShared<FJsonValueObject>(Entry));
 		}
 	}
 
@@ -226,6 +306,8 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleValidateBlueprint(
 	Root->SetArrayField(TEXT("unused_variables"), UnusedVars);
 	Root->SetArrayField(TEXT("disconnected_nodes"), DisconnectedNodes);
 	Root->SetArrayField(TEXT("node_errors"), NodeErrors);
+	Root->SetArrayField(TEXT("unimplemented_interface_functions"), UnimplementedFuncs);
+	Root->SetArrayField(TEXT("duplicate_custom_events"), DuplicateEvents);
 	Root->SetNumberField(TEXT("total_graphs"), AllGraphs.Num());
 	Root->SetNumberField(TEXT("total_nodes"), TotalNodes);
 	return FMonolithActionResult::Success(Root);
@@ -285,11 +367,19 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleCreateBlueprint(co
 	else if (BlueprintTypeStr == TEXT("Interface"))      BPType = BPTYPE_Interface;
 	else if (BlueprintTypeStr == TEXT("FunctionLibrary")) BPType = BPTYPE_FunctionLibrary;
 
-	// Guard: check if a Blueprint already exists at this path (CreateBlueprint asserts otherwise)
+	// Guard: check if a Blueprint already exists at this path.
+	// Asset Registry check covers on-disk assets not yet loaded (cold path).
+	// FindObject covers in-memory assets from the current session.
+	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	FAssetData ExistingAsset = AR.GetAssetByObjectPath(FSoftObjectPath(SavePath + TEXT(".") + AssetName));
+	if (ExistingAsset.IsValid())
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Blueprint already exists at '%s'. Use duplicate_blueprint or delete it first."), *SavePath));
+	}
 	UBlueprint* ExistingBP = FindObject<UBlueprint>(nullptr, *(SavePath + TEXT(".") + AssetName));
 	if (!ExistingBP)
 	{
-		// Also check via package — CreatePackage returns existing in-memory packages
 		UPackage* ExistingPkg = FindPackage(nullptr, *SavePath);
 		if (ExistingPkg)
 		{
@@ -302,12 +392,19 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleCreateBlueprint(co
 			TEXT("Blueprint already exists at '%s'. Use duplicate_blueprint or delete it first."), *SavePath));
 	}
 
-	// Create the package — use the full save path as package name
+	// Create the package — use the full save path as package name.
+	// CreatePackage returns an existing in-memory package if one exists at
+	// this path (e.g. leftover from a prior crashed attempt).
 	UPackage* Package = CreatePackage(*SavePath);
 	if (!Package)
 	{
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at path: %s"), *SavePath));
 	}
+
+	// Ensure the package is fully loaded — if a prior crash left a .uasset
+	// on disk, CreatePackage returns a partially-loaded stub.  SavePackage
+	// asserts on partial packages.
+	Package->FullyLoad();
 
 	UBlueprint* NewBP = FKismetEditorUtilities::CreateBlueprint(
 		ParentClass,
@@ -329,12 +426,21 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleCreateBlueprint(co
 		bSkipSave = Params->GetBoolField(TEXT("skip_save"));
 	}
 
+	// Compile before save — CreateBlueprint leaves the GeneratedClass in a
+	// partially initialized state.  Serialization walks every sub-object
+	// through IsValidChecked() which asserts if any inner UObject is null.
+	FKismetEditorUtilities::CompileBlueprint(NewBP, EBlueprintCompileOptions::SkipGarbageCollection);
+
 	Package->MarkPackageDirty();
 	FAssetRegistryModule::AssetCreated(NewBP);
 
+	bool bSaved = false;
 	if (!bSkipSave)
 	{
-		UEditorAssetLibrary::SaveAsset(SavePath, false);
+		// SaveLoadedAsset is the safest path for newly-created assets —
+		// it works on the loaded UObject directly and handles the package
+		// state correctly.
+		bSaved = UEditorAssetLibrary::SaveLoadedAsset(NewBP, false);
 	}
 
 	FString GeneratedClassName;
@@ -348,7 +454,7 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleCreateBlueprint(co
 	Root->SetStringField(TEXT("parent_class"), ParentClass->GetName());
 	Root->SetStringField(TEXT("blueprint_type"), BlueprintTypeStr);
 	Root->SetStringField(TEXT("generated_class"), GeneratedClassName);
-	Root->SetBoolField(TEXT("saved"), !bSkipSave);
+	Root->SetBoolField(TEXT("saved"), bSaved);
 	Root->SetBoolField(TEXT("success"), true);
 	return FMonolithActionResult::Success(Root);
 }

@@ -404,6 +404,9 @@ FMonolithActionResult FMonolithBlueprintGraphActions::HandleAddEventDispatcher(c
 
 	const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
 	K2Schema->CreateDefaultNodesForGraph(*NewGraph);
+	K2Schema->CreateFunctionGraphTerminators(*NewGraph, (UClass*)nullptr);
+	K2Schema->AddExtraFunctionFlags(NewGraph, (FUNC_BlueprintCallable | FUNC_BlueprintEvent | FUNC_Public));
+	K2Schema->MarkFunctionEntryAsEditable(NewGraph, true);
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 
@@ -751,6 +754,12 @@ FMonolithActionResult FMonolithBlueprintGraphActions::HandleScaffoldInterfaceImp
 	Root->SetStringField(TEXT("interface_name"), InterfaceClass->GetName());
 	Root->SetArrayField(TEXT("functions_created"), FunctionsCreated);
 	Root->SetBoolField(TEXT("already_implemented"), bAlreadyImplemented);
+	if (FunctionsCreated.Num() == 0 && !bAlreadyImplemented)
+	{
+		Root->SetStringField(TEXT("note"),
+			TEXT("No Blueprint-overridable functions found on this interface. "
+			     "C++ interfaces with only native functions cannot generate stubs — override them in C++ instead."));
+	}
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -857,8 +866,7 @@ FMonolithActionResult FMonolithBlueprintGraphActions::HandleRemoveEventDispatche
 			}
 			else if (UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node))
 			{
-				FString FuncName = CallNode->FunctionReference.GetMemberName().ToString();
-				if (FuncName.Contains(DispatcherName))
+				if (CallNode->FunctionReference.GetMemberName() == FName(*DispatcherName))
 				{
 					Warnings.Add(FString::Printf(TEXT("CallFunction node '%s' in graph '%s' may reference this dispatcher"),
 						*Node->GetName(), *Graph->GetName()));
@@ -944,34 +952,15 @@ FMonolithActionResult FMonolithBlueprintGraphActions::HandleSetEventDispatcherPa
 			TEXT("No FunctionEntry node found in dispatcher signature graph: %s"), *DispatcherName));
 	}
 
-	// Clear existing user-defined pins
-	// We iterate backwards and remove non-exec, non-self pins
-	TArray<UEdGraphPin*> PinsToRemove;
-	for (UEdGraphPin* Pin : EntryNode->Pins)
+	// Clear existing user-defined pins safely — iterate a copy since removal mutates the array
+	TArray<TSharedPtr<FUserPinInfo>> PinsToRemove = EntryNode->UserDefinedPins;
+	for (const TSharedPtr<FUserPinInfo>& PinInfo : PinsToRemove)
 	{
-		if (!Pin) continue;
-		if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
-		if (Pin->PinName == UEdGraphSchema_K2::PN_Self) continue;
-		if (Pin->Direction != EGPD_Output) continue;
-		// This is a user-defined signature param — mark for removal
-		PinsToRemove.Add(Pin);
+		if (PinInfo.IsValid())
+		{
+			EntryNode->RemoveUserDefinedPin(PinInfo);
+		}
 	}
-
-	for (UEdGraphPin* Pin : PinsToRemove)
-	{
-		EntryNode->RemoveUserDefinedPin(Pin->GetOwningNode() == EntryNode
-			? EntryNode->UserDefinedPins[
-				EntryNode->UserDefinedPins.IndexOfByPredicate([&](const TSharedPtr<FUserPinInfo>& P)
-				{
-					return P.IsValid() && P->PinName == Pin->PinName;
-				})
-			]
-			: nullptr);
-		// Safer: find in UserDefinedPins by name and remove
-	}
-
-	// Clear UserDefinedPins directly — this is the cleanest approach
-	EntryNode->UserDefinedPins.Empty();
 
 	// Add new params
 	int32 ParamsAdded = 0;

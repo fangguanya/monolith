@@ -286,6 +286,7 @@ FMonolithActionResult FMonolithBlueprintComponentActions::HandleRenameComponent(
 
 	if (CompName.IsEmpty()) return FMonolithActionResult::Error(TEXT("component_name is required"));
 	if (NewName.IsEmpty())  return FMonolithActionResult::Error(TEXT("new_name is required"));
+	if (FName(*NewName).IsNone()) return FMonolithActionResult::Error(TEXT("'None' is a reserved FName and cannot be used as a component name"));
 
 	USCS_Node* Node = FindSCSNodeByName(BP->SimpleConstructionScript, FName(*CompName));
 	if (!Node)

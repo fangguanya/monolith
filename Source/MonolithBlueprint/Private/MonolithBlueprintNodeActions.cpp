@@ -27,6 +27,29 @@
 #include "UObject/Package.h"
 
 // ============================================================
+//  MonolithBlueprintInternal helpers
+// ============================================================
+
+bool MonolithBlueprintInternal::HasCustomEventNamed(UBlueprint* BP, FName EventName)
+{
+	TArray<UEdGraph*> AllGraphs;
+	BP->GetAllGraphs(AllGraphs);
+	for (UEdGraph* G : AllGraphs)
+	{
+		if (!G) continue;
+		for (UEdGraphNode* N : G->Nodes)
+		{
+			UK2Node_CustomEvent* Existing = Cast<UK2Node_CustomEvent>(N);
+			if (Existing && Existing->CustomFunctionName == EventName)
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// ============================================================
 //  Registration
 // ============================================================
 
@@ -394,6 +417,12 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 			return FMonolithActionResult::Error(TEXT("CustomEvent node requires 'event_name'"));
 		}
 
+		if (MonolithBlueprintInternal::HasCustomEventNamed(BP, FName(*EventName)))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("A custom event named '%s' already exists in this Blueprint"), *EventName));
+		}
+
 		UK2Node_CustomEvent* EventNode = NewObject<UK2Node_CustomEvent>(Graph);
 		EventNode->CustomFunctionName = FName(*EventName);
 		EventNode->NodePosX = PosX;
@@ -658,6 +687,9 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleConnectPins(const TSh
 			TEXT("Cannot connect pins: %s"), *Response.Message.ToString()));
 	}
 
+	// Track whether UE will insert an auto-conversion node
+	bool bAutoConversion = (Response.Response == CONNECT_RESPONSE_MAKE_WITH_CONVERSION_NODE);
+
 	bool bConnected = Schema->TryCreateConnection(SrcPin, TgtPin);
 	if (!bConnected)
 	{
@@ -675,6 +707,10 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleConnectPins(const TSh
 	Root->SetStringField(TEXT("target_node"), TargetNodeId);
 	Root->SetStringField(TEXT("target_pin"), TargetPinName);
 	Root->SetBoolField(TEXT("success"), true);
+	if (bAutoConversion)
+	{
+		Root->SetStringField(TEXT("warning"), TEXT("Connection required an auto-conversion node (types were not directly compatible)"));
+	}
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -953,7 +989,22 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 			continue;
 		}
 
-		FString OpName = Op->GetStringField(TEXT("op"));
+		FString OpName;
+		if (!Op->TryGetStringField(TEXT("op"), OpName) || OpName.IsEmpty())
+		{
+			FString HintName;
+			Op->TryGetStringField(TEXT("action"), HintName);
+			FString Hint = HintName.IsEmpty()
+				? TEXT("Each operation must have an \"op\" key with the action name, plus flat inline params (not nested under \"params\").")
+				: FString::Printf(TEXT("Use \"op\" key, not \"action\". Found \"action\":\"%s\". Params must be flat inline, not nested."), *HintName);
+			RO->SetStringField(TEXT("op"), TEXT("(missing)"));
+			RO->SetBoolField(TEXT("success"), false);
+			RO->SetStringField(TEXT("error"), Hint);
+			Results.Add(MakeShared<FJsonValueObject>(RO));
+			Fail++;
+			if (bStopOnError) break;
+			continue;
+		}
 		RO->SetStringField(TEXT("op"), OpName);
 
 		// Build sub-params: inject asset_path then copy all op fields
@@ -1088,9 +1139,14 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 
 	TArray<FString> Warnings;
 
-	// Create a transient graph to host the node — some node types behave differently
-	// without a schema on the outer graph, so we set it explicitly.
-	UEdGraph* TempGraph = NewObject<UEdGraph>(GetTransientPackage());
+	// Create a transient Blueprint + graph so AllocateDefaultPins() can find an
+	// owning Blueprint via the outer chain.  Without this, nodes like
+	// UK2Node_CallFunction assert in FindBlueprintForNodeChecked().
+	UBlueprint* TempBP = NewObject<UBlueprint>(GetTransientPackage(), NAME_None, RF_Transient);
+	TempBP->ParentClass = AActor::StaticClass();
+	TempBP->GeneratedClass = AActor::StaticClass();
+	TempBP->SkeletonGeneratedClass = AActor::StaticClass();
+	UEdGraph* TempGraph = NewObject<UEdGraph>(TempBP, NAME_None, RF_Transient);
 	TempGraph->Schema = UEdGraphSchema_K2::StaticClass();
 
 	UEdGraphNode* Node = nullptr;
@@ -1276,6 +1332,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 
 	// Mark transient objects for GC
 	TempGraph->MarkAsGarbage();
+	TempBP->MarkAsGarbage();
 
 	return FMonolithActionResult::Success(Root);
 }
@@ -1377,6 +1434,17 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNodesBulk(const TS
 			Out->SetStringField(TEXT("node_id"), NodeId);
 			Out->SetStringField(TEXT("class"),   NodeClass);
 			Out->SetStringField(TEXT("title"),   NodeTitle);
+
+			// Include position if available (from auto_layout or user-specified)
+			const TArray<TSharedPtr<FJsonValue>>* PosArr = nullptr;
+			if (SubParams->TryGetArrayField(TEXT("position"), PosArr) && PosArr && PosArr->Num() >= 2)
+			{
+				TArray<TSharedPtr<FJsonValue>> PosOut;
+				PosOut.Add((*PosArr)[0]);
+				PosOut.Add((*PosArr)[1]);
+				Out->SetArrayField(TEXT("position"), PosOut);
+			}
+
 			Count++;
 		}
 		else if (!Result.bSuccess)
@@ -1704,6 +1772,11 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimeline(const TSh
 	TimelineNode->TimelineGuid = Template->TimelineGuid;
 	TimelineNode->bAutoPlay = bAutoPlay;
 	TimelineNode->bLoop = bLoop;
+
+	// Set flags on the template too — runtime reads from template, not node
+	Template->Modify();
+	Template->bAutoPlay = bAutoPlay;
+	Template->bLoop = bLoop;
 	TimelineNode->NodePosX = PosX;
 	TimelineNode->NodePosY = PosY;
 
@@ -1894,7 +1967,13 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddEventNode(const TS
 	else
 	{
 		// No native function found — treat as a custom event
-		// Delegate to the same creation path as add_node with CustomEvent type
+		// Check for duplicate custom event names first
+		if (MonolithBlueprintInternal::HasCustomEventNamed(BP, FName(*EventName)))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("A custom event named '%s' already exists in this Blueprint"), *EventName));
+		}
+
 		UK2Node_CustomEvent* EventNode = NewObject<UK2Node_CustomEvent>(Graph);
 		EventNode->CustomFunctionName = FName(*EventName);
 		EventNode->NodePosX = PosX;
@@ -2157,14 +2236,15 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandlePromotePinToVariable(
 	                  MonolithBlueprintInternal::PinTypeToString(Pin->PinType);
 
 	// Step 1: Add the member variable.
-	// AddMemberVariable requires the type and returns the new variable index.
-	FBlueprintEditorUtils::AddMemberVariable(BP, VarName, Pin->PinType);
+	if (!FBlueprintEditorUtils::AddMemberVariable(BP, VarName, Pin->PinType))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to add variable '%s' — a variable with that name may already exist"), *VarNameStr));
+	}
 
-	// Step 2: Mark as structurally modified so the skeleton class regenerates
-	// and the new variable is available before we create the variable node.
-	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
-
-	// Step 3: Position the new variable node relative to the source node
+	// Step 2: Position the new variable node relative to the source node
+	// NOTE: MarkBlueprintAsStructurallyModified is deferred to AFTER pin
+	// rewiring to avoid invalidating the Pin pointer during skeleton regen.
 	const EEdGraphPinDirection PinDir = Pin->Direction;
 	int32 VarNodePosX = SourceNode->NodePosX + (PinDir == EGPD_Output ? 200 : -200);
 	int32 VarNodePosY = SourceNode->NodePosY;
@@ -2266,7 +2346,8 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandlePromotePinToVariable(
 		}
 	}
 
-	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+	// Now safe to do structural modification — all pin rewiring is complete
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("variable_name"), VarNameStr);
