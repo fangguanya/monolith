@@ -102,4 +102,26 @@ public:
 	static FMonolithActionResult HandleGetCompositeInfo(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleAddCompositeSegment(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleRemoveCompositeSegment(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 8a: IKRig (4) ---
+	static FMonolithActionResult HandleGetIKRigInfo(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddIKSolver(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetRetargeterInfo(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetRetargetChainMapping(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 8b: Control Rig Read (2) ---
+	static FMonolithActionResult HandleGetControlRigInfo(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetControlRigVariables(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 8c: Control Rig Write (1) ---
+	static FMonolithActionResult HandleAddControlRigElement(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 9: ABP Read Enhancements (2) ---
+	static FMonolithActionResult HandleGetAbpVariables(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetAbpLinkedAssets(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Wave 10: ABP Write Experimental (3) ---
+	static FMonolithActionResult HandleAddStateToMachine(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddTransition(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetTransitionRule(const TSharedPtr<FJsonObject>& Params);
 };

@@ -10,7 +10,7 @@ void FMonolithAnimationModule::StartupModule()
 {
 	FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithPoseSearchActions::RegisterActions(FMonolithToolRegistry::Get());
-	UE_LOG(LogMonolith, Verbose, TEXT("Monolith — Animation module loaded (63 actions)"));
+	UE_LOG(LogMonolith, Verbose, TEXT("Monolith — Animation module loaded (74 actions)"));
 }
 
 void FMonolithAnimationModule::ShutdownModule()

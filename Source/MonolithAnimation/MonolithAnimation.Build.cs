@@ -25,7 +25,12 @@ public class MonolithAnimation : ModuleRules
 			"JsonUtilities",
 			"PoseSearch",
 			"EditorScriptingUtilities",
-			"AnimationModifiers"
+			"AnimationModifiers",
+			"IKRig",
+			"IKRigEditor",
+			"ControlRig",
+			"ControlRigDeveloper",
+			"RigVM",
 		});
 	}
 }

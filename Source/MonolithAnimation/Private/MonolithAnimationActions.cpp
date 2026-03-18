@@ -29,6 +29,17 @@
 #include "Animation/AnimData/CurveIdentifier.h"
 #include "Animation/AnimComposite.h"
 #include "AnimationModifier.h"
+#include "Rig/IKRigDefinition.h"
+#include "Rig/IKRigSkeleton.h"
+#include "RigEditor/IKRigController.h"
+#include "Retargeter/IKRetargeter.h"
+#include "Retargeter/IKRetargetChainMapping.h"
+#include "RetargetEditor/IKRetargeterController.h"
+#include "ControlRigBlueprintLegacy.h"
+#include "Rigs/RigHierarchy.h"
+#include "Rigs/RigHierarchyElements.h"
+#include "Rigs/RigHierarchyDefines.h"
+#include "Rigs/RigHierarchyController.h"
 #include "EditorAssetLibrary.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Dom/JsonObject.h"
@@ -36,6 +47,12 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
 #include "Editor.h"
+#include "AnimationStateMachineSchema.h"
+#include "AnimGraphNode_TransitionResult.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "Kismet2/Kismet2NameValidators.h"
+#include "K2Node_VariableGet.h"
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -502,6 +519,114 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("AnimComposite asset path"))
 			.Required(TEXT("segment_index"), TEXT("integer"), TEXT("Index of the segment to remove"))
 			.Build());
+
+	// Wave 8a — IKRig
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_ikrig_info"),
+		TEXT("Get IK Rig asset info: solvers, goals, retarget chains, and skeleton overview"),
+		FMonolithActionHandler::CreateStatic(&HandleGetIKRigInfo),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("IKRig asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_ik_solver"),
+		TEXT("Add a solver to an IK Rig asset, optionally setting a root bone and goals"),
+		FMonolithActionHandler::CreateStatic(&HandleAddIKSolver),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("IKRig asset path"))
+			.Required(TEXT("solver_type"), TEXT("string"), TEXT("Solver type (e.g. FullBodyIKSolver or /Script/IKRig.FullBodyIKSolver)"))
+			.Optional(TEXT("root_bone"), TEXT("string"), TEXT("Root bone name for the solver"))
+			.Optional(TEXT("goals"), TEXT("array"), TEXT("Array of {name, bone} goal objects to create and connect"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_retargeter_info"),
+		TEXT("Get IK Retargeter asset info: source/target rigs, preview meshes, and chain mappings"),
+		FMonolithActionHandler::CreateStatic(&HandleGetRetargeterInfo),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("IKRetargeter asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_retarget_chain_mapping"),
+		TEXT("Set chain mappings on an IK Retargeter via auto-map or manual source/target pair"),
+		FMonolithActionHandler::CreateStatic(&HandleSetRetargetChainMapping),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("IKRetargeter asset path"))
+			.Optional(TEXT("auto_map"), TEXT("string"), TEXT("Auto-map mode: exact, fuzzy, or clear"))
+			.Optional(TEXT("source_chain"), TEXT("string"), TEXT("Source chain name for manual mapping"))
+			.Optional(TEXT("target_chain"), TEXT("string"), TEXT("Target chain name for manual mapping"))
+			.Build());
+
+	// Wave 8b — Control Rig Read
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_control_rig_info"),
+		TEXT("Get Control Rig hierarchy info: elements by type with parents, control settings, and counts"),
+		FMonolithActionHandler::CreateStatic(&HandleGetControlRigInfo),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("ControlRigBlueprint asset path"))
+			.Optional(TEXT("element_type"), TEXT("string"), TEXT("Filter: bone, control, null, curve, all (default: all)"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_control_rig_variables"),
+		TEXT("Get animatable controls and blueprint variables from a Control Rig asset"),
+		FMonolithActionHandler::CreateStatic(&HandleGetControlRigVariables),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("ControlRigBlueprint asset path"))
+			.Build());
+
+	// Wave 8c — Control Rig Write
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_control_rig_element"),
+		TEXT("Add a bone, control, or null element to a Control Rig hierarchy"),
+		FMonolithActionHandler::CreateStatic(&HandleAddControlRigElement),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("ControlRigBlueprint asset path"))
+			.Required(TEXT("element_type"), TEXT("string"), TEXT("Element type: bone, control, or null"))
+			.Required(TEXT("name"), TEXT("string"), TEXT("Name for the new element"))
+			.Optional(TEXT("parent"), TEXT("string"), TEXT("Parent element name"))
+			.Optional(TEXT("parent_type"), TEXT("string"), TEXT("Parent element type (default: same as element_type)"))
+			.Optional(TEXT("control_type"), TEXT("string"), TEXT("For controls: Float, Integer, Transform, Rotator, Position, Scale, Vector2D (default: Transform)"))
+			.Optional(TEXT("animatable"), TEXT("bool"), TEXT("Whether control is animatable (default: true)"), TEXT("true"))
+			.Optional(TEXT("transform"), TEXT("object"), TEXT("Initial transform: {tx, ty, tz, rx, ry, rz}"))
+			.Build());
+
+	// Wave 10 — ABP Write
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_state_to_machine"),
+		TEXT("Add a state node to an existing state machine in an animation blueprint"),
+		FMonolithActionHandler::CreateStatic(&HandleAddStateToMachine),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name (exact, as shown in get_state_machines)"))
+			.Required(TEXT("state_name"), TEXT("string"), TEXT("Name for the new state"))
+			.Optional(TEXT("position_x"), TEXT("integer"), TEXT("Node X position (default: 200)"), TEXT("200"))
+			.Optional(TEXT("position_y"), TEXT("integer"), TEXT("Node Y position (default: 0)"), TEXT("0"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("add_transition"),
+		TEXT("Add a transition between two states in a state machine"),
+		FMonolithActionHandler::CreateStatic(&HandleAddTransition),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name"))
+			.Required(TEXT("from_state"), TEXT("string"), TEXT("Source state name"))
+			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_transition_rule"),
+		TEXT("Wire a boolean variable as the condition for a state machine transition"),
+		FMonolithActionHandler::CreateStatic(&HandleSetTransitionRule),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("machine_name"), TEXT("string"), TEXT("State machine name"))
+			.Required(TEXT("from_state"), TEXT("string"), TEXT("Source state name"))
+			.Required(TEXT("to_state"), TEXT("string"), TEXT("Destination state name"))
+			.Required(TEXT("variable_name"), TEXT("string"), TEXT("Boolean variable name to use as transition condition"))
+			.Build());
+
+	// Wave 9 — ABP Read Enhancements
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_abp_variables"),
+		TEXT("List all variables in an animation blueprint with types and defaults"),
+		FMonolithActionHandler::CreateStatic(&HandleGetAbpVariables),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation Blueprint asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("animation"), TEXT("get_abp_linked_assets"),
+		TEXT("Find all animation assets referenced by an animation blueprint"),
+		FMonolithActionHandler::CreateStatic(&HandleGetAbpLinkedAssets),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation Blueprint asset path"))
+			.Build());
+
 }
 
 // ---------------------------------------------------------------------------
@@ -3278,5 +3403,1081 @@ FMonolithActionResult FMonolithAnimationActions::HandleRemoveCompositeSegment(co
 	Root->SetNumberField(TEXT("removed_index"), SegmentIndex);
 	Root->SetStringField(TEXT("removed_anim"), AnimName);
 	Root->SetNumberField(TEXT("remaining_segments"), Segments.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 9 — ABP Read Enhancements
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetAbpVariables(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	TArray<TSharedPtr<FJsonValue>> VarsArr;
+	for (const FBPVariableDescription& Var : ABP->NewVariables)
+	{
+		TSharedPtr<FJsonObject> VarJson = MakeShared<FJsonObject>();
+		VarJson->SetStringField(TEXT("name"), Var.VarName.ToString());
+
+		FString TypeStr = Var.VarType.PinCategory.ToString();
+		const FString PinCat = TypeStr;
+		if ((PinCat == TEXT("object") || PinCat == TEXT("struct")) && Var.VarType.PinSubCategoryObject.IsValid())
+		{
+			TypeStr = FString::Printf(TEXT("%s:%s"), *PinCat, *Var.VarType.PinSubCategoryObject->GetName());
+		}
+		VarJson->SetStringField(TEXT("type"), TypeStr);
+		VarJson->SetStringField(TEXT("default_value"), Var.DefaultValue);
+		VarJson->SetStringField(TEXT("category"), Var.Category.ToString());
+		VarJson->SetBoolField(TEXT("blueprint_visible"), (Var.PropertyFlags & CPF_BlueprintVisible) != 0);
+		VarJson->SetBoolField(TEXT("edit_instance"), (Var.PropertyFlags & CPF_DisableEditOnInstance) == 0);
+		VarsArr.Add(MakeShared<FJsonValueObject>(VarJson));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetArrayField(TEXT("variables"), VarsArr);
+	Root->SetNumberField(TEXT("count"), VarsArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetAbpLinkedAssets(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+	FName PackageName = FName(*ABP->GetPackage()->GetName());
+
+	TArray<FAssetIdentifier> Deps;
+	AR.GetDependencies(FAssetIdentifier(PackageName), Deps, UE::AssetRegistry::EDependencyCategory::Package);
+
+	TArray<TSharedPtr<FJsonValue>> SequencesArr;
+	TArray<TSharedPtr<FJsonValue>> MontagesArr;
+	TArray<TSharedPtr<FJsonValue>> BlendSpacesArr;
+	TArray<TSharedPtr<FJsonValue>> CompositesArr;
+	TArray<TSharedPtr<FJsonValue>> LinkedAbpArr;
+
+	for (const FAssetIdentifier& Dep : Deps)
+	{
+		TArray<FAssetData> PackageAssets;
+		AR.GetAssetsByPackageName(Dep.PackageName, PackageAssets);
+		for (const FAssetData& DepData : PackageAssets)
+		{
+			if (!DepData.IsValid()) continue;
+
+			FString ClassName = DepData.AssetClassPath.GetAssetName().ToString();
+			FString DepPath = DepData.GetObjectPathString();
+
+			if (ClassName == TEXT("AnimSequence"))
+			{
+				SequencesArr.Add(MakeShared<FJsonValueString>(DepPath));
+			}
+			else if (ClassName == TEXT("AnimMontage"))
+			{
+				MontagesArr.Add(MakeShared<FJsonValueString>(DepPath));
+			}
+			else if (ClassName == TEXT("BlendSpace") || ClassName == TEXT("BlendSpace1D") ||
+			         ClassName == TEXT("AimOffsetBlendSpace") || ClassName == TEXT("AimOffsetBlendSpace1D"))
+			{
+				BlendSpacesArr.Add(MakeShared<FJsonValueString>(DepPath));
+			}
+			else if (ClassName == TEXT("AnimComposite"))
+			{
+				CompositesArr.Add(MakeShared<FJsonValueString>(DepPath));
+			}
+			else if (ClassName == TEXT("AnimBlueprint"))
+			{
+				LinkedAbpArr.Add(MakeShared<FJsonValueString>(DepPath));
+			}
+		}
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetArrayField(TEXT("sequences"), SequencesArr);
+	Root->SetArrayField(TEXT("montages"), MontagesArr);
+	Root->SetArrayField(TEXT("blend_spaces"), BlendSpacesArr);
+	Root->SetArrayField(TEXT("composites"), CompositesArr);
+	Root->SetArrayField(TEXT("linked_anim_blueprints"), LinkedAbpArr);
+	Root->SetNumberField(TEXT("total_dependencies"), Deps.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 8b — Control Rig Read
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetControlRigInfo(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UControlRigBlueprint* CRB = FMonolithAssetUtils::LoadAssetByPath<UControlRigBlueprint>(AssetPath);
+	if (!CRB) return FMonolithActionResult::Error(FString::Printf(TEXT("ControlRigBlueprint not found: %s"), *AssetPath));
+
+	URigHierarchy* H = CRB->Hierarchy;
+	if (!H) return FMonolithActionResult::Error(TEXT("ControlRigBlueprint has no hierarchy"));
+
+	// Optional element type filter
+	FString FilterStr;
+	bool bHasFilter = Params->TryGetStringField(TEXT("element_type"), FilterStr);
+	FilterStr.ToLowerInline();
+
+	auto TypeMatchesFilter = [&](ERigElementType Type) -> bool
+	{
+		if (!bHasFilter || FilterStr.IsEmpty() || FilterStr == TEXT("all")) return true;
+		if (FilterStr == TEXT("bone"))    return Type == ERigElementType::Bone;
+		if (FilterStr == TEXT("control")) return Type == ERigElementType::Control;
+		if (FilterStr == TEXT("null"))    return Type == ERigElementType::Null;
+		if (FilterStr == TEXT("curve"))   return Type == ERigElementType::Curve;
+		return true;
+	};
+
+	TArray<FRigElementKey> AllKeys = H->GetAllKeys();
+
+	TArray<TSharedPtr<FJsonValue>> ElementsArr;
+	int32 BoneCount = 0, ControlCount = 0, NullCount = 0, CurveCount = 0, OtherCount = 0;
+	for (const FRigElementKey& Key : AllKeys)
+	{
+		if (!TypeMatchesFilter(Key.Type)) continue;
+
+		switch (Key.Type)
+		{
+		case ERigElementType::Bone:    ++BoneCount;    break;
+		case ERigElementType::Control: ++ControlCount; break;
+		case ERigElementType::Null:    ++NullCount;    break;
+		case ERigElementType::Curve:   ++CurveCount;   break;
+		default:                       ++OtherCount;   break;
+		}
+
+		TSharedPtr<FJsonObject> ElemObj = MakeShared<FJsonObject>();
+		ElemObj->SetStringField(TEXT("name"), Key.Name.ToString());
+
+		// Type string
+		FString TypeStr = StaticEnum<ERigElementType>()->GetNameStringByValue(static_cast<int64>(Key.Type));
+		ElemObj->SetStringField(TEXT("type"), TypeStr);
+
+		// Parent
+		FRigElementKey ParentKey = H->GetFirstParent(Key);
+		ElemObj->SetStringField(TEXT("parent"), ParentKey.IsValid() ? ParentKey.Name.ToString() : TEXT(""));
+
+		// Control-specific info
+		if (Key.Type == ERigElementType::Control)
+		{
+			FRigControlElement* CE = H->Find<FRigControlElement>(Key);
+			if (CE)
+			{
+				FString ControlTypeStr = StaticEnum<ERigControlType>()->GetNameStringByValue(static_cast<int64>(CE->Settings.ControlType));
+				ElemObj->SetStringField(TEXT("control_type"), ControlTypeStr);
+				ElemObj->SetBoolField(TEXT("animatable"), CE->Settings.IsAnimatable());
+				ElemObj->SetStringField(TEXT("display_name"), CE->Settings.DisplayName.IsNone() ? Key.Name.ToString() : CE->Settings.DisplayName.ToString());
+			}
+		}
+
+		ElementsArr.Add(MakeShared<FJsonValueObject>(ElemObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("total_elements"), ElementsArr.Num());
+	TSharedPtr<FJsonObject> CountsObj = MakeShared<FJsonObject>();
+	CountsObj->SetNumberField(TEXT("bones"), BoneCount);
+	CountsObj->SetNumberField(TEXT("controls"), ControlCount);
+	CountsObj->SetNumberField(TEXT("nulls"), NullCount);
+	CountsObj->SetNumberField(TEXT("curves"), CurveCount);
+	CountsObj->SetNumberField(TEXT("other"), OtherCount);
+	Root->SetObjectField(TEXT("counts"), CountsObj);
+	if (bHasFilter && !FilterStr.IsEmpty())
+		Root->SetStringField(TEXT("filter"), FilterStr);
+	Root->SetArrayField(TEXT("elements"), ElementsArr);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetControlRigVariables(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UControlRigBlueprint* CRB = FMonolithAssetUtils::LoadAssetByPath<UControlRigBlueprint>(AssetPath);
+	if (!CRB) return FMonolithActionResult::Error(FString::Printf(TEXT("ControlRigBlueprint not found: %s"), *AssetPath));
+
+	// Part 1 — Animatable controls from hierarchy
+	TArray<TSharedPtr<FJsonValue>> AnimControlsArr;
+	URigHierarchy* H = CRB->Hierarchy;
+	if (H)
+	{
+		TArray<FRigElementKey> AllKeys = H->GetAllKeys();
+		for (const FRigElementKey& Key : AllKeys)
+		{
+			if (Key.Type != ERigElementType::Control) continue;
+
+			FRigControlElement* CE = H->Find<FRigControlElement>(Key);
+			if (!CE || !CE->Settings.IsAnimatable()) continue;
+
+			TSharedPtr<FJsonObject> CtrlObj = MakeShared<FJsonObject>();
+			CtrlObj->SetStringField(TEXT("name"), Key.Name.ToString());
+
+			FString ControlTypeStr = StaticEnum<ERigControlType>()->GetNameStringByValue(static_cast<int64>(CE->Settings.ControlType));
+			CtrlObj->SetStringField(TEXT("control_type"), ControlTypeStr);
+
+			FString AnimTypeStr = StaticEnum<ERigControlAnimationType>()->GetNameStringByValue(static_cast<int64>(CE->Settings.AnimationType));
+			CtrlObj->SetStringField(TEXT("animation_type"), AnimTypeStr);
+
+			CtrlObj->SetStringField(TEXT("display_name"), CE->Settings.DisplayName.IsNone() ? Key.Name.ToString() : CE->Settings.DisplayName.ToString());
+
+			FRigElementKey ParentKey = H->GetFirstParent(Key);
+			CtrlObj->SetStringField(TEXT("parent"), ParentKey.IsValid() ? ParentKey.Name.ToString() : TEXT(""));
+
+			AnimControlsArr.Add(MakeShared<FJsonValueObject>(CtrlObj));
+		}
+	}
+
+	// Part 2 — Blueprint variables (from UBlueprint::NewVariables)
+	TArray<TSharedPtr<FJsonValue>> BpVarsArr;
+	for (const FBPVariableDescription& Var : CRB->NewVariables)
+	{
+		TSharedPtr<FJsonObject> VarObj = MakeShared<FJsonObject>();
+		VarObj->SetStringField(TEXT("name"), Var.VarName.ToString());
+		VarObj->SetStringField(TEXT("type"), Var.VarType.PinCategory.ToString());
+		VarObj->SetStringField(TEXT("default_value"), Var.DefaultValue);
+		VarObj->SetStringField(TEXT("category"), Var.Category.ToString());
+		VarObj->SetBoolField(TEXT("blueprint_visible"), (Var.PropertyFlags & CPF_BlueprintVisible) != 0);
+		BpVarsArr.Add(MakeShared<FJsonValueObject>(VarObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetArrayField(TEXT("animatable_controls"), AnimControlsArr);
+	Root->SetNumberField(TEXT("animatable_control_count"), AnimControlsArr.Num());
+	Root->SetArrayField(TEXT("blueprint_variables"), BpVarsArr);
+	Root->SetNumberField(TEXT("blueprint_variable_count"), BpVarsArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 8c — Control Rig Write
+// ---------------------------------------------------------------------------
+
+static ERigElementType ParseRigElementType(const FString& Str)
+{
+	if (Str.Equals(TEXT("bone"),    ESearchCase::IgnoreCase)) return ERigElementType::Bone;
+	if (Str.Equals(TEXT("control"), ESearchCase::IgnoreCase)) return ERigElementType::Control;
+	if (Str.Equals(TEXT("null"),    ESearchCase::IgnoreCase)) return ERigElementType::Null;
+	if (Str.Equals(TEXT("curve"),   ESearchCase::IgnoreCase)) return ERigElementType::Curve;
+	return ERigElementType::Bone;
+}
+
+static ERigControlType ParseRigControlType(const FString& Str)
+{
+	if (Str.Equals(TEXT("Float"),      ESearchCase::IgnoreCase)) return ERigControlType::Float;
+	if (Str.Equals(TEXT("Integer"),    ESearchCase::IgnoreCase)) return ERigControlType::Integer;
+	if (Str.Equals(TEXT("Bool"),       ESearchCase::IgnoreCase)) return ERigControlType::Bool;
+	if (Str.Equals(TEXT("Transform"),  ESearchCase::IgnoreCase)) return ERigControlType::Transform;
+	if (Str.Equals(TEXT("Rotator"),    ESearchCase::IgnoreCase)) return ERigControlType::Rotator;
+	if (Str.Equals(TEXT("Position"),   ESearchCase::IgnoreCase)) return ERigControlType::Position;
+	if (Str.Equals(TEXT("Scale"),      ESearchCase::IgnoreCase)) return ERigControlType::Scale;
+	if (Str.Equals(TEXT("ScaleFloat"), ESearchCase::IgnoreCase)) return ERigControlType::ScaleFloat;
+	if (Str.Equals(TEXT("Vector2D"),   ESearchCase::IgnoreCase)) return ERigControlType::Vector2D;
+	return ERigControlType::Transform;
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleAddControlRigElement(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath    = Params->GetStringField(TEXT("asset_path"));
+	FString ElementTypeStr = Params->GetStringField(TEXT("element_type"));
+	FString Name         = Params->GetStringField(TEXT("name"));
+
+	if (Name.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("name must not be empty"));
+
+	UControlRigBlueprint* CRB = FMonolithAssetUtils::LoadAssetByPath<UControlRigBlueprint>(AssetPath);
+	if (!CRB) return FMonolithActionResult::Error(FString::Printf(TEXT("ControlRigBlueprint not found: %s"), *AssetPath));
+
+	URigHierarchyController* HC = CRB->GetHierarchyController();
+	if (!HC) return FMonolithActionResult::Error(TEXT("Failed to get hierarchy controller"));
+
+	// Parse element type
+	ElementTypeStr.ToLowerInline();
+	if (ElementTypeStr != TEXT("bone") && ElementTypeStr != TEXT("control") && ElementTypeStr != TEXT("null"))
+		return FMonolithActionResult::Error(TEXT("Invalid element_type — use bone, control, or null"));
+
+	ERigElementType ElemType = ParseRigElementType(ElementTypeStr);
+
+	// Parse parent (optional)
+	FRigElementKey ParentKey;
+	FString ParentName;
+	if (Params->TryGetStringField(TEXT("parent"), ParentName) && !ParentName.IsEmpty())
+	{
+		FString ParentTypeStr;
+		ERigElementType ParentElemType = ERigElementType::Bone;
+		if (Params->TryGetStringField(TEXT("parent_type"), ParentTypeStr) && !ParentTypeStr.IsEmpty())
+			ParentElemType = ParseRigElementType(ParentTypeStr);
+
+		ParentKey = FRigElementKey(FName(*ParentName), ParentElemType);
+
+		// Validate parent exists
+		URigHierarchy* H = CRB->Hierarchy;
+		if (!H || !H->Find(ParentKey))
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Parent element not found: %s"), *ParentName));
+	}
+
+	// Parse optional transform {tx, ty, tz, rx, ry, rz}
+	FTransform Xform = FTransform::Identity;
+	const TSharedPtr<FJsonObject>* XformObj = nullptr;
+	if (Params->TryGetObjectField(TEXT("transform"), XformObj) && XformObj && (*XformObj)->Values.Num() > 0)
+	{
+		double TX = 0, TY = 0, TZ = 0, RX = 0, RY = 0, RZ = 0;
+		(*XformObj)->TryGetNumberField(TEXT("tx"), TX);
+		(*XformObj)->TryGetNumberField(TEXT("ty"), TY);
+		(*XformObj)->TryGetNumberField(TEXT("tz"), TZ);
+		(*XformObj)->TryGetNumberField(TEXT("rx"), RX);
+		(*XformObj)->TryGetNumberField(TEXT("ry"), RY);
+		(*XformObj)->TryGetNumberField(TEXT("rz"), RZ);
+		Xform.SetTranslation(FVector(TX, TY, TZ));
+		Xform.SetRotation(FQuat(FRotator(RX, RY, RZ)));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add Control Rig Element")));
+	static_cast<UBlueprint*>(CRB)->Modify();
+
+	FRigElementKey ResultKey;
+
+	if (ElementTypeStr == TEXT("bone"))
+	{
+		ResultKey = HC->AddBone(FName(*Name), ParentKey, Xform, /*bTransformInGlobal=*/false,
+			ERigBoneType::User, /*bSetupUndo=*/true, /*bPrintPythonCommand=*/false);
+	}
+	else if (ElementTypeStr == TEXT("null"))
+	{
+		ResultKey = HC->AddNull(FName(*Name), ParentKey, Xform, /*bTransformInGlobal=*/false,
+			/*bSetupUndo=*/true, /*bPrintPythonCommand=*/false);
+	}
+	else // control
+	{
+		// Parse control_type
+		FString ControlTypeStr;
+		if (!Params->TryGetStringField(TEXT("control_type"), ControlTypeStr) || ControlTypeStr.IsEmpty())
+			ControlTypeStr = TEXT("Transform");
+
+		// Parse animatable flag
+		bool bAnimatable = true;
+		Params->TryGetBoolField(TEXT("animatable"), bAnimatable);
+
+		FRigControlSettings Settings;
+		Settings.ControlType = ParseRigControlType(ControlTypeStr);
+		Settings.AnimationType = bAnimatable
+			? ERigControlAnimationType::AnimationControl
+			: ERigControlAnimationType::ProxyControl;
+		Settings.DisplayName = FName(*Name);
+
+		// Use SetFromTransform for safe type-correct value initialization.
+		// GetIdentityValue() calls SetFromTransform(Identity, ControlType, PrimaryAxis)
+		// and handles all storage type variants (FTransform_Float, FVector3f, float, etc.)
+		FRigControlValue InitVal = Settings.GetIdentityValue();
+
+		// If a custom transform was provided, apply it for transform-capable control types
+		if (XformObj && (*XformObj)->Values.Num() > 0)
+		{
+			const ERigControlType CT = Settings.ControlType;
+			if (CT == ERigControlType::Transform ||
+				CT == ERigControlType::Position   ||
+				CT == ERigControlType::Scale      ||
+				CT == ERigControlType::Rotator)
+			{
+				InitVal.SetFromTransform(Xform, CT, Settings.PrimaryAxis);
+			}
+		}
+
+		ResultKey = HC->AddControl(FName(*Name), ParentKey, Settings, InitVal,
+			FTransform::Identity, FTransform::Identity,
+			/*bSetupUndo=*/true, /*bPrintPythonCommand=*/false);
+	}
+
+	GEditor->EndTransaction();
+
+	if (!ResultKey.IsValid())
+		return FMonolithActionResult::Error(TEXT("Failed to create element — AddBone/AddNull/AddControl returned invalid key"));
+
+	// Mandatory: without RequestRigVMInit the editor shows "Data missing please force a recompile"
+	CRB->RequestRigVMInit();
+	CRB->MarkPackageDirty();
+
+	// Build result
+	FString ResultTypeStr = StaticEnum<ERigElementType>()->GetNameStringByValue(static_cast<int64>(ResultKey.Type));
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("name"),         ResultKey.Name.ToString());
+	Root->SetStringField(TEXT("element_type"), ResultTypeStr);
+	Root->SetStringField(TEXT("parent"),       ParentKey.IsValid() ? ParentKey.Name.ToString() : TEXT(""));
+	Root->SetStringField(TEXT("asset_path"),   AssetPath);
+	if (ElementTypeStr == TEXT("control"))
+	{
+		FString ControlTypeStr;
+		Params->TryGetStringField(TEXT("control_type"), ControlTypeStr);
+		if (ControlTypeStr.IsEmpty()) ControlTypeStr = TEXT("Transform");
+		Root->SetStringField(TEXT("control_type"), ControlTypeStr);
+	}
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 8a — IKRig
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetIKRigInfo(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UIKRigDefinition* Asset = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(AssetPath);
+	if (!Asset) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRigDefinition not found: %s"), *AssetPath));
+
+	UIKRigController* C = UIKRigController::GetController(Asset);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get IKRigController"));
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+
+	// Preview mesh
+	USkeletalMesh* PreviewMesh = Asset->GetPreviewMesh();
+	Root->SetStringField(TEXT("preview_mesh"), PreviewMesh ? PreviewMesh->GetPathName() : TEXT("None"));
+
+	// Pelvis / retarget root
+	Root->SetStringField(TEXT("pelvis_bone"), C->GetRetargetRoot().ToString());
+
+	// Skeleton
+	const FIKRigSkeleton& Skel = C->GetIKRigSkeleton();
+	Root->SetNumberField(TEXT("bone_count"), Skel.BoneNames.Num());
+
+	// Solvers
+	TArray<TSharedPtr<FJsonValue>> SolversArr;
+	const int32 NumSolvers = C->GetNumSolvers();
+	const TArray<FInstancedStruct>& SolverStructs = Asset->GetSolverStructs();
+	for (int32 i = 0; i < NumSolvers; ++i)
+	{
+		TSharedPtr<FJsonObject> SolverObj = MakeShared<FJsonObject>();
+		SolverObj->SetNumberField(TEXT("index"), i);
+		SolverObj->SetBoolField(TEXT("enabled"), C->GetSolverEnabled(i));
+		SolverObj->SetStringField(TEXT("start_bone"), C->GetStartBone(i).ToString());
+
+		FString TypeName = TEXT("Unknown");
+		if (SolverStructs.IsValidIndex(i) && SolverStructs[i].GetScriptStruct())
+		{
+			TypeName = SolverStructs[i].GetScriptStruct()->GetName();
+		}
+		SolverObj->SetStringField(TEXT("type"), TypeName);
+		SolverObj->SetStringField(TEXT("label"), C->GetSolverUniqueName(i));
+		SolversArr.Add(MakeShared<FJsonValueObject>(SolverObj));
+	}
+	Root->SetArrayField(TEXT("solvers"), SolversArr);
+	Root->SetNumberField(TEXT("solver_count"), NumSolvers);
+
+	// Goals
+	TArray<TSharedPtr<FJsonValue>> GoalsArr;
+	const TArray<UIKRigEffectorGoal*>& Goals = C->GetAllGoals();
+	for (const UIKRigEffectorGoal* Goal : Goals)
+	{
+		if (!Goal) continue;
+		TSharedPtr<FJsonObject> GoalObj = MakeShared<FJsonObject>();
+		GoalObj->SetStringField(TEXT("name"), Goal->GoalName.ToString());
+		GoalObj->SetStringField(TEXT("bone"), Goal->BoneName.ToString());
+		GoalObj->SetBoolField(TEXT("connected"), C->IsGoalConnectedToAnySolver(Goal->GoalName));
+		GoalsArr.Add(MakeShared<FJsonValueObject>(GoalObj));
+	}
+	Root->SetArrayField(TEXT("goals"), GoalsArr);
+	Root->SetNumberField(TEXT("goal_count"), GoalsArr.Num());
+
+	// Retarget chains
+	TArray<TSharedPtr<FJsonValue>> ChainsArr;
+	const TArray<FBoneChain>& Chains = C->GetRetargetChains();
+	for (const FBoneChain& Chain : Chains)
+	{
+		TSharedPtr<FJsonObject> ChainObj = MakeShared<FJsonObject>();
+		ChainObj->SetStringField(TEXT("name"), Chain.ChainName.ToString());
+		ChainObj->SetStringField(TEXT("start_bone"), Chain.StartBone.BoneName.ToString());
+		ChainObj->SetStringField(TEXT("end_bone"), Chain.EndBone.BoneName.ToString());
+		ChainObj->SetStringField(TEXT("goal"), Chain.IKGoalName.ToString());
+		ChainsArr.Add(MakeShared<FJsonValueObject>(ChainObj));
+	}
+	Root->SetArrayField(TEXT("retarget_chains"), ChainsArr);
+	Root->SetNumberField(TEXT("retarget_chain_count"), ChainsArr.Num());
+
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleAddIKSolver(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString SolverType = Params->GetStringField(TEXT("solver_type"));
+
+	UIKRigDefinition* Asset = FMonolithAssetUtils::LoadAssetByPath<UIKRigDefinition>(AssetPath);
+	if (!Asset) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRigDefinition not found: %s"), *AssetPath));
+
+	UIKRigController* C = UIKRigController::GetController(Asset);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get IKRigController"));
+
+	// Normalize solver type — add package prefix if bare name
+	if (!SolverType.Contains(TEXT("/")))
+	{
+		SolverType = FString::Printf(TEXT("/Script/IKRig.%s"), *SolverType);
+	}
+
+	int32 SolverIdx = C->AddSolver(SolverType);
+	if (SolverIdx < 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to add solver of type '%s' — check type name"), *SolverType));
+	}
+
+	// Optional root bone
+	FString RootBone;
+	bool bStartBoneSet = false;
+	if (Params->TryGetStringField(TEXT("root_bone"), RootBone) && !RootBone.IsEmpty())
+	{
+		bStartBoneSet = C->SetStartBone(FName(*RootBone), SolverIdx);
+	}
+
+	// Optional goals array
+	TArray<FString> CreatedGoals;
+	TArray<FString> SkippedGoals;
+	TArray<FString> Warnings;
+	const TArray<TSharedPtr<FJsonValue>>* GoalsArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("goals"), GoalsArray) && GoalsArray)
+	{
+		const FIKRigSkeleton& Skel = C->GetIKRigSkeleton();
+		if (Skel.BoneNames.Num() == 0)
+		{
+			// Can't validate bones — skeleton not loaded (no preview mesh assigned)
+			// Skip bone pre-check and let AddNewGoal handle validation
+			Warnings.Add(TEXT("IKRig has no skeleton data loaded — bone validation skipped. Assign a preview mesh for reliable goal creation."));
+		}
+		for (const TSharedPtr<FJsonValue>& GoalVal : *GoalsArray)
+		{
+			const TSharedPtr<FJsonObject>* GoalObjPtr = nullptr;
+			if (!GoalVal->TryGetObject(GoalObjPtr) || !GoalObjPtr) continue;
+
+			FString GoalNameStr, BoneNameStr;
+			if (!(*GoalObjPtr)->TryGetStringField(TEXT("name"), GoalNameStr) ||
+				!(*GoalObjPtr)->TryGetStringField(TEXT("bone"), BoneNameStr))
+			{
+				continue;
+			}
+
+			// Validate bone exists (only when skeleton is populated)
+			if (Skel.BoneNames.Num() > 0 && !Skel.BoneNames.Contains(FName(*BoneNameStr)))
+			{
+				SkippedGoals.Add(FString::Printf(TEXT("%s (bone '%s' not found)"), *GoalNameStr, *BoneNameStr));
+				continue;
+			}
+
+			FName CreatedGoalName = C->AddNewGoal(FName(*GoalNameStr), FName(*BoneNameStr));
+			if (!CreatedGoalName.IsNone())
+			{
+				C->ConnectGoalToSolver(CreatedGoalName, SolverIdx);
+				CreatedGoals.Add(CreatedGoalName.ToString());
+			}
+		}
+	}
+
+	Asset->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetNumberField(TEXT("solver_index"), SolverIdx);
+	Root->SetStringField(TEXT("solver_type"), SolverType);
+	Root->SetStringField(TEXT("label"), C->GetSolverUniqueName(SolverIdx));
+
+	if (!RootBone.IsEmpty())
+	{
+		Root->SetBoolField(TEXT("start_bone_set"), bStartBoneSet);
+		if (!bStartBoneSet)
+		{
+			Root->SetStringField(TEXT("start_bone_warning"), FString::Printf(TEXT("SetStartBone failed for '%s' — bone may not exist in skeleton"), *RootBone));
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> GoalNamesArr;
+	for (const FString& GoalName : CreatedGoals)
+	{
+		GoalNamesArr.Add(MakeShared<FJsonValueString>(GoalName));
+	}
+	Root->SetArrayField(TEXT("created_goals"), GoalNamesArr);
+
+	TArray<TSharedPtr<FJsonValue>> SkippedGoalsArr;
+	for (const FString& Skipped : SkippedGoals)
+	{
+		SkippedGoalsArr.Add(MakeShared<FJsonValueString>(Skipped));
+	}
+	Root->SetArrayField(TEXT("skipped_goals"), SkippedGoalsArr);
+
+	if (Warnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarningsArr;
+		for (const FString& W : Warnings)
+		{
+			WarningsArr.Add(MakeShared<FJsonValueString>(W));
+		}
+		Root->SetArrayField(TEXT("warnings"), WarningsArr);
+	}
+
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleGetRetargeterInfo(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UIKRetargeter* Asset = FMonolithAssetUtils::LoadAssetByPath<UIKRetargeter>(AssetPath);
+	if (!Asset) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRetargeter not found: %s"), *AssetPath));
+
+	UIKRetargeterController* C = UIKRetargeterController::GetController(Asset);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get UIKRetargeterController"));
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+
+	// Source / target rigs
+	const UIKRigDefinition* SourceRig = C->GetIKRig(ERetargetSourceOrTarget::Source);
+	const UIKRigDefinition* TargetRig = C->GetIKRig(ERetargetSourceOrTarget::Target);
+	Root->SetStringField(TEXT("source_rig"), SourceRig ? SourceRig->GetPathName() : TEXT("None"));
+	Root->SetStringField(TEXT("target_rig"), TargetRig ? TargetRig->GetPathName() : TEXT("None"));
+
+	// Preview meshes
+	USkeletalMesh* SourceMesh = C->GetPreviewMesh(ERetargetSourceOrTarget::Source);
+	USkeletalMesh* TargetMesh = C->GetPreviewMesh(ERetargetSourceOrTarget::Target);
+	Root->SetStringField(TEXT("source_preview_mesh"), SourceMesh ? SourceMesh->GetPathName() : TEXT("None"));
+	Root->SetStringField(TEXT("target_preview_mesh"), TargetMesh ? TargetMesh->GetPathName() : TEXT("None"));
+
+	// Op count
+	const int32 NumOps = C->GetNumRetargetOps();
+	Root->SetNumberField(TEXT("retarget_op_count"), NumOps);
+
+	// Chain mappings — iterate all target chains and query per-chain source
+	TArray<TSharedPtr<FJsonValue>> MappingsArr;
+	if (TargetRig)
+	{
+		const TArray<FBoneChain>& TargetChains = TargetRig->GetRetargetChains();
+		for (const FBoneChain& Chain : TargetChains)
+		{
+			FName SourceChain = C->GetSourceChain(Chain.ChainName);
+			if (!SourceChain.IsNone())
+			{
+				TSharedPtr<FJsonObject> PairObj = MakeShared<FJsonObject>();
+				PairObj->SetStringField(TEXT("target_chain"), Chain.ChainName.ToString());
+				PairObj->SetStringField(TEXT("source_chain"), SourceChain.ToString());
+				MappingsArr.Add(MakeShared<FJsonValueObject>(PairObj));
+			}
+		}
+	}
+	Root->SetArrayField(TEXT("chain_mappings"), MappingsArr);
+	Root->SetNumberField(TEXT("chain_mapping_count"), MappingsArr.Num());
+
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetRetargetChainMapping(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+
+	UIKRetargeter* Asset = FMonolithAssetUtils::LoadAssetByPath<UIKRetargeter>(AssetPath);
+	if (!Asset) return FMonolithActionResult::Error(FString::Printf(TEXT("IKRetargeter not found: %s"), *AssetPath));
+
+	UIKRetargeterController* C = UIKRetargeterController::GetController(Asset);
+	if (!C) return FMonolithActionResult::Error(TEXT("Failed to get UIKRetargeterController"));
+
+	FString AutoMapStr;
+	FString SourceChain, TargetChain;
+	const bool bHasAutoMap = Params->TryGetStringField(TEXT("auto_map"), AutoMapStr);
+	const bool bHasSourceChain = Params->TryGetStringField(TEXT("source_chain"), SourceChain);
+	const bool bHasTargetChain = Params->TryGetStringField(TEXT("target_chain"), TargetChain);
+
+	if (!bHasAutoMap && !(bHasSourceChain && bHasTargetChain))
+	{
+		return FMonolithActionResult::Error(TEXT("Must provide either 'auto_map' or both 'source_chain' and 'target_chain'"));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Retarget Chain Mapping")));
+	Asset->Modify();
+
+	if (bHasAutoMap)
+	{
+		EAutoMapChainType MapType = EAutoMapChainType::Fuzzy;
+		if (AutoMapStr.Equals(TEXT("exact"), ESearchCase::IgnoreCase))
+		{
+			MapType = EAutoMapChainType::Exact;
+		}
+		else if (AutoMapStr.Equals(TEXT("clear"), ESearchCase::IgnoreCase))
+		{
+			MapType = EAutoMapChainType::Clear;
+		}
+		else if (!AutoMapStr.Equals(TEXT("fuzzy"), ESearchCase::IgnoreCase))
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unknown auto_map value '%s' — use 'exact', 'fuzzy', or 'clear'"), *AutoMapStr));
+		}
+		C->AutoMapChains(MapType, true);
+	}
+	else
+	{
+		bool bOk = C->SetSourceChain(FName(*SourceChain), FName(*TargetChain));
+		if (!bOk)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Failed to set mapping: source chain '%s' or target chain '%s' not found"), *SourceChain, *TargetChain));
+		}
+	}
+
+	GEditor->EndTransaction();
+	Asset->MarkPackageDirty();
+
+	// Return resulting mappings for confirmation — iterate all target chains
+	TArray<TSharedPtr<FJsonValue>> MappingsArr;
+	const UIKRigDefinition* TargetRig = C->GetIKRig(ERetargetSourceOrTarget::Target);
+	if (TargetRig)
+	{
+		const TArray<FBoneChain>& TargetChains = TargetRig->GetRetargetChains();
+		for (const FBoneChain& Chain : TargetChains)
+		{
+			FName MappedSource = C->GetSourceChain(Chain.ChainName);
+			if (!MappedSource.IsNone())
+			{
+				TSharedPtr<FJsonObject> PairObj = MakeShared<FJsonObject>();
+				PairObj->SetStringField(TEXT("target_chain"), Chain.ChainName.ToString());
+				PairObj->SetStringField(TEXT("source_chain"), MappedSource.ToString());
+				MappingsArr.Add(MakeShared<FJsonValueObject>(PairObj));
+			}
+		}
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetArrayField(TEXT("chain_mappings"), MappingsArr);
+	Root->SetNumberField(TEXT("chain_mapping_count"), MappingsArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 10 — ABP Write Experimental
+// ---------------------------------------------------------------------------
+
+// Helper: find a state machine graph by machine name (exact match on node title, same logic as get_state_machines)
+static UAnimationStateMachineGraph* FindStateMachineGraphByName(UAnimBlueprint* ABP, const FString& MachineName)
+{
+	for (UEdGraph* Graph : ABP->FunctionGraphs)
+	{
+		if (!Graph) continue;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			UAnimGraphNode_StateMachine* SMNode = Cast<UAnimGraphNode_StateMachine>(Node);
+			if (!SMNode) continue;
+
+			FString SMTitle = SMNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString();
+			int32 NewlineIdx = INDEX_NONE;
+			if (SMTitle.FindChar(TEXT('\n'), NewlineIdx))
+			{
+				SMTitle.LeftInline(NewlineIdx);
+			}
+			if (SMTitle == MachineName)
+			{
+				return Cast<UAnimationStateMachineGraph>(SMNode->EditorStateMachineGraph);
+			}
+		}
+	}
+	return nullptr;
+}
+
+// Helper: find a state node by exact name within a state machine graph
+static UAnimStateNode* FindStateNodeByName(UAnimationStateMachineGraph* SMGraph, const FString& StateName)
+{
+	for (UEdGraphNode* Node : SMGraph->Nodes)
+	{
+		UAnimStateNode* StateNode = Cast<UAnimStateNode>(Node);
+		if (StateNode && StateNode->GetStateName() == StateName)
+		{
+			return StateNode;
+		}
+	}
+	return nullptr;
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleAddStateToMachine(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath   = Params->GetStringField(TEXT("asset_path"));
+	FString MachineName = Params->GetStringField(TEXT("machine_name"));
+	FString StateName   = Params->GetStringField(TEXT("state_name"));
+
+	double TempVal;
+	int32 PosX = 200;
+	int32 PosY = 0;
+	if (Params->TryGetNumberField(TEXT("position_x"), TempVal)) PosX = static_cast<int32>(TempVal);
+	if (Params->TryGetNumberField(TEXT("position_y"), TempVal)) PosY = static_cast<int32>(TempVal);
+
+	if (MachineName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
+	if (StateName.IsEmpty())   return FMonolithActionResult::Error(TEXT("Missing required parameter: state_name"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
+	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+
+	// Reject duplicate state names up front
+	if (FindStateNodeByName(SMGraph, StateName))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("A state named '%s' already exists in machine '%s'"), *StateName, *MachineName));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add State to Machine")));
+	SMGraph->Modify();
+
+	// SpawnNodeFromTemplate follows the same code path as the editor's drag-drop.
+	// It calls PostPlacedNewNode() which creates the BoundGraph subgraph.
+	UAnimStateNode* NewNode = FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate<UAnimStateNode>(
+		SMGraph,
+		NewObject<UAnimStateNode>(SMGraph),
+		FVector2f(static_cast<float>(PosX), static_cast<float>(PosY)),
+		/*bSelectNewNode=*/false);
+
+	if (!NewNode)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("Failed to spawn state node"));
+	}
+
+	if (!NewNode->BoundGraph)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("State node created but BoundGraph is null — state may be corrupt"));
+	}
+
+	// Rename via the BoundGraph — this propagates the name correctly so GetStateName() returns the right value
+	if (NewNode->BoundGraph)
+	{
+		TSharedPtr<INameValidatorInterface> NameValidator = FNameValidatorFactory::MakeValidator(NewNode);
+		FBlueprintEditorUtils::RenameGraphWithSuggestion(NewNode->BoundGraph, NameValidator, StateName);
+	}
+
+	GEditor->EndTransaction();
+
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("machine_name"), MachineName);
+	Root->SetStringField(TEXT("state_name"), NewNode->GetStateName());
+	Root->SetNumberField(TEXT("position_x"), NewNode->NodePosX);
+	Root->SetNumberField(TEXT("position_y"), NewNode->NodePosY);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleAddTransition(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath   = Params->GetStringField(TEXT("asset_path"));
+	FString MachineName = Params->GetStringField(TEXT("machine_name"));
+	FString FromState   = Params->GetStringField(TEXT("from_state"));
+	FString ToState     = Params->GetStringField(TEXT("to_state"));
+
+	if (MachineName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
+	if (FromState.IsEmpty())   return FMonolithActionResult::Error(TEXT("Missing required parameter: from_state"));
+	if (ToState.IsEmpty())     return FMonolithActionResult::Error(TEXT("Missing required parameter: to_state"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
+	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+
+	UAnimStateNode* FromNode = FindStateNodeByName(SMGraph, FromState);
+	if (!FromNode) return FMonolithActionResult::Error(FString::Printf(TEXT("State '%s' not found in machine '%s'"), *FromState, *MachineName));
+
+	UAnimStateNode* ToNode = FindStateNodeByName(SMGraph, ToState);
+	if (!ToNode) return FMonolithActionResult::Error(FString::Printf(TEXT("State '%s' not found in machine '%s'"), *ToState, *MachineName));
+
+	UEdGraphPin* OutputPin = FromNode->GetOutputPin();
+	UEdGraphPin* InputPin  = ToNode->GetInputPin();
+
+	if (!OutputPin) return FMonolithActionResult::Error(FString::Printf(TEXT("Source state '%s' has no output pin"), *FromState));
+	if (!InputPin)  return FMonolithActionResult::Error(FString::Printf(TEXT("Target state '%s' has no input pin"), *ToState));
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Add Transition")));
+	SMGraph->Modify();
+
+	// TryCreateConnection internally creates the UAnimStateTransitionNode — do NOT create it manually
+	const UAnimationStateMachineSchema* Schema = Cast<UAnimationStateMachineSchema>(SMGraph->GetSchema());
+	if (!Schema)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("State machine graph has unexpected or null schema"));
+	}
+	const bool bConnected = Schema->TryCreateConnection(OutputPin, InputPin);
+
+	GEditor->EndTransaction();
+
+	if (!bConnected)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("TryCreateConnection failed for '%s' -> '%s'. States may already be connected or the connection is invalid."),
+			*FromState, *ToState));
+	}
+
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("machine_name"), MachineName);
+	Root->SetStringField(TEXT("from_state"), FromState);
+	Root->SetStringField(TEXT("to_state"), ToState);
+	return FMonolithActionResult::Success(Root);
+}
+
+FMonolithActionResult FMonolithAnimationActions::HandleSetTransitionRule(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath    = Params->GetStringField(TEXT("asset_path"));
+	FString MachineName  = Params->GetStringField(TEXT("machine_name"));
+	FString FromState    = Params->GetStringField(TEXT("from_state"));
+	FString ToState      = Params->GetStringField(TEXT("to_state"));
+	FString VariableName = Params->GetStringField(TEXT("variable_name"));
+
+	if (MachineName.IsEmpty())  return FMonolithActionResult::Error(TEXT("Missing required parameter: machine_name"));
+	if (FromState.IsEmpty())    return FMonolithActionResult::Error(TEXT("Missing required parameter: from_state"));
+	if (ToState.IsEmpty())      return FMonolithActionResult::Error(TEXT("Missing required parameter: to_state"));
+	if (VariableName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: variable_name"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	// Validate variable exists and is boolean
+	const FBPVariableDescription* VarDesc = nullptr;
+	for (const FBPVariableDescription& V : ABP->NewVariables)
+	{
+		if (V.VarName.ToString() == VariableName)
+		{
+			VarDesc = &V;
+			break;
+		}
+	}
+	if (!VarDesc)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Variable '%s' not found in ABP. Use get_abp_variables to list available variables."), *VariableName));
+	}
+	if (!VarDesc->VarType.PinCategory.ToString().Equals(TEXT("bool"), ESearchCase::IgnoreCase))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Variable '%s' is type '%s', not bool. Transition rules require a boolean variable."),
+			*VariableName, *VarDesc->VarType.PinCategory.ToString()));
+	}
+
+	UAnimationStateMachineGraph* SMGraph = FindStateMachineGraphByName(ABP, MachineName);
+	if (!SMGraph) return FMonolithActionResult::Error(FString::Printf(TEXT("State machine '%s' not found in ABP"), *MachineName));
+
+	// Find the transition node connecting the two states
+	UAnimStateTransitionNode* TransNode = nullptr;
+	for (UEdGraphNode* Node : SMGraph->Nodes)
+	{
+		UAnimStateTransitionNode* TN = Cast<UAnimStateTransitionNode>(Node);
+		if (!TN) continue;
+
+		UAnimStateNodeBase* PrevState = TN->GetPreviousState();
+		UAnimStateNodeBase* NextState = TN->GetNextState();
+		if (PrevState && NextState &&
+			PrevState->GetStateName() == FromState &&
+			NextState->GetStateName() == ToState)
+		{
+			TransNode = TN;
+			break;
+		}
+	}
+	if (!TransNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No transition found from '%s' to '%s'. Use add_transition first."), *FromState, *ToState));
+	}
+
+	UEdGraph* RuleGraph = TransNode->GetBoundGraph();
+	if (!RuleGraph)
+	{
+		return FMonolithActionResult::Error(TEXT("Transition has no bound rule graph"));
+	}
+
+	// Find the UAnimGraphNode_TransitionResult node in the rule graph
+	UAnimGraphNode_TransitionResult* ResultNode = nullptr;
+	for (UEdGraphNode* N : RuleGraph->Nodes)
+	{
+		ResultNode = Cast<UAnimGraphNode_TransitionResult>(N);
+		if (ResultNode) break;
+	}
+	if (!ResultNode)
+	{
+		return FMonolithActionResult::Error(TEXT("Transition rule graph has no result node"));
+	}
+
+	// Find bCanEnterTransition input pin on the result node
+	UEdGraphPin* ResultPin = ResultNode->FindPin(TEXT("bCanEnterTransition"), EGPD_Input);
+	if (!ResultPin)
+	{
+		return FMonolithActionResult::Error(TEXT("Could not find bCanEnterTransition pin on transition result node"));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Transition Rule")));
+	RuleGraph->Modify();
+
+	// Clear any existing wiring before connecting our getter
+	ResultPin->BreakAllPinLinks();
+
+	// Spawn a UK2Node_VariableGet for the boolean variable
+	UK2Node_VariableGet* VarGetNode = NewObject<UK2Node_VariableGet>(RuleGraph);
+	VarGetNode->VariableReference.SetSelfMember(FName(*VariableName));
+	RuleGraph->AddNode(VarGetNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+	VarGetNode->NodePosX = ResultNode->NodePosX - 200;
+	VarGetNode->NodePosY = ResultNode->NodePosY;
+	VarGetNode->AllocateDefaultPins();
+
+	// Find the output value pin — first try the variable name, then any non-self output pin
+	UEdGraphPin* GetterOutputPin = VarGetNode->FindPin(FName(*VariableName), EGPD_Output);
+	if (!GetterOutputPin)
+	{
+		for (UEdGraphPin* Pin : VarGetNode->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Output && Pin->PinName != TEXT("self"))
+			{
+				GetterOutputPin = Pin;
+				break;
+			}
+		}
+	}
+
+	bool bWired = false;
+	if (GetterOutputPin)
+	{
+		const UEdGraphSchema* RuleSchema = RuleGraph->GetSchema();
+		if (RuleSchema)
+		{
+			bWired = RuleSchema->TryCreateConnection(GetterOutputPin, ResultPin);
+		}
+	}
+
+	GEditor->EndTransaction();
+
+	FKismetEditorUtilities::CompileBlueprint(ABP);
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("machine_name"), MachineName);
+	Root->SetStringField(TEXT("from_state"), FromState);
+	Root->SetStringField(TEXT("to_state"), ToState);
+	Root->SetStringField(TEXT("variable_name"), VariableName);
+	Root->SetBoolField(TEXT("pin_wired"), bWired);
+	if (!bWired)
+	{
+		Root->SetStringField(TEXT("warning"), TEXT("Variable getter node was created but output pin could not be found. Manual wiring may be needed."));
+	}
 	return FMonolithActionResult::Success(Root);
 }

@@ -1,11 +1,11 @@
 ---
 name: unreal-animation
-description: Use when inspecting or editing Unreal animation assets via Monolith MCP — sequences, montages, blend spaces, animation blueprints, notifies, curves, sync markers, skeletons. Triggers on animation, montage, ABP, blend space, notify, anim sequence, skeleton.
+description: Use when inspecting or editing Unreal animation assets via Monolith MCP — sequences, montages, blend spaces, animation blueprints, notifies, curves, sync markers, skeletons, IKRig, IK Retargeter, Control Rig. Triggers on animation, montage, ABP, blend space, notify, anim sequence, skeleton, IKRig, retargeter, control rig.
 ---
 
 # Unreal Animation Workflows
 
-You have access to **Monolith** with 23 animation actions via `animation_query()`.
+You have access to **Monolith** with 74 animation actions via `animation_query()`.
 
 ## Discovery
 
@@ -57,6 +57,15 @@ All asset paths follow UE content browser format (no .uasset extension):
 | `get_linked_layers` | `asset_path` | Linked anim layers |
 | `get_graphs` | `asset_path` | All graphs in the ABP |
 | `get_nodes` | `asset_path`, `graph_name` (optional) | Nodes within a specific graph (or all graphs) |
+| `get_abp_variables` | `asset_path` | List ABP variables with types and defaults |
+| `get_abp_linked_assets` | `asset_path` | Find referenced anim assets via Asset Registry deps |
+
+### Animation Blueprint (ABP) Writing — EXPERIMENTAL
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `add_state_to_machine` | `asset_path`, `machine_name`, `state_name`, `position_x?`, `position_y?` | Add a state to a state machine |
+| `add_transition` | `asset_path`, `machine_name`, `from_state`, `to_state` | Add a transition between two states |
+| `set_transition_rule` | `asset_path`, `machine_name`, `from_state`, `to_state`, `variable_name` | Wire a boolean variable as transition condition |
 
 ### Notify Editing
 | Action | Key Params | Purpose |
@@ -78,6 +87,21 @@ All asset paths follow UE content browser format (no .uasset extension):
 | `remove_virtual_bones` | `asset_path`, `bones` | Remove virtual bones |
 | `get_skeleton_info` | `asset_path` | Bone hierarchy, sockets, virtual bones |
 | `get_skeletal_mesh_info` | `asset_path` | Mesh details, LODs, materials |
+
+### IKRig
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `get_ikrig_info` | `asset_path` | Read IKRig asset — solvers, goals, chains, skeleton |
+| `add_ik_solver` | `asset_path`, `solver_type`, `root_bone?`, `goals?` | Add a solver and goals to an IKRig |
+| `get_retargeter_info` | `asset_path` | Read IK Retargeter — source/target rigs, chain mappings |
+| `set_retarget_chain_mapping` | `asset_path`, `auto_map?` OR `source_chain`+`target_chain` | Map retarget chains (auto or explicit) |
+
+### Control Rig
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `get_control_rig_info` | `asset_path`, `element_type?` | Read CR hierarchy — bones, controls, nulls |
+| `get_control_rig_variables` | `asset_path` | Get animatable controls and BP variables |
+| `add_control_rig_element` | `asset_path`, `element_type`, `name`, `parent?`, `control_type?`, `animatable?`, `transform?` | Add a bone, control, or null to a CR |
 
 ## Common Workflows
 
@@ -108,6 +132,25 @@ animation_query({ action: "get_skeleton_info", params: { asset_path: "/Game/Char
 animation_query({ action: "get_skeletal_mesh_info", params: { asset_path: "/Game/Characters/SKM_Mannequin" } })
 ```
 
+### Inspect IKRig and retargeter
+```
+animation_query({ action: "get_ikrig_info", params: { asset_path: "/Game/Characters/IK_Mannequin" } })
+animation_query({ action: "get_retargeter_info", params: { asset_path: "/Game/Characters/RTG_MannequinToPlayer" } })
+```
+
+### Read Control Rig hierarchy
+```
+animation_query({ action: "get_control_rig_info", params: { asset_path: "/Game/ControlRigs/CR_Player" } })
+animation_query({ action: "get_control_rig_info", params: { asset_path: "/Game/ControlRigs/CR_Player", element_type: "Control" } })
+```
+
+### Experimental: add a state and transition to an ABP
+```
+animation_query({ action: "add_state_to_machine", params: { asset_path: "/Game/Animations/ABP_Player", machine_name: "Locomotion", state_name: "Crouch" } })
+animation_query({ action: "add_transition", params: { asset_path: "/Game/Animations/ABP_Player", machine_name: "Locomotion", from_state: "Idle", to_state: "Crouch" } })
+animation_query({ action: "set_transition_rule", params: { asset_path: "/Game/Animations/ABP_Player", machine_name: "Locomotion", from_state: "Idle", to_state: "Crouch", variable_name: "bIsCrouching" } })
+```
+
 ## Rules
 
 - Editing tools modify assets **live in the editor** — changes are immediate
@@ -115,4 +158,6 @@ animation_query({ action: "get_skeletal_mesh_info", params: { asset_path: "/Game
 - State machine names are returned clean (no newline artifacts)
 - `get_nodes` accepts an optional `graph_name` filter to scope results
 - Use `project_query("search", { query: "AM_*" })` to find animation assets first
-- ABP reading is read-only — state machine logic must be edited in the BP editor
+- ABP write actions (Wave 10) are **EXPERIMENTAL** — structural writes to ABP graphs are high-risk; always compile after and check for errors
+- `set_retarget_chain_mapping` accepts either `auto_map: true` for automatic mapping or explicit `source_chain` + `target_chain` for manual mapping
+- `add_control_rig_element`: `animatable` uses `IsAnimatable()` method internally — not a raw bool field on FRigControlSettings
