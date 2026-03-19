@@ -6,6 +6,129 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-03-19
+
+Major feature expansion: +69 actions across Blueprint, Material, Niagara, and Animation. IKRig, IK Retargeter, Control Rig, and AnimBP structural write support. Full Material instance CRUD. Niagara dynamic inputs, event handlers, and simulation stages. 60 bug fixes. 220 → 290 actions total.
+
+### Added
+
+**Blueprint (+20, 47 → 67)**
+
+- `batch_execute` — dispatch multiple Blueprint operations in a single call
+- `resolve_node` — resolve a node reference to its target (function, variable, etc.)
+- `search_functions` — search functions and events by name across a Blueprint
+- `get_node_details` — full detail dump for a single node (pins, defaults, metadata)
+- `add_nodes_bulk` — add multiple nodes to a graph in one call
+- `connect_pins_bulk` — connect multiple pin pairs in one call
+- `set_pin_defaults_bulk` — set multiple pin default values in one call
+- `scaffold_interface_implementation` — auto-generate stub event nodes for an unimplemented interface
+- `add_timeline` — add a Timeline node to a graph
+- `add_event_node` — add a named event node to a graph
+- `add_comment_node` — add a comment box to a graph
+- `get_function_signature` — return param list and return type for a Blueprint function
+- `get_blueprint_info` — comprehensive Blueprint summary (class, interfaces, components, variable count)
+- `get_event_dispatcher_details` — full detail for a single event dispatcher
+- `remove_event_dispatcher` — remove an event dispatcher from a Blueprint
+- `set_event_dispatcher_params` — change the parameter signature of an event dispatcher
+- `validate_blueprint` (enhanced) — now detects unimplemented interfaces and duplicate events
+- `promote_pin_to_variable` — promote a pin's value to a Blueprint variable
+- `add_replicated_variable` — add a replicated variable with configurable RepNotify
+- `add_node` (extended) — now supports cast node creation (`CastTo<ClassName>`)
+
+**Material (+22, 25 → 47)**
+
+- `auto_layout` — auto-arrange expression nodes in the material graph
+- `duplicate_expression` — duplicate an expression node in-place
+- `list_expression_classes` — list all available material expression class names
+- `get_expression_connections` — return all connections into/out of an expression
+- `move_expression` — move an expression node to a new graph position
+- `get_material_properties` — return material-level properties (blend mode, shading model, etc.)
+- `get_instance_parameters` — list all parameter overrides on a material instance
+- `set_instance_parameters` — set multiple parameters on a material instance in one call
+- `set_instance_parent` — reparent a material instance to a different material
+- `clear_instance_parameter` — clear a parameter override on a material instance (revert to parent)
+- `save_material` — explicitly save a material asset (bypass auto-save)
+- `update_custom_hlsl_node` — update the HLSL code or description on a CustomHLSL expression
+- `replace_expression` — swap an expression node for a different type, preserving connections
+- `get_expression_pin_info` — return pin names, types, and connection state for an expression
+- `rename_expression` — rename an expression node's parameter name
+- `list_material_instances` — find all material instances derived from a material
+- `create_material_function` — create a new UMaterialFunction asset
+- `build_function_graph` — build a material function's node graph from a declarative spec
+- `get_function_info` — return inputs, outputs, and description of a material function
+- `batch_set_material_property` — set a property on multiple materials in one call
+- `batch_recompile` — recompile multiple materials in one call
+- `import_texture` — import an image file as a UTexture2D asset
+
+**Niagara (+17, 47 → 64)**
+
+- `get_system_summary` — high-level system overview (emitter count, renderer count, param count)
+- `get_emitter_summary` — high-level emitter overview (module count, renderer count, sim target)
+- `list_emitter_properties` — list all editable UPROPERTY fields on an emitter asset
+- `get_module_input_value` — read the current value of a single module input
+- `configure_curve_keys` — set the full key list on a curve data interface in one call
+- `configure_data_interface` — set multiple properties on a data interface in one call
+- `duplicate_system` — duplicate a Niagara system asset to a new path
+- `set_fixed_bounds` — set fixed world-space bounds on a Niagara system
+- `set_effect_type` — assign an effect type asset to a Niagara system
+- `create_emitter` — create a standalone Niagara emitter asset from scratch
+- `export_system_spec` — export a system's full spec as JSON (reverse of `create_system_from_spec`)
+- `add_dynamic_input` — add a dynamic input module to a module's input slot
+- `set_dynamic_input_value` — set an input value on a dynamic input module
+- `search_dynamic_inputs` — search available dynamic input scripts by keyword
+- `add_event_handler` — add an event handler stage to an emitter
+- `validate_system` — validate system for GPU+Light renderer conflicts, missing materials, and bounds warnings
+- `add_simulation_stage` — add a simulation stage to a GPU emitter
+
+**Animation (+12, 62 → 74)**
+
+- `get_ikrig_info` — return IKRig asset info: chains, goals, solvers, retarget root
+- `add_ik_solver` — add a solver (PBIK, TwoBone, etc.) to an IKRig
+- `get_retargeter_info` — return IK Retargeter asset info: source/target rigs, chain mappings
+- `set_retarget_chain_mapping` — set or update a chain mapping on an IK Retargeter
+- `get_control_rig_info` — return Control Rig hierarchy: bones, controls, nulls, curves
+- `get_control_rig_variables` — list variables on a Control Rig Blueprint
+- `add_control_rig_element` — add a bone, control, or null to a Control Rig hierarchy
+- `get_abp_variables` — list variables defined in an Animation Blueprint
+- `get_abp_linked_assets` — list assets linked to an Animation Blueprint (skeletons, rigs, etc.)
+- `add_state_to_machine` — add a new state to an AnimBP state machine
+- `add_transition` — add a transition between two states in a state machine
+- `set_transition_rule` — set the condition expression on a state machine transition
+
+### Fixed
+
+**Blueprint (21 fixes)**
+
+- 5 crash fixes: null graph reference, invalid pin access on removed nodes, blueprint-not-compiled guard, interface scaffold on abstract classes, cast node creation with missing target class
+- 7 logic bugs: `get_functions` missing latent function flags, `find_nodes_by_class` incorrect prefix handling, `connect_pins` direction mismatch silent failure, `remove_node` orphaned connections, `get_event_dispatchers` missing param types, `validate_blueprint` false-positive on native interfaces, `get_graph_data` stale node references after compile
+- 9 UX improvements: clearer error messages for invalid pin names, node class alias expansion in `add_node`, bulk op partial-success reporting, better param validation messages, schema enrichment for all 20 new actions
+
+**Material (11 fixes)**
+
+- 3 bugs: `build_function_graph` node class resolution for function-context expressions, `connect_expressions` direction detection when both nodes have same-named pins, `get_material_parameters` missing static switch params on instanced materials
+- 3 UX: `list_material_instances` now recurses through instance chains, `get_compilation_stats` includes VS/PS instruction counts, `set_instance_parameter` accepts both short and full parameter names
+- 5 minor: null-safety guards in expression walker, consistent use of `PostEditChangeProperty` across all write actions, `save_material` marks package dirty before save, `import_texture` sets sRGB correctly for normal maps, `batch_recompile` returns per-asset results
+
+**Niagara (16 fixes)**
+
+- 2 crash fixes: `configure_data_interface` null DI reference on freshly-created emitters, `add_event_handler` accessing uninitialized event receiver
+- 5 bugs: `get_module_input_value` mismatched override vs default value for bound inputs, `set_dynamic_input_value` namespace aliasing for dynamic input params, `validate_system` false-positive on CPU+Light (only GPU+Light is invalid), `export_system_spec` missing user parameter defaults, `add_simulation_stage` not calling `RebuildEmitterNodes` after add
+- 9 UX: `get_system_summary` includes compile status, `list_emitter_properties` groups by category, `configure_curve_keys` validates key ordering, `duplicate_system` deep-copies override table, consistent emitter param naming across all actions, `set_fixed_bounds` validates axis order, `search_dynamic_inputs` supports multi-word queries, `get_emitter_summary` includes module names, `add_event_handler` returns handler index
+
+**Animation (12 fixes)**
+
+- 1 crash fix: `add_ik_solver` null pointer when IKRig asset has no chain defined yet
+- 6 bugs: `get_ikrig_info` missing retarget root bone, `set_retarget_chain_mapping` overwrote existing mappings instead of merging, `get_control_rig_info` excluded null-type elements, `get_abp_linked_assets` missed indirect skeleton links via pose asset references, `add_state_to_machine` duplicate state name collision not detected, `set_transition_rule` lost existing conditions on complex rule expressions
+- 5 UX: `get_ikrig_info` now includes goal offsets and weight settings, `get_retargeter_info` includes auto-map status per chain, `add_transition` accepts both state names and state indices, `get_abp_variables` includes type info and default values, `add_control_rig_element` returns new element's full path
+
+### Changed
+
+- **Blueprint** — Action count 47 → 67
+- **Material** — Action count 25 → 47
+- **Niagara** — Action count 47 → 64
+- **Animation** — Action count 62 → 74
+- **Total** — Action count 220 → 290
+
 ## [0.8.0] - 2026-03-15
 
 Native C++ source indexer, marketplace plugin content indexing, CDO property reader, and project C++ source indexing. Community PRs from NRG-Nad. 219 → 220 actions total.
