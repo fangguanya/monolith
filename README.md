@@ -18,7 +18,7 @@ It works with **Claude Code**, **Cursor**, or any MCP-compatible client. If your
 
 ## Why Monolith?
 
-Most MCP integrations register every action as a separate tool, which floods the AI's context window and buries the actually useful stuff. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists everything available. Small tool list (12 tools), massive capability (291 actions across nine domains). The AI gets oriented fast and spends its context on your actual problem.
+Most MCP integrations register every action as a separate tool, which floods the AI's context window and buries the actually useful stuff. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists everything available. Small tool list (13 tools), massive capability (443 actions across ten domains). The AI gets oriented fast and spends its context on your actual problem.
 
 ## What Can It Actually Do?
 
@@ -28,7 +28,7 @@ Most MCP integrations register every action as a separate tool, which floods the
 
 **Animation** — Inspect and modify animation sequences, montages, blend spaces, Animation Blueprints, state machines, skeletons, and PoseSearch databases. Add/remove notifies, edit montage sections, create blend space samples, trace ABP state transitions. The whole animation pipeline is in scope.
 
-**Niagara** — Create particle systems from specs, add/remove emitters and modules, set module inputs and bindings, configure data interfaces and renderers, edit parameters, read compiled GPU HLSL, and batch-execute multiple operations atomically. "Build me a blood splatter system that responds to hit direction" — genuinely doable.
+**Niagara** — Create particle systems from specs, add/remove emitters and modules, set module inputs and bindings, configure data interfaces and renderers, edit parameters, read compiled GPU HLSL, and batch-execute multiple operations atomically. Dynamic input CRUD, event handler and simulation stage management, NPC particle systems, effect types, and system diffing. 96 actions — the deepest Niagara integration anywhere. "Build me a blood splatter system that responds to hit direction" — genuinely doable.
 
 **Editor** — Trigger full UBT builds or Live Coding compiles, read build errors and compiler output, search editor logs, get crash context after failures, query editor state. The AI can compile your code and diagnose the failure without you touching the editor.
 
@@ -45,7 +45,7 @@ Most MCP integrations register every action as a separate tool, which floods the
 - **Full Blueprint read/write/CRUD** — Create Blueprints, edit variables/components/functions/nodes, compile and validate. Read CDO properties from any Blueprint or DataAsset.
 - **Material graph editing** — Read, build, and validate material graphs with preview support
 - **Animation coverage** — Montages, blend spaces, ABP state machines, skeletons, bone tracks
-- **Niagara particle systems** — Create and edit systems, emitters, modules, parameters, renderers, and HLSL
+- **Niagara particle systems** — Create and edit systems, emitters, modules, parameters, renderers, HLSL, dynamic inputs, event handlers, simulation stages, NPC systems, effect types, and system diffing (96 actions)
 - **Editor integration** — Build triggers, log capture, compile output, crash context, Live Coding support
 - **Config management** — INI resolution, diff, search, and explain
 - **Deep project search** — SQLite FTS5 full-text search across all indexed assets, including marketplace and Fab plugin content. Configurable additional content paths.
@@ -201,17 +201,18 @@ cp -r Plugins/Monolith/Skills/* ~/.claude/skills/
 ```
 Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, auto-updater (4 actions)
-  MonolithBlueprint     — Blueprint read/write, variable/component/graph CRUD, node operations, compile, CDO reader (67 actions)
-  MonolithMaterial      — Material inspection + graph editing + CRUD (47 actions)
-  MonolithAnimation     — Animation sequences, montages, ABPs, PoseSearch (74 actions)
-  MonolithNiagara       — Niagara particle systems (64 actions)
-  MonolithEditor        — Build triggers, log capture, compile output, crash context (17 actions)
+  MonolithBlueprint     — Blueprint read/write, variable/component/graph CRUD, node operations, compile, CDO reader (86 actions)
+  MonolithMaterial      — Material inspection + graph editing + CRUD + material functions (57 actions)
+  MonolithAnimation     — Animation sequences, montages, ABPs, PoseSearch, IKRig, Control Rig (115 actions)
+  MonolithNiagara       — Niagara particle systems, dynamic inputs, event handlers, sim stages, NPC (96 actions)
+  MonolithEditor        — Build triggers, log capture, compile output, crash context (19 actions)
   MonolithConfig        — Config/INI resolution and search (6 actions)
-  MonolithIndex         — SQLite FTS5 deep project indexer, marketplace content, 15 asset indexers (5 actions)
-  MonolithSource        — Native C++ engine source indexer, call graphs, class hierarchy (10 actions)
+  MonolithIndex         — SQLite FTS5 deep project indexer, marketplace content, 15 asset indexers (7 actions)
+  MonolithSource        — Native C++ engine source indexer, call graphs, class hierarchy (11 actions)
+  MonolithUI            — UI widget Blueprint CRUD, templates, styling, animation (42 actions)
 ```
 
-**291 actions total across 9 modules, exposed through 12 MCP tools.**
+**443 actions total across 10 modules, exposed through 13 MCP tools.**
 
 ### Tool Reference
 
@@ -221,14 +222,15 @@ Monolith.uplugin
 | `monolith` | `monolith_status` | — | Server health, version, index status |
 | `monolith` | `monolith_reindex` | — | Trigger full project re-index |
 | `monolith` | `monolith_update` | — | Check or install updates |
-| `blueprint` | `blueprint_query` | 67 | Full Blueprint CRUD — read/write graphs, variables, components, functions, nodes, compile, CDO properties |
-| `material` | `material_query` | 47 | Inspection, editing, graph building, previews, validation, CRUD |
-| `animation` | `animation_query` | 74 | Montages, blend spaces, ABPs, skeletons, bone tracks, PoseSearch, IKRig, Control Rig |
-| `niagara` | `niagara_query` | 64 | Systems, emitters, modules, parameters, renderers, HLSL, dynamic inputs, simulation stages |
-| `editor` | `editor_query` | 17 | Build triggers, error logs, compile output, crash context, scene capture, texture import |
+| `blueprint` | `blueprint_query` | 86 | Full Blueprint CRUD — read/write graphs, variables, components, functions, nodes, compile, CDO properties, auto-layout |
+| `material` | `material_query` | 57 | Inspection, editing, graph building, material functions, previews, validation, CRUD |
+| `animation` | `animation_query` | 115 | Montages, blend spaces, ABPs, skeletons, bone tracks, PoseSearch, IKRig, Control Rig |
+| `niagara` | `niagara_query` | 96 | Systems, emitters, modules, parameters, renderers, HLSL, dynamic inputs, event handlers, sim stages, NPC, effect types |
+| `editor` | `editor_query` | 19 | Build triggers, error logs, compile output, crash context, scene capture, texture import |
 | `config` | `config_query` | 6 | INI resolution, explain, diff, search |
-| `project` | `project_query` | 5 | Deep project search — FTS5 across all indexed assets including marketplace plugins |
-| `source` | `source_query` | 10 | Native C++ engine source lookup, call graphs, class hierarchy, project reindex |
+| `project` | `project_query` | 7 | Deep project search — FTS5 across all indexed assets including marketplace plugins |
+| `source` | `source_query` | 11 | Native C++ engine source lookup, call graphs, class hierarchy, project reindex |
+| `ui` | `ui_query` | 42 | UI widget Blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility |
 
 ---
 
