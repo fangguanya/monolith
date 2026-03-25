@@ -941,12 +941,24 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 	else
 	{
 		// Generic K2Node fallback — try to find any UK2Node subclass by name
-		FString ClassName = FString::Printf(TEXT("UK2Node_%s"), *NodeType);
-		UClass* NodeClass = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::NativeFirst);
+		// UObject names strip the U/A prefix, so "UK2Node_InputAction" is stored as "K2Node_InputAction"
+		FString WithoutPrefix = FString::Printf(TEXT("K2Node_%s"), *NodeType);
+		UClass* NodeClass = FindFirstObject<UClass>(*WithoutPrefix, EFindFirstObjectOptions::NativeFirst);
 		if (!NodeClass)
 		{
-			// Try exact name (caller may have included the UK2Node_ prefix)
+			// Try with U prefix (in case it works on some platforms)
+			FString WithPrefix = FString::Printf(TEXT("UK2Node_%s"), *NodeType);
+			NodeClass = FindFirstObject<UClass>(*WithPrefix, EFindFirstObjectOptions::NativeFirst);
+		}
+		if (!NodeClass)
+		{
+			// Try exact name as given (caller may have passed "K2Node_InputAction" directly)
 			NodeClass = FindFirstObject<UClass>(*NodeType, EFindFirstObjectOptions::NativeFirst);
+		}
+		if (!NodeClass && NodeType.StartsWith(TEXT("U")))
+		{
+			// Strip U prefix if caller included it (e.g., "UK2Node_DoOnce" → "K2Node_DoOnce")
+			NodeClass = FindFirstObject<UClass>(*NodeType.Mid(1), EFindFirstObjectOptions::NativeFirst);
 		}
 
 		if (NodeClass && NodeClass->IsChildOf(UK2Node::StaticClass()))
