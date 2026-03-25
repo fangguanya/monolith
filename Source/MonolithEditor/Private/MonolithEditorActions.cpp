@@ -407,10 +407,11 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("delete_assets"),
-		TEXT("Delete UE assets by path. Safety: only allows paths under /Game/AgentTraining/"),
+		TEXT("Delete UE assets by path. Optional safety: restrict to allowed path prefixes"),
 		FMonolithActionHandler::CreateStatic(&HandleDeleteAssets),
 		FParamSchemaBuilder()
-			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of UE asset paths to delete (must be under /Game/AgentTraining/)"))
+			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of UE asset paths to delete"))
+			.Optional(TEXT("allowed_prefixes"), TEXT("array"), TEXT("If set, only paths starting with one of these prefixes can be deleted (e.g. [\"/Game/AgentTraining/\"])"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("get_viewport_info"),
@@ -1969,14 +1970,40 @@ FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
 		return FMonolithActionResult::Error(TEXT("No valid paths in asset_paths"));
 	}
 
-	// Safety: only allow deletion under /Game/AgentTraining/
-	for (const FString& Path : AssetPaths)
+	// Optional safety: restrict deletion to allowed prefixes
+	TArray<FString> AllowedPrefixes;
+	const TArray<TSharedPtr<FJsonValue>>* PrefixArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("allowed_prefixes"), PrefixArray) && PrefixArray)
 	{
-		if (!Path.StartsWith(TEXT("/Game/AgentTraining/")))
+		for (const auto& PVal : *PrefixArray)
 		{
-			return FMonolithActionResult::Error(FString::Printf(
-				TEXT("Refusing to delete %s — only assets under /Game/AgentTraining/ can be deleted"),
-				*Path));
+			FString Prefix;
+			if (PVal->TryGetString(Prefix) && !Prefix.IsEmpty())
+			{
+				AllowedPrefixes.Add(Prefix);
+			}
+		}
+	}
+
+	if (AllowedPrefixes.Num() > 0)
+	{
+		for (const FString& Path : AssetPaths)
+		{
+			bool bAllowed = false;
+			for (const FString& Prefix : AllowedPrefixes)
+			{
+				if (Path.StartsWith(Prefix))
+				{
+					bAllowed = true;
+					break;
+				}
+			}
+			if (!bAllowed)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Refusing to delete '%s' — not under any allowed prefix. Allowed: %s"),
+					*Path, *FString::Join(AllowedPrefixes, TEXT(", "))));
+			}
 		}
 	}
 
