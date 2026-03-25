@@ -1552,10 +1552,7 @@ FMonolithActionResult FMonolithMaterialActions::ExportMaterialGraph(const TShare
 			NodeJson->SetStringField(TEXT("id"), Expr->GetName());
 
 			FString ClassName = Expr->GetClass()->GetName();
-			if (ClassName.StartsWith(TEXT("MaterialExpression")))
-			{
-				ClassName = ClassName.Mid(18);
-			}
+			ClassName.RemoveFromStart(TEXT("MaterialExpression"));
 			NodeJson->SetStringField(TEXT("class"), ClassName);
 
 			if (bIncludePositions)
@@ -6464,11 +6461,8 @@ FMonolithActionResult FMonolithMaterialActions::ExportFunctionGraph(const TShare
 
 	bool bIncludeProperties = true;
 	bool bIncludePositions = true;
-	if (Params.IsValid())
-	{
-		Params->TryGetBoolField(TEXT("include_properties"), bIncludeProperties);
-		Params->TryGetBoolField(TEXT("include_positions"), bIncludePositions);
-	}
+	Params->TryGetBoolField(TEXT("include_properties"), bIncludeProperties);
+	Params->TryGetBoolField(TEXT("include_positions"), bIncludePositions);
 
 	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
 	if (!LoadedAsset)
@@ -6646,10 +6640,7 @@ FMonolithActionResult FMonolithMaterialActions::ExportFunctionGraph(const TShare
 			NodeJson->SetStringField(TEXT("id"), Expr->GetName());
 
 			FString ClassName = Expr->GetClass()->GetName();
-			if (ClassName.StartsWith(TEXT("MaterialExpression")))
-			{
-				ClassName = ClassName.Mid(18);
-			}
+			ClassName.RemoveFromStart(TEXT("MaterialExpression"));
 			NodeJson->SetStringField(TEXT("class"), ClassName);
 
 			if (bIncludePositions)
@@ -6922,35 +6913,38 @@ FMonolithActionResult FMonolithMaterialActions::DeleteFunctionExpression(const T
 		Name = Name.TrimStartAndEnd();
 	}
 
+	GEditor->BeginTransaction(FText::FromString(TEXT("DeleteFunctionExpression")));
 	MatFunc->Modify();
+
+	// Build name→expression map for O(1) lookups instead of O(N) per name
+	TMap<FString, UMaterialExpression*> NameToExpr;
+	for (UMaterialExpression* Expr : MatFunc->GetExpressions())
+	{
+		if (Expr)
+		{
+			NameToExpr.Add(Expr->GetName(), Expr);
+		}
+	}
 
 	int32 DeletedCount = 0;
 	TArray<FString> NotFound;
 
 	for (const FString& Name : NamesToDelete)
 	{
-		UMaterialExpression* TargetExpr = nullptr;
-		TConstArrayView<TObjectPtr<UMaterialExpression>> Expressions = MatFunc->GetExpressions();
-		for (const TObjectPtr<UMaterialExpression>& Expr : Expressions)
-		{
-			if (Expr && Expr->GetName() == Name)
-			{
-				TargetExpr = Expr;
-				break;
-			}
-		}
-
-		if (!TargetExpr)
+		UMaterialExpression** FoundPtr = NameToExpr.Find(Name);
+		if (!FoundPtr || !(*FoundPtr))
 		{
 			NotFound.Add(Name);
 			continue;
 		}
 
 		// Breaks all connections automatically
-		UMaterialEditingLibrary::DeleteMaterialExpressionInFunction(MatFunc, TargetExpr);
+		UMaterialEditingLibrary::DeleteMaterialExpressionInFunction(MatFunc, *FoundPtr);
+		NameToExpr.Remove(Name);
 		++DeletedCount;
 	}
 
+	GEditor->EndTransaction();
 	MatFunc->MarkPackageDirty();
 
 	auto ResultJson = MakeShared<FJsonObject>();

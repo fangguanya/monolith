@@ -2010,15 +2010,13 @@ FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
 	// Load and delete each asset
 	TArray<UObject*> ObjectsToDelete;
 	TArray<FString> NotFound;
-	TArray<FString> Deleted;
 
 	for (const FString& Path : AssetPaths)
 	{
-		UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *Path);
+		UObject* Asset = UEditorAssetLibrary::LoadAsset(Path);
 		if (Asset)
 		{
 			ObjectsToDelete.Add(Asset);
-			Deleted.Add(Path);
 		}
 		else
 		{
@@ -2033,9 +2031,10 @@ FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
 	}
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("success"), NumDeleted == ObjectsToDelete.Num() && NotFound.Num() == 0);
 	Result->SetNumberField(TEXT("deleted"), NumDeleted);
 	Result->SetNumberField(TEXT("requested"), AssetPaths.Num());
+	Result->SetNumberField(TEXT("found"), ObjectsToDelete.Num());
 
 	if (NotFound.Num() > 0)
 	{
