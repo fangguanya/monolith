@@ -1,6 +1,21 @@
 # Monolith — TODO
 
-Last updated: 2026-03-22
+Last updated: 2026-03-25
+
+---
+
+### Material Function Full Suite (2026-03-25)
+
+- [x] **export_function_graph** — Full graph export with connections, properties, switch details (#7)
+- [x] **set_function_metadata** — Update description, categories, library exposure
+- [x] **delete_function_expression** — Remove expression(s) from function
+- [x] **update_material_function** — Recompile cascade to referencing materials
+- [x] **create_function_instance** — Create MFI with parent + optional overrides
+- [x] **set_function_instance_parameter** — Set param overrides on MFI
+- [x] **get_function_instance_info** — Read MFI parent chain + overrides (11 param types)
+- [x] **layout_function_expressions** — Auto-arrange function graph
+- [x] **rename_function_parameter_group** — Rename param group
+- [x] **create_material_function type param** — Support MaterialLayer/MaterialLayerBlend creation
 
 ---
 

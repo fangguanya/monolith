@@ -45,9 +45,26 @@ def test_action(namespace, action, params=None):
 
 ---
 
-## Current Status: ALL 340 ACTIONS PASS
+## Current Status: 340/349 ACTIONS PASS (9 PENDING)
 
-All 10 modules fully tested. Polish pass 2026-03-14 added 4 Niagara actions + get_system_property (213→218). 2026-03-15: HLSL module/function creation tested end-to-end (CPU + GPU), 3 bugs fixed (input exposure, dot validation, numeric index lookup). 2026-03-17: Blueprint module waves 2-7 full test pass (48/48 + 17 retests). 21 bugs found and fixed during testing session. Total actions now 278. 2026-03-17: Material module full test pass (44/44 + 11 retests). 11 bugs found and fixed. 2026-03-18: Niagara module full test pass (37/37 + 8 retests). 16 bugs found and fixed. 2026-03-18: Animation Wave 8-10 full test pass (33/33 + 4 retests). 12 bugs found and fixed. 2026-03-22: MonolithUI module full test pass (42/42). All 8 action classes verified.
+All 10 modules tested. 2026-03-25: 9 new material function actions added (48→57 mat, 340→349 total). Polish pass 2026-03-14 added 4 Niagara actions + get_system_property (213→218). 2026-03-15: HLSL module/function creation tested end-to-end (CPU + GPU), 3 bugs fixed (input exposure, dot validation, numeric index lookup). 2026-03-17: Blueprint module waves 2-7 full test pass (48/48 + 17 retests). 21 bugs found and fixed during testing session. Total actions now 278. 2026-03-17: Material module full test pass (44/44 + 11 retests). 11 bugs found and fixed. 2026-03-18: Niagara module full test pass (37/37 + 8 retests). 16 bugs found and fixed. 2026-03-18: Animation Wave 8-10 full test pass (33/33 + 4 retests). 12 bugs found and fixed. 2026-03-22: MonolithUI module full test pass (42/42). All 8 action classes verified.
+
+---
+
+## Material Function Full Suite (2026-03-25)
+
+| Action | Status | Notes |
+|--------|--------|-------|
+| export_function_graph | PENDING | Needs editor test with real function asset |
+| set_function_metadata | PENDING | |
+| delete_function_expression | PENDING | |
+| update_material_function | PENDING | |
+| create_function_instance | PENDING | |
+| set_function_instance_parameter | PENDING | |
+| get_function_instance_info | PENDING | |
+| layout_function_expressions | PENDING | |
+| rename_function_parameter_group | PENDING | |
+| create_material_function (type param) | PENDING | Test MaterialLayer + MaterialLayerBlend |
 
 ---
 

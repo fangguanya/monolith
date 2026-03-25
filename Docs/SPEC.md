@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 13 MCP tools (340 total actions across 10 domains), cutting AI assistant context consumption by ~95%.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 13 MCP tools (349 total actions across 10 domains), cutting AI assistant context consumption by ~95%.
 
 ### What It Replaces
 
@@ -36,7 +36,7 @@ Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate M
 Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, settings, auto-updater
   MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile (66 actions)
-  MonolithMaterial      — Material inspection + graph editing + CRUD (48 actions)
+  MonolithMaterial      — Material inspection + graph editing + CRUD + function suite (57 actions)
   MonolithAnimation     — Animation sequences, montages, ABPs, curves, notifies, skeletons, PoseSearch (74 actions)
   MonolithNiagara       — Niagara particle systems, HLSL module/function creation (65 actions)
   MonolithEditor        — Build triggers, live compile, log capture, compile output, crash context, scene capture, texture import (19 actions)
@@ -203,10 +203,10 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithMaterialModule` | Registers 48 material actions |
+| `FMonolithMaterialModule` | Registers 57 material actions |
 | `FMonolithMaterialActions` | Static handlers + helpers for loading materials and serializing expressions |
 
-#### Actions (48 — namespace: "material")
+#### Actions (57 — namespace: "material")
 
 **Read Actions (10)**
 | Action | Description |
@@ -240,6 +240,24 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | `import_material_graph` | Import graph from JSON. Mode: "overwrite" (clear+rebuild) or "merge" (offset +500 X) |
 | `begin_transaction` | Begin named undo transaction for batching edits |
 | `end_transaction` | End current undo transaction |
+
+**Material Function Actions (9)**
+| Action | Description |
+|--------|-------------|
+| `export_function_graph` | Full graph export of a material function — nodes, connections, properties, inputs, outputs, static switch details |
+| `set_function_metadata` | Update material function description, categories, and library exposure settings |
+| `delete_function_expression` | Remove expression(s) from a material function graph |
+| `update_material_function` | Recompile a material function and cascade changes to all referencing materials/instances |
+| `create_function_instance` | Create a MaterialFunctionInstance with parent reference and optional parameter overrides |
+| `set_function_instance_parameter` | Set parameter overrides on a MaterialFunctionInstance (supports 11 parameter types) |
+| `get_function_instance_info` | Read MFI parent chain and all parameter overrides (11 types: scalar, vector, texture, font, static switch, static component mask, and more) |
+| `layout_function_expressions` | Auto-arrange material function graph layout |
+| `rename_function_parameter_group` | Rename a parameter group across all parameters in a material function |
+
+**Extended Actions (1)**
+| Action | Change |
+|--------|--------|
+| `create_material_function` | Added `type` parameter — supports `MaterialLayer` and `MaterialLayerBlend` in addition to standard material functions |
 
 ---
 
@@ -855,7 +873,7 @@ python Saved/monolith_offline.py <namespace> <action> [args...]
 | unreal-build | build, compile, Live Coding, hot reload, rebuild | `editor_query()` | 19 |
 | unreal-cpp | C++, header, include, UCLASS, Build.cs, linker error | `source_query()` + `config_query()` | 11+6 |
 | unreal-debugging | build error, crash, log, debug, stack trace | `editor_query()` | 19 |
-| unreal-materials | material, shader, PBR, texture, material graph | `material_query()` | 48 |
+| unreal-materials | material, shader, PBR, texture, material graph | `material_query()` | 57 |
 | unreal-niagara | Niagara, particle, VFX, emitter | `niagara_query()` | 65 |
 | unreal-performance | performance, optimization, FPS, frame time | Cross-domain | config + material + niagara |
 | unreal-project-search | find asset, search project, dependencies | `project_query()` | 5 |
@@ -1019,7 +1037,7 @@ See `TODO.md` for the full list. Key architectural constraints:
 |--------|-----------|---------|
 | MonolithCore | monolith | 4 |
 | MonolithBlueprint | blueprint | 66 |
-| MonolithMaterial | material | 48 |
+| MonolithMaterial | material | 57 |
 | MonolithAnimation | animation | 74 |
 | MonolithNiagara | niagara | 65 |
 | MonolithEditor | editor | 19 |
@@ -1027,6 +1045,6 @@ See `TODO.md` for the full list. Key architectural constraints:
 | MonolithIndex | project | 5 |
 | MonolithSource | source | 11 |
 | MonolithUI | ui | 42 |
-| **Total** | | **340** |
+| **Total** | | **349** |
 
 **Note:** PoseSearch's 5 actions are included in Animation's 74 — they are not additive. The original Python server had higher counts (~231 tools) due to fragmented action design.
