@@ -6,6 +6,7 @@
 #include "MonolithBlueprintCompileActions.h"
 #include "MonolithBlueprintCDOActions.h"
 #include "MonolithBlueprintGraphExportActions.h"
+#include "MonolithBlueprintLayoutActions.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -1470,6 +1471,8 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 		else if (OpName == TEXT("export_graph"))                SubResult = FMonolithBlueprintGraphExportActions::HandleExportGraph(SubParams);
 		else if (OpName == TEXT("copy_nodes"))                  SubResult = FMonolithBlueprintGraphExportActions::HandleCopyNodes(SubParams);
 		else if (OpName == TEXT("duplicate_graph"))             SubResult = FMonolithBlueprintGraphExportActions::HandleDuplicateGraph(SubParams);
+		// Phase 6 layout
+		else if (OpName == TEXT("auto_layout"))                 SubResult = FMonolithBlueprintLayoutActions::HandleAutoLayout(SubParams);
 
 		RO->SetBoolField(TEXT("success"), SubResult.bSuccess);
 		if (!SubResult.bSuccess)
