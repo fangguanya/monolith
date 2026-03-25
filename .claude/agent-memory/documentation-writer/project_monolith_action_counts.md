@@ -1,23 +1,26 @@
 ---
 name: Monolith action counts
-description: Current verified action counts per module — use these when writing docs to avoid stale numbers
+description: Current Monolith action counts per module (349 total as of 2026-03-25). Use when writing or updating any docs that reference action counts.
 type: project
 ---
 
-As of 2026-03-13, Monolith has **217 total actions** across 9 modules:
+As of 2026-03-25, Monolith has **349 total actions** across 10 modules (13 MCP tools):
 
 | Module | Namespace | Actions |
 |--------|-----------|---------|
 | MonolithCore | monolith | 4 |
-| MonolithBlueprint | blueprint | 46 |
-| MonolithMaterial | material | 25 |
-| MonolithAnimation | animation | 62 |
-| MonolithNiagara | niagara | 41 |
-| MonolithEditor | editor | 13 |
+| MonolithBlueprint | blueprint | 66 |
+| MonolithMaterial | material | 57 |
+| MonolithAnimation | animation | 74 |
+| MonolithNiagara | niagara | 65 |
+| MonolithEditor | editor | 19 |
 | MonolithConfig | config | 6 |
 | MonolithIndex | project | 5 |
-| MonolithSource | source | 10 |
+| MonolithSource | source | 11 |
+| MonolithUI | ui | 42 |
 
-Blueprint was upgraded from 6 → 46 actions on 2026-03-13. Previous total was 177.
+Material was upgraded from 48 to 57 actions on 2026-03-25 (Material Function Full Suite: 9 new actions + 1 extended).
 
-The CLAUDE.md project instructions still reference 177 — that needs updating separately.
+**Why:** Action counts appear in CLAUDE.md, SPEC.md (multiple locations), skill files, and agent definitions. Keeping them in sync is critical.
+
+**How to apply:** When any doc update touches action counts, verify against this table. Update this memory when new actions are added.

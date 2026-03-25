@@ -17,8 +17,8 @@ struct FNiagaraParameterStore;
 
 /**
  * Niagara domain action handlers for Monolith.
- * 64 actions across system, module, parameter, renderer, DI, diagnostics, and advanced domains.
- * Waves 1-6 implementation (bug fixes + 17 new actions).
+ * 69 actions across system, module, parameter, renderer, DI, diagnostics, and advanced domains.
+ * Waves 1-6 + Phase 3 dynamic input features (5 new actions).
  * Fixed for UE 5.7 API compatibility.
  */
 class FMonolithNiagaraActions
@@ -125,6 +125,41 @@ public:
 
 	// --- Composite Helpers (1 new) ---
 	static FMonolithActionResult HandleSetSpawnShape(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Phase 3: Dynamic Input Features (5 new) ---
+	static FMonolithActionResult HandleListDynamicInputs(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetDynamicInputTree(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveDynamicInput(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetDynamicInputValue(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetDynamicInputInputs(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Phase 4: Module & Emitter Management (2 new) ---
+	static FMonolithActionResult HandleRenameEmitter(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetEmitterProperty(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Phase 5: Renderer & DI Improvements (4 new) ---
+	static FMonolithActionResult HandleListAvailableRenderers(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetRendererMesh(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleConfigureRibbon(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleConfigureSubUV(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Phase 6B: NPC Support (5 new) ---
+	static FMonolithActionResult HandleCreateNPC(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetNPC(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleAddNPCParameter(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveNPCParameter(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetNPCDefault(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Phase 6B: Effect Type CRUD (3 new) ---
+	static FMonolithActionResult HandleCreateEffectType(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetEffectType(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetEffectTypeProperty(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Phase 6B: Parameter Discovery (1 new) ---
+	static FMonolithActionResult HandleGetAvailableParameters(const TSharedPtr<FJsonObject>& Params);
+
+	// --- Phase 6B: Preview (1 new) ---
+	static FMonolithActionResult HandlePreviewSystem(const TSharedPtr<FJsonObject>& Params);
 
 	// --- Helpers (public for use by free functions) ---
 	static FString SerializeParameterValue(const FNiagaraVariable& Variable, const FNiagaraParameterStore& Store);

@@ -29,4 +29,7 @@ private:
 	TUniquePtr<FMonolithHttpServer> HttpServer;
 
 	void RegisterCoreTools();
+	void WriteSentinelFile(int32 Port);
+	void RemoveSentinelFile();
+	FString GetSentinelFilePath() const;
 };
