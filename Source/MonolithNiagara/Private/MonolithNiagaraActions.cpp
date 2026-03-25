@@ -1782,6 +1782,80 @@ void FMonolithNiagaraActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("start_frame"), TEXT("number"), TEXT("Start frame for animation"))
 			.Optional(TEXT("end_frame"), TEXT("number"), TEXT("End frame for animation"))
 			.Build());
+
+	// --- Phase 6B: NPC Support (5 new) ---
+	Registry.RegisterAction(TEXT("niagara"), TEXT("create_npc"), TEXT("Create a Niagara Parameter Collection (NPC) asset"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateNPC),
+		FParamSchemaBuilder()
+			.Required(TEXT("save_path"), TEXT("string"), TEXT("Path to save the NPC (e.g. /Game/VFX/NPC_Global)"))
+			.Required(TEXT("namespace"), TEXT("string"), TEXT("FName namespace for the collection"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_npc"), TEXT("Read all parameters and defaults from a Niagara Parameter Collection"),
+		FMonolithActionHandler::CreateStatic(&HandleGetNPC),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("NPC asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("add_npc_parameter"), TEXT("Add a parameter to a Niagara Parameter Collection"),
+		FMonolithActionHandler::CreateStatic(&HandleAddNPCParameter),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("NPC asset path"))
+			.Required(TEXT("name"), TEXT("string"), TEXT("Parameter name"))
+			.Required(TEXT("type"), TEXT("string"), TEXT("Parameter type (float, int, bool, vec2, vec3, vec4, color, position)"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("remove_npc_parameter"), TEXT("Remove a parameter from a Niagara Parameter Collection"),
+		FMonolithActionHandler::CreateStatic(&HandleRemoveNPCParameter),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("NPC asset path"))
+			.Required(TEXT("name"), TEXT("string"), TEXT("Parameter name to remove"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_npc_default"), TEXT("Set the default value for a parameter in a Niagara Parameter Collection"),
+		FMonolithActionHandler::CreateStatic(&HandleSetNPCDefault),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("NPC asset path"))
+			.Required(TEXT("name"), TEXT("string"), TEXT("Parameter name"))
+			.Required(TEXT("value"), TEXT("any"), TEXT("Default value (number, bool, or {x,y,z}/{r,g,b,a} object)"))
+			.Build());
+
+	// --- Phase 6B: Effect Type CRUD (3 new) ---
+	Registry.RegisterAction(TEXT("niagara"), TEXT("create_effect_type"), TEXT("Create a UNiagaraEffectType asset with optional initial settings"),
+		FMonolithActionHandler::CreateStatic(&HandleCreateEffectType),
+		FParamSchemaBuilder()
+			.Required(TEXT("save_path"), TEXT("string"), TEXT("Path to save the effect type (e.g. /Game/VFX/ET_Ambient)"))
+			.Optional(TEXT("cull_reaction"), TEXT("string"), TEXT("Deactivate, DeactivateImmediate, DeactivateResume, PauseResume (default: Deactivate)"))
+			.Optional(TEXT("update_frequency"), TEXT("string"), TEXT("Continuous, Low, Medium, High (default: Continuous)"))
+			.Optional(TEXT("max_distance"), TEXT("number"), TEXT("Significance max distance (default: 0 = no limit)"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_effect_type"), TEXT("Read all settings from a UNiagaraEffectType asset"),
+		FMonolithActionHandler::CreateStatic(&HandleGetEffectType),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Effect type asset path"))
+			.Build());
+	Registry.RegisterAction(TEXT("niagara"), TEXT("set_effect_type_property"), TEXT("Set a property on a UNiagaraEffectType via reflection"),
+		FMonolithActionHandler::CreateStatic(&HandleSetEffectTypeProperty),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Effect type asset path"))
+			.Required(TEXT("property"), TEXT("string"), TEXT("Property name (CullReaction, UpdateFrequency, SignificanceHandler, etc.)"))
+			.Required(TEXT("value"), TEXT("any"), TEXT("Property value"))
+			.Build());
+
+	// --- Phase 6B: Parameter Discovery (1 new) ---
+	Registry.RegisterAction(TEXT("niagara"), TEXT("get_available_parameters"), TEXT("List all parameters available for binding in a system (user, engine, particle, emitter, system attributes)"),
+		FMonolithActionHandler::CreateStatic(&HandleGetAvailableParameters),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Niagara system asset path"))
+			.Optional(TEXT("emitter"), TEXT("string"), TEXT("Emitter name (to include particle/emitter-scoped attributes)"))
+			.Optional(TEXT("usage"), TEXT("string"), TEXT("Filter by context: user, engine, particle, emitter, system, or all (default: all)"))
+			.Build());
+
+	// --- Phase 6B: Preview (1 new) ---
+	Registry.RegisterAction(TEXT("niagara"), TEXT("preview_system"), TEXT("Capture a preview screenshot of a Niagara system via editor preview scene"),
+		FMonolithActionHandler::CreateStatic(&HandlePreviewSystem),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Niagara system asset path"))
+			.Optional(TEXT("seek_time"), TEXT("number"), TEXT("Simulation time to seek to before capture (default: 1.0)"))
+			.Optional(TEXT("resolution"), TEXT("string"), TEXT("Resolution as WxH string (default: 512x512)"))
+			.Optional(TEXT("output_path"), TEXT("string"), TEXT("Absolute output file path (default: auto-generated in Saved/Screenshots/Monolith)"))
+			.Build());
 }
 
 // ============================================================================
@@ -4775,6 +4849,20 @@ FMonolithActionResult FMonolithNiagaraActions::HandleBatchExecute(const TSharedP
 		else if (OpName == TEXT("set_renderer_mesh")) SubResult = HandleSetRendererMesh(SubParams);
 		else if (OpName == TEXT("configure_ribbon")) SubResult = HandleConfigureRibbon(SubParams);
 		else if (OpName == TEXT("configure_subuv")) SubResult = HandleConfigureSubUV(SubParams);
+		// Phase 6B: NPC Support
+		else if (OpName == TEXT("create_npc")) SubResult = HandleCreateNPC(SubParams);
+		else if (OpName == TEXT("get_npc")) SubResult = HandleGetNPC(SubParams);
+		else if (OpName == TEXT("add_npc_parameter")) SubResult = HandleAddNPCParameter(SubParams);
+		else if (OpName == TEXT("remove_npc_parameter")) SubResult = HandleRemoveNPCParameter(SubParams);
+		else if (OpName == TEXT("set_npc_default")) SubResult = HandleSetNPCDefault(SubParams);
+		// Phase 6B: Effect Type CRUD
+		else if (OpName == TEXT("create_effect_type")) SubResult = HandleCreateEffectType(SubParams);
+		else if (OpName == TEXT("get_effect_type")) SubResult = HandleGetEffectType(SubParams);
+		else if (OpName == TEXT("set_effect_type_property")) SubResult = HandleSetEffectTypeProperty(SubParams);
+		// Phase 6B: Parameter Discovery
+		else if (OpName == TEXT("get_available_parameters")) SubResult = HandleGetAvailableParameters(SubParams);
+		// Phase 6B: Preview
+		else if (OpName == TEXT("preview_system")) SubResult = HandlePreviewSystem(SubParams);
 		// Read operations (14)
 		else if (OpName == TEXT("get_ordered_modules")) SubResult = HandleGetOrderedModules(SubParams);
 		else if (OpName == TEXT("get_all_parameters")) SubResult = HandleGetAllParameters(SubParams);

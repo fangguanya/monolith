@@ -143,6 +143,15 @@ public:
 	static FMonolithActionResult HandleConfigureRibbon(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleConfigureSubUV(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Phase 6A: Event Handlers, Simulation Stages, Module Outputs (7 new) ---
+	static FMonolithActionResult HandleGetEventHandlers(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetEventHandlerProperty(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveEventHandler(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetSimulationStages(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetSimulationStageProperty(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleRemoveSimulationStage(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetModuleOutputParameters(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Phase 6B: NPC Support (5 new) ---
 	static FMonolithActionResult HandleCreateNPC(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleGetNPC(const TSharedPtr<FJsonObject>& Params);
