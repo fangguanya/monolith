@@ -6,6 +6,11 @@
 #include "MonolithBlueprintNodeActions.h"
 #include "MonolithBlueprintCompileActions.h"
 #include "MonolithBlueprintCDOActions.h"
+#include "MonolithBlueprintStructActions.h"
+#include "MonolithBlueprintBuildActions.h"
+#include "MonolithBlueprintDiffActions.h"
+#include "MonolithBlueprintTemplateActions.h"
+#include "MonolithBlueprintGraphExportActions.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
@@ -24,7 +29,12 @@ void FMonolithBlueprintModule::StartupModule()
 	FMonolithBlueprintNodeActions::RegisterActions(Registry);
 	FMonolithBlueprintCompileActions::RegisterActions(Registry);
 	FMonolithBlueprintCDOActions::RegisterActions(Registry);
-	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (47 actions)"));
+	FMonolithBlueprintStructActions::RegisterActions(Registry);
+	FMonolithBlueprintBuildActions::RegisterActions(Registry);
+	FMonolithBlueprintDiffActions::RegisterActions(Registry);
+	FMonolithBlueprintTemplateActions::RegisterActions(Registry);
+	FMonolithBlueprintGraphExportActions::RegisterActions(Registry);
+	UE_LOG(LogMonolith, Log, TEXT("Monolith — Blueprint module loaded (85 actions)"));
 }
 
 void FMonolithBlueprintModule::ShutdownModule()

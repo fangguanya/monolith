@@ -27,6 +27,8 @@ void FMonolithBlueprintGraphActions::RegisterActions(FMonolithToolRegistry& Regi
 			.Optional(TEXT("category"), TEXT("string"), TEXT("Function category"))
 			.Optional(TEXT("description"), TEXT("string"), TEXT("Function tooltip/description"))
 			.Optional(TEXT("access"), TEXT("string"), TEXT("Access specifier: Public, Protected, or Private"), TEXT("Public"))
+			.Optional(TEXT("replication"), TEXT("string"), TEXT("Replication mode: none, multicast, server, client (default: none)"))
+			.Optional(TEXT("reliable"), TEXT("bool"), TEXT("Use reliable replication (default: false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("remove_function"),
@@ -211,6 +213,27 @@ FMonolithActionResult FMonolithBlueprintGraphActions::HandleAddFunction(const TS
 		ExtraFlags &= ~(FUNC_Protected | FUNC_Private); // clear existing
 		if (Access == TEXT("Protected"))      ExtraFlags |= FUNC_Protected;
 		else if (Access == TEXT("Private"))   ExtraFlags |= FUNC_Private;
+
+		// RPC / Multicast replication flags (Phase 5A)
+		FString Replication;
+		if (Params->TryGetStringField(TEXT("replication"), Replication) && !Replication.IsEmpty() && Replication != TEXT("none"))
+		{
+			const uint32 FlagsToClear = FUNC_Net | FUNC_NetMulticast | FUNC_NetServer | FUNC_NetClient;
+			ExtraFlags &= ~FlagsToClear;
+
+			uint32 NetFlag = 0;
+			FString Lower = Replication.ToLower();
+			if (Lower == TEXT("multicast"))      NetFlag = FUNC_NetMulticast;
+			else if (Lower == TEXT("server"))    NetFlag = FUNC_NetServer;
+			else if (Lower == TEXT("client"))    NetFlag = FUNC_NetClient;
+
+			if (NetFlag != 0)
+				ExtraFlags |= (FUNC_Net | NetFlag);
+		}
+
+		bool bReliable = false;
+		if (Params->TryGetBoolField(TEXT("reliable"), bReliable) && bReliable)
+			ExtraFlags |= FUNC_NetReliable;
 
 		EntryNode->SetExtraFlags(ExtraFlags);
 		EntryNode->MetaData.bCallInEditor = bCallInEditor;

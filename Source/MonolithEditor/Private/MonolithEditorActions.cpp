@@ -1,6 +1,7 @@
 #include "MonolithEditorActions.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
+#include "EditorAssetLibrary.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Misc/OutputDeviceRedirector.h"

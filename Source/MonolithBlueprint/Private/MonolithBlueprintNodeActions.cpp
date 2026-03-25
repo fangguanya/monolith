@@ -4,6 +4,8 @@
 #include "MonolithBlueprintComponentActions.h"
 #include "MonolithBlueprintGraphActions.h"
 #include "MonolithBlueprintCompileActions.h"
+#include "MonolithBlueprintCDOActions.h"
+#include "MonolithBlueprintGraphExportActions.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -20,9 +22,20 @@
 #include "K2Node_Event.h"
 #include "K2Node_Self.h"
 #include "K2Node_FunctionResult.h"
+#include "K2Node_MakeStruct.h"
+#include "K2Node_BreakStruct.h"
+#include "K2Node_SwitchEnum.h"
+#include "K2Node_SwitchInteger.h"
+#include "K2Node_SwitchString.h"
+#include "K2Node_FormatText.h"
+#include "K2Node_MakeArray.h"
+#include "K2Node_Select.h"
 #include "EdGraphNode_Comment.h"
 #include "EdGraphSchema_K2.h"
 #include "Engine/TimelineTemplate.h"
+#include "Curves/CurveFloat.h"
+#include "Curves/CurveVector.h"
+#include "Curves/CurveLinearColor.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Editor.h"
@@ -87,6 +100,26 @@ static const TMap<FString, FNodeAlias>& GetNodeAliases()
 		Aliases.Add(TEXT("return"),         {TEXT("Return"), {}});
 		Aliases.Add(TEXT("function_result"), {TEXT("Return"), {}});
 
+		// --- Phase 2A: Struct/Switch/Utility node aliases ---
+		Aliases.Add(TEXT("make_struct"),       {TEXT("MakeStruct"), {}});
+		Aliases.Add(TEXT("makestruct"),        {TEXT("MakeStruct"), {}});
+		Aliases.Add(TEXT("break_struct"),      {TEXT("BreakStruct"), {}});
+		Aliases.Add(TEXT("breakstruct"),       {TEXT("BreakStruct"), {}});
+		Aliases.Add(TEXT("switch_enum"),       {TEXT("SwitchOnEnum"), {}});
+		Aliases.Add(TEXT("switchonenum"),      {TEXT("SwitchOnEnum"), {}});
+		Aliases.Add(TEXT("switch_on_enum"),    {TEXT("SwitchOnEnum"), {}});
+		Aliases.Add(TEXT("switch_int"),        {TEXT("SwitchOnInt"), {}});
+		Aliases.Add(TEXT("switchonint"),       {TEXT("SwitchOnInt"), {}});
+		Aliases.Add(TEXT("switch_on_int"),     {TEXT("SwitchOnInt"), {}});
+		Aliases.Add(TEXT("switch_string"),     {TEXT("SwitchOnString"), {}});
+		Aliases.Add(TEXT("switchonstring"),    {TEXT("SwitchOnString"), {}});
+		Aliases.Add(TEXT("switch_on_string"),  {TEXT("SwitchOnString"), {}});
+		Aliases.Add(TEXT("format_text"),       {TEXT("FormatText"), {}});
+		Aliases.Add(TEXT("formattext"),        {TEXT("FormatText"), {}});
+		Aliases.Add(TEXT("make_array"),        {TEXT("MakeArray"), {}});
+		Aliases.Add(TEXT("makearray"),         {TEXT("MakeArray"), {}});
+		Aliases.Add(TEXT("select"),            {TEXT("Select"), {}});
+
 		// --- Phase 1A: Macro shorthand aliases ---
 		const FString StandardMacros = TEXT("/Engine/EditorBlueprintResources/StandardMacros");
 
@@ -139,11 +172,11 @@ bool MonolithBlueprintInternal::HasCustomEventNamed(UBlueprint* BP, FName EventN
 void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_node"),
-		TEXT("Add a new node to a Blueprint graph. Supports CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return node types. Also supports shorthand aliases: ForEachLoop, ForLoop, ForLoopWithBreak, DoOnce, FlipFlop, Gate (macro shortcuts), IsValid, Delay, RetriggerableDelay (function shortcuts)."),
+		TEXT("Add a new node to a Blueprint graph. Supports CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return, MakeStruct, BreakStruct, SwitchOnEnum, SwitchOnInt, SwitchOnString, FormatText, MakeArray, Select node types. Also supports shorthand aliases: ForEachLoop, ForLoop, ForLoopWithBreak, DoOnce, FlipFlop, Gate (macro shortcuts), IsValid, Delay, RetriggerableDelay (function shortcuts), make_struct, break_struct, switch_enum, switch_int, switch_string, format_text, make_array, select."),
 		FMonolithActionHandler::CreateStatic(&HandleAddNode),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"),       TEXT("string"),  TEXT("Blueprint asset path"))
-			.Required(TEXT("node_type"),         TEXT("string"),  TEXT("Node type: CallFunction (or 'function'/'call'), VariableGet (or 'get'), VariableSet (or 'set'), CustomEvent (or 'event'), Branch (or 'if'), Sequence, MacroInstance (or 'macro'), SpawnActorFromClass (or 'spawn'), DynamicCast (or 'cast'), Self, Return. Shortcuts: ForEachLoop, ForLoop, DoOnce, FlipFlop, Gate, IsValid, Delay, RetriggerableDelay"))
+			.Required(TEXT("node_type"),         TEXT("string"),  TEXT("Node type: CallFunction (or 'function'/'call'), VariableGet (or 'get'), VariableSet (or 'set'), CustomEvent (or 'event'), Branch (or 'if'), Sequence, MacroInstance (or 'macro'), SpawnActorFromClass (or 'spawn'), DynamicCast (or 'cast'), Self, Return, MakeStruct (or 'make_struct'), BreakStruct (or 'break_struct'), SwitchOnEnum (or 'switch_enum'), SwitchOnInt (or 'switch_int'), SwitchOnString (or 'switch_string'), FormatText (or 'format_text'), MakeArray (or 'make_array'), Select. Shortcuts: ForEachLoop, ForLoop, DoOnce, FlipFlop, Gate, IsValid, Delay, RetriggerableDelay"))
 			.Optional(TEXT("graph_name"),        TEXT("string"),  TEXT("Graph name (defaults to EventGraph)"))
 			.Optional(TEXT("position"),          TEXT("array"),   TEXT("Node position as [x, y] (default: [0, 0])"))
 			.Optional(TEXT("function_name"),     TEXT("string"),  TEXT("Function name for CallFunction nodes (e.g. PrintString)"))
@@ -154,6 +187,12 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("macro_blueprint"),   TEXT("string"),  TEXT("Blueprint asset path containing the macro (optional for MacroInstance)"))
 			.Optional(TEXT("cast_class"),        TEXT("string"),  TEXT("Class name for DynamicCast nodes (e.g. 'MyPawn'). Accepts A/U prefix or bare name."))
 			.Optional(TEXT("actor_class"),       TEXT("string"),  TEXT("Actor class name for SpawnActorFromClass nodes"))
+			.Optional(TEXT("struct_type"),       TEXT("string"),  TEXT("Struct type for MakeStruct/BreakStruct nodes (e.g. 'Vector', 'Transform', 'FHitResult'). Accepts F prefix or bare name."))
+			.Optional(TEXT("enum_type"),         TEXT("string"),  TEXT("Enum type for SwitchOnEnum nodes (e.g. 'ECollisionChannel'). Accepts E prefix or bare name."))
+			.Optional(TEXT("format"),            TEXT("string"),  TEXT("Format string for FormatText nodes (e.g. 'Hello {Name}, you have {Count} items'). Argument pins are auto-created from {ArgName} patterns."))
+			.Optional(TEXT("num_entries"),        TEXT("integer"), TEXT("Number of input entries for MakeArray nodes (default: 1)"))
+			.Optional(TEXT("replication"),        TEXT("string"),  TEXT("Replication mode for CustomEvent nodes: none, multicast, server, client (default: none)"))
+			.Optional(TEXT("reliable"),           TEXT("bool"),    TEXT("Use reliable replication for CustomEvent nodes (default: false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("remove_node"),
@@ -218,6 +257,8 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("function_name"), TEXT("string"), TEXT("Function name for CallFunction nodes"))
 			.Optional(TEXT("target_class"),  TEXT("string"), TEXT("Class to search for the function (optional for CallFunction)"))
 			.Optional(TEXT("variable_name"), TEXT("string"), TEXT("Variable name hint for VariableGet/VariableSet (uses wildcard if omitted)"))
+			.Optional(TEXT("replication"),   TEXT("string"), TEXT("Replication mode for CustomEvent: none, multicast, server, client"))
+			.Optional(TEXT("reliable"),      TEXT("bool"),   TEXT("Use reliable replication for CustomEvent"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("batch_execute"),
@@ -282,6 +323,8 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Required(TEXT("event_name"),  TEXT("string"), TEXT("Event name: BeginPlay, Tick, EndPlay, BeginOverlap, EndOverlap, Hit, Destroyed, AnyDamage, PointDamage, RadialDamage, or a custom event name"))
 			.Optional(TEXT("graph_name"),  TEXT("string"), TEXT("Event graph name (defaults to EventGraph)"))
 			.Optional(TEXT("position"),    TEXT("array"),  TEXT("Node position as [x, y] (default: [0, 0])"))
+			.Optional(TEXT("replication"), TEXT("string"), TEXT("Replication mode for custom events: none, multicast, server, client (default: none). Ignored for native override events."))
+			.Optional(TEXT("reliable"),    TEXT("bool"),   TEXT("Use reliable replication for custom events (default: false). Ignored for native override events."))
 			.Build());
 
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_comment_node"),
@@ -297,6 +340,39 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("position"),    TEXT("array"),   TEXT("Node position as [x, y] — overridden if node_ids provided"))
 			.Optional(TEXT("width"),       TEXT("integer"), TEXT("Comment box width — overridden if node_ids provided"))
 			.Optional(TEXT("height"),      TEXT("integer"), TEXT("Comment box height — overridden if node_ids provided"))
+			.Build());
+
+	// ---- Phase 3A: Timeline read/edit ----
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("get_timeline_data"),
+		TEXT("Read timeline data from a Blueprint. Returns all UTimelineTemplates with their tracks, keys, and settings. "
+		     "Float/vector/color tracks include full keyframe data (time, value, interp_mode). Event tracks include key times."),
+		FMonolithActionHandler::CreateStatic(&HandleGetTimelineData),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),     TEXT("string"), TEXT("Blueprint asset path"))
+			.Optional(TEXT("timeline_name"),  TEXT("string"), TEXT("Timeline name to query (returns all timelines if omitted)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_timeline_track"),
+		TEXT("Add a track to an existing timeline. Supports float, vector, event, and color track types. "
+		     "Creates the backing curve object (UCurveFloat/UCurveVector/UCurveLinearColor) automatically."),
+		FMonolithActionHandler::CreateStatic(&HandleAddTimelineTrack),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),     TEXT("string"), TEXT("Blueprint asset path"))
+			.Required(TEXT("timeline_name"),  TEXT("string"), TEXT("Name of the existing timeline"))
+			.Required(TEXT("track_name"),     TEXT("string"), TEXT("Name for the new track"))
+			.Optional(TEXT("track_type"),     TEXT("string"), TEXT("Track type: float (default), vector, event, or color"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("set_timeline_keys"),
+		TEXT("Set keyframes on a timeline float track's curve. Replaces all existing keys. "
+		     "Each key: {time, value, interp_mode?}. interp_mode: linear (default), constant, or cubic."),
+		FMonolithActionHandler::CreateStatic(&HandleSetTimelineKeys),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"),     TEXT("string"), TEXT("Blueprint asset path"))
+			.Required(TEXT("timeline_name"),  TEXT("string"), TEXT("Name of the timeline"))
+			.Required(TEXT("track_name"),     TEXT("string"), TEXT("Name of the float track"))
+			.Required(TEXT("keys"),           TEXT("array"),  TEXT("Array of keyframes: [{time, value, interp_mode?}]. interp_mode: linear|constant|cubic"))
 			.Build());
 
 	// ---- Wave 7 ----
@@ -371,6 +447,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 	}
 
 	UEdGraphNode* NewNode = nullptr;
+	bool bGenericFallback = false;
 
 	// ---- CallFunction ----
 	if (NodeType == TEXT("CallFunction"))
@@ -499,6 +576,40 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 		EventNode->NodePosY = PosY;
 		Graph->AddNode(EventNode, true, false);
 		EventNode->AllocateDefaultPins();
+
+		// RPC / Multicast replication flags (Phase 5A)
+		bool bNetFlagsChanged = false;
+		FString Replication;
+		if (Params->TryGetStringField(TEXT("replication"), Replication) && !Replication.IsEmpty() && Replication != TEXT("none"))
+		{
+			const uint32 FlagsToClear = FUNC_Net | FUNC_NetMulticast | FUNC_NetServer | FUNC_NetClient;
+			EventNode->FunctionFlags &= ~FlagsToClear;
+
+			uint32 NetFlag = 0;
+			FString RepLower = Replication.ToLower();
+			if (RepLower == TEXT("multicast"))      NetFlag = FUNC_NetMulticast;
+			else if (RepLower == TEXT("server"))    NetFlag = FUNC_NetServer;
+			else if (RepLower == TEXT("client"))    NetFlag = FUNC_NetClient;
+
+			if (NetFlag != 0)
+			{
+				EventNode->FunctionFlags |= (FUNC_Net | NetFlag);
+				bNetFlagsChanged = true;
+			}
+		}
+
+		bool bReliable = false;
+		if (Params->TryGetBoolField(TEXT("reliable"), bReliable) && bReliable)
+		{
+			EventNode->FunctionFlags |= FUNC_NetReliable;
+			bNetFlagsChanged = true;
+		}
+
+		if (bNetFlagsChanged)
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+		}
+
 		NewNode = EventNode;
 	}
 	// ---- Branch ----
@@ -642,6 +753,156 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 		CastNode->AllocateDefaultPins();
 		NewNode = CastNode;
 	}
+	// ---- MakeStruct ----
+	else if (NodeType == TEXT("MakeStruct"))
+	{
+		FString StructType = Params->GetStringField(TEXT("struct_type"));
+		if (StructType.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("MakeStruct node requires 'struct_type' (e.g. struct_type=Vector)"));
+		}
+
+		UScriptStruct* FoundStruct = FindFirstObject<UScriptStruct>(*StructType, EFindFirstObjectOptions::NativeFirst);
+		if (!FoundStruct && !StructType.StartsWith(TEXT("F")))
+			FoundStruct = FindFirstObject<UScriptStruct>(*FString::Printf(TEXT("F%s"), *StructType), EFindFirstObjectOptions::NativeFirst);
+		if (!FoundStruct)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Struct not found for MakeStruct: '%s' (also tried 'F%s')"), *StructType, *StructType));
+		}
+
+		UK2Node_MakeStruct* StructNode = NewObject<UK2Node_MakeStruct>(Graph);
+		StructNode->StructType = FoundStruct;
+		StructNode->NodePosX = PosX;
+		StructNode->NodePosY = PosY;
+		Graph->AddNode(StructNode, true, false);
+		StructNode->AllocateDefaultPins();
+		NewNode = StructNode;
+	}
+	// ---- BreakStruct ----
+	else if (NodeType == TEXT("BreakStruct"))
+	{
+		FString StructType = Params->GetStringField(TEXT("struct_type"));
+		if (StructType.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("BreakStruct node requires 'struct_type' (e.g. struct_type=Vector)"));
+		}
+
+		UScriptStruct* FoundStruct = FindFirstObject<UScriptStruct>(*StructType, EFindFirstObjectOptions::NativeFirst);
+		if (!FoundStruct && !StructType.StartsWith(TEXT("F")))
+			FoundStruct = FindFirstObject<UScriptStruct>(*FString::Printf(TEXT("F%s"), *StructType), EFindFirstObjectOptions::NativeFirst);
+		if (!FoundStruct)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Struct not found for BreakStruct: '%s' (also tried 'F%s')"), *StructType, *StructType));
+		}
+
+		UK2Node_BreakStruct* BreakNode = NewObject<UK2Node_BreakStruct>(Graph);
+		BreakNode->StructType = FoundStruct;
+		BreakNode->NodePosX = PosX;
+		BreakNode->NodePosY = PosY;
+		Graph->AddNode(BreakNode, true, false);
+		BreakNode->AllocateDefaultPins();
+		NewNode = BreakNode;
+	}
+	// ---- SwitchOnEnum ----
+	else if (NodeType == TEXT("SwitchOnEnum"))
+	{
+		FString EnumType = Params->GetStringField(TEXT("enum_type"));
+		if (EnumType.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("SwitchOnEnum node requires 'enum_type' (e.g. enum_type=ECollisionChannel)"));
+		}
+
+		UEnum* FoundEnum = FindFirstObject<UEnum>(*EnumType, EFindFirstObjectOptions::NativeFirst);
+		if (!FoundEnum && !EnumType.StartsWith(TEXT("E")))
+			FoundEnum = FindFirstObject<UEnum>(*FString::Printf(TEXT("E%s"), *EnumType), EFindFirstObjectOptions::NativeFirst);
+		if (!FoundEnum)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Enum not found for SwitchOnEnum: '%s' (also tried 'E%s')"), *EnumType, *EnumType));
+		}
+
+		UK2Node_SwitchEnum* SwitchNode = NewObject<UK2Node_SwitchEnum>(Graph);
+		SwitchNode->SetEnum(FoundEnum);
+		SwitchNode->NodePosX = PosX;
+		SwitchNode->NodePosY = PosY;
+		Graph->AddNode(SwitchNode, true, false);
+		SwitchNode->AllocateDefaultPins();
+		NewNode = SwitchNode;
+	}
+	// ---- SwitchOnInt ----
+	else if (NodeType == TEXT("SwitchOnInt"))
+	{
+		UK2Node_SwitchInteger* SwitchNode = NewObject<UK2Node_SwitchInteger>(Graph);
+		SwitchNode->NodePosX = PosX;
+		SwitchNode->NodePosY = PosY;
+		Graph->AddNode(SwitchNode, true, false);
+		SwitchNode->AllocateDefaultPins();
+		NewNode = SwitchNode;
+	}
+	// ---- SwitchOnString ----
+	else if (NodeType == TEXT("SwitchOnString"))
+	{
+		UK2Node_SwitchString* SwitchNode = NewObject<UK2Node_SwitchString>(Graph);
+		SwitchNode->NodePosX = PosX;
+		SwitchNode->NodePosY = PosY;
+		Graph->AddNode(SwitchNode, true, false);
+		SwitchNode->AllocateDefaultPins();
+		NewNode = SwitchNode;
+	}
+	// ---- FormatText ----
+	else if (NodeType == TEXT("FormatText"))
+	{
+		UK2Node_FormatText* FormatNode = NewObject<UK2Node_FormatText>(Graph);
+		FormatNode->NodePosX = PosX;
+		FormatNode->NodePosY = PosY;
+		Graph->AddNode(FormatNode, true, false);
+		FormatNode->AllocateDefaultPins();
+
+		FString FormatStr = Params->GetStringField(TEXT("format"));
+		if (!FormatStr.IsEmpty())
+		{
+			UEdGraphPin* FormatPin = FormatNode->GetFormatPin();
+			if (FormatPin)
+			{
+				FormatPin->DefaultTextValue = FText::FromString(FormatStr);
+				FormatNode->PinDefaultValueChanged(FormatPin);
+			}
+		}
+		NewNode = FormatNode;
+	}
+	// ---- MakeArray ----
+	else if (NodeType == TEXT("MakeArray"))
+	{
+		UK2Node_MakeArray* ArrayNode = NewObject<UK2Node_MakeArray>(Graph);
+		ArrayNode->NodePosX = PosX;
+		ArrayNode->NodePosY = PosY;
+		Graph->AddNode(ArrayNode, true, false);
+		ArrayNode->AllocateDefaultPins();
+
+		int32 NumEntries = 1;
+		if (Params->HasField(TEXT("num_entries")))
+		{
+			NumEntries = FMath::Max(1, (int32)Params->GetNumberField(TEXT("num_entries")));
+		}
+		// AllocateDefaultPins creates 1 input by default, add extras
+		for (int32 i = 1; i < NumEntries; ++i)
+		{
+			ArrayNode->AddInputPin();
+		}
+		NewNode = ArrayNode;
+	}
+	// ---- Select ----
+	else if (NodeType == TEXT("Select"))
+	{
+		UK2Node_Select* SelectNode = NewObject<UK2Node_Select>(Graph);
+		SelectNode->NodePosX = PosX;
+		SelectNode->NodePosY = PosY;
+		Graph->AddNode(SelectNode, true, false);
+		SelectNode->AllocateDefaultPins();
+		NewNode = SelectNode;
+	}
 	// ---- Self ----
 	else if (NodeType == TEXT("Self"))
 	{
@@ -678,8 +939,33 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 	}
 	else
 	{
-		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Unknown node_type: '%s'. Valid types: CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return"), *NodeType));
+		// Generic K2Node fallback — try to find any UK2Node subclass by name
+		FString ClassName = FString::Printf(TEXT("UK2Node_%s"), *NodeType);
+		UClass* NodeClass = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::NativeFirst);
+		if (!NodeClass)
+		{
+			// Try exact name (caller may have included the UK2Node_ prefix)
+			NodeClass = FindFirstObject<UClass>(*NodeType, EFindFirstObjectOptions::NativeFirst);
+		}
+
+		if (NodeClass && NodeClass->IsChildOf(UK2Node::StaticClass()))
+		{
+			UK2Node* GenericNode = NewObject<UK2Node>(Graph, NodeClass);
+			GenericNode->NodePosX = PosX;
+			GenericNode->NodePosY = PosY;
+			Graph->AddNode(GenericNode, true, false);
+			GenericNode->AllocateDefaultPins();
+			NewNode = GenericNode;
+
+			// Flag so we can add a warning to the response
+			bGenericFallback = true;
+		}
+		else
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unknown node_type '%s'. Supported types: CallFunction, VariableGet, VariableSet, CustomEvent, Branch, Sequence, MacroInstance, SpawnActorFromClass, DynamicCast, Self, Return, MakeStruct, BreakStruct, SwitchOnEnum, SwitchOnInt, SwitchOnString, FormatText, MakeArray, Select. Also accepts any UK2Node_ class name as generic fallback."),
+				*NodeType));
+		}
 	}
 
 	if (!NewNode)
@@ -692,6 +978,11 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 	TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(NewNode);
 	Root->SetStringField(TEXT("asset_path"), AssetPath);
 	Root->SetStringField(TEXT("graph"), Graph->GetName());
+	if (bGenericFallback)
+	{
+		Root->SetStringField(TEXT("warning"),
+			TEXT("Created via generic K2Node fallback — node may require additional configuration via set_pin_default or dedicated handler"));
+	}
 	return FMonolithActionResult::Success(Root);
 }
 
@@ -1169,6 +1460,16 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 		else if (OpName == TEXT("save_asset"))                 SubResult = FMonolithBlueprintCompileActions::HandleSaveAsset(SubParams);
 		else if (OpName == TEXT("remove_macro"))               SubResult = FMonolithBlueprintGraphActions::HandleRemoveMacro(SubParams);
 		else if (OpName == TEXT("rename_macro"))               SubResult = FMonolithBlueprintGraphActions::HandleRenameMacro(SubParams);
+		// CDO ops
+		else if (OpName == TEXT("set_cdo_property"))           SubResult = FMonolithBlueprintCDOActions::HandleSetCDOProperty(SubParams);
+		// Phase 3A timeline read/edit
+		else if (OpName == TEXT("get_timeline_data"))           SubResult = HandleGetTimelineData(SubParams);
+		else if (OpName == TEXT("add_timeline_track"))          SubResult = HandleAddTimelineTrack(SubParams);
+		else if (OpName == TEXT("set_timeline_keys"))           SubResult = HandleSetTimelineKeys(SubParams);
+		// Phase 5C graph export/copy
+		else if (OpName == TEXT("export_graph"))                SubResult = FMonolithBlueprintGraphExportActions::HandleExportGraph(SubParams);
+		else if (OpName == TEXT("copy_nodes"))                  SubResult = FMonolithBlueprintGraphExportActions::HandleCopyNodes(SubParams);
+		else if (OpName == TEXT("duplicate_graph"))             SubResult = FMonolithBlueprintGraphExportActions::HandleDuplicateGraph(SubParams);
 
 		RO->SetBoolField(TEXT("success"), SubResult.bSuccess);
 		if (!SubResult.bSuccess)
@@ -1356,6 +1657,28 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 		if (EventName.IsEmpty()) EventName = TEXT("MyEvent");
 		EventNode->CustomFunctionName = FName(*EventName);
 		EventNode->AllocateDefaultPins();
+
+		// Apply replication flags for resolve preview (Phase 5A)
+		FString Replication;
+		if (Params->TryGetStringField(TEXT("replication"), Replication) && !Replication.IsEmpty() && Replication != TEXT("none"))
+		{
+			const uint32 FlagsToClear = FUNC_Net | FUNC_NetMulticast | FUNC_NetServer | FUNC_NetClient;
+			EventNode->FunctionFlags &= ~FlagsToClear;
+
+			uint32 NetFlag = 0;
+			FString RepLower = Replication.ToLower();
+			if (RepLower == TEXT("multicast"))      NetFlag = FUNC_NetMulticast;
+			else if (RepLower == TEXT("server"))    NetFlag = FUNC_NetServer;
+			else if (RepLower == TEXT("client"))    NetFlag = FUNC_NetClient;
+
+			if (NetFlag != 0)
+				EventNode->FunctionFlags |= (FUNC_Net | NetFlag);
+		}
+
+		bool bReliable = false;
+		if (Params->TryGetBoolField(TEXT("reliable"), bReliable) && bReliable)
+			EventNode->FunctionFlags |= FUNC_NetReliable;
+
 		Node = EventNode;
 	}
 	else if (NodeType == TEXT("Sequence"))
@@ -1428,6 +1751,21 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 	Root->SetStringField(TEXT("node_title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 	Root->SetArrayField(TEXT("pins"), PinsArr);
 	Root->SetNumberField(TEXT("pin_count"), PinsArr.Num());
+
+	// Replication info for CustomEvent resolve (Phase 5A)
+	if (UK2Node_CustomEvent* EvNode = Cast<UK2Node_CustomEvent>(Node))
+	{
+		uint32 Flags = EvNode->FunctionFlags;
+		if (Flags & FUNC_Net)
+		{
+			FString RepType = TEXT("none");
+			if (Flags & FUNC_NetMulticast)       RepType = TEXT("multicast");
+			else if (Flags & FUNC_NetServer)     RepType = TEXT("server");
+			else if (Flags & FUNC_NetClient)     RepType = TEXT("client");
+			Root->SetStringField(TEXT("replication"), RepType);
+			Root->SetBoolField(TEXT("reliable"), (Flags & FUNC_NetReliable) != 0);
+		}
+	}
 
 	// Warnings
 	TArray<TSharedPtr<FJsonValue>> WarnArr;
@@ -2088,13 +2426,53 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddEventNode(const TS
 		Graph->AddNode(EventNode, /*bUserAction=*/true, /*bSelectNewNode=*/false);
 		EventNode->AllocateDefaultPins();
 
-		FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+		// RPC / Multicast replication flags (Phase 5A)
+		bool bNetFlagsChanged = false;
+		FString Replication;
+		if (Params->TryGetStringField(TEXT("replication"), Replication) && !Replication.IsEmpty() && Replication != TEXT("none"))
+		{
+			const uint32 FlagsToClear = FUNC_Net | FUNC_NetMulticast | FUNC_NetServer | FUNC_NetClient;
+			EventNode->FunctionFlags &= ~FlagsToClear;
+
+			uint32 NetFlag = 0;
+			FString RepLower = Replication.ToLower();
+			if (RepLower == TEXT("multicast"))      NetFlag = FUNC_NetMulticast;
+			else if (RepLower == TEXT("server"))    NetFlag = FUNC_NetServer;
+			else if (RepLower == TEXT("client"))    NetFlag = FUNC_NetClient;
+
+			if (NetFlag != 0)
+			{
+				EventNode->FunctionFlags |= (FUNC_Net | NetFlag);
+				bNetFlagsChanged = true;
+			}
+		}
+
+		bool bReliable = false;
+		if (Params->TryGetBoolField(TEXT("reliable"), bReliable) && bReliable)
+		{
+			EventNode->FunctionFlags |= FUNC_NetReliable;
+			bNetFlagsChanged = true;
+		}
+
+		if (bNetFlagsChanged)
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
+		}
+		else
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+		}
 
 		TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(EventNode);
 		Root->SetStringField(TEXT("event_name"), EventName);
 		Root->SetBoolField(TEXT("is_override"), false);
 		Root->SetStringField(TEXT("class"), TEXT("CustomEvent"));
 		Root->SetStringField(TEXT("graph"), Graph->GetName());
+		if (bNetFlagsChanged)
+		{
+			Root->SetStringField(TEXT("replication"), Replication.ToLower());
+			Root->SetBoolField(TEXT("reliable"), bReliable);
+		}
 		return FMonolithActionResult::Success(Root);
 	}
 }
@@ -2470,5 +2848,466 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandlePromotePinToVariable(
 	}
 	Root->SetNumberField(TEXT("connections_made"), ConnectionsMade);
 	Root->SetStringField(TEXT("graph"), Graph->GetName());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  get_timeline_data  (Phase 3A)
+// ============================================================
+
+static FString InterpModeToString(ERichCurveInterpMode Mode)
+{
+	switch (Mode)
+	{
+	case RCIM_Linear:   return TEXT("linear");
+	case RCIM_Constant: return TEXT("constant");
+	case RCIM_Cubic:    return TEXT("cubic");
+	default:            return TEXT("linear");
+	}
+}
+
+static ERichCurveInterpMode StringToInterpMode(const FString& Str)
+{
+	if (Str.Equals(TEXT("constant"), ESearchCase::IgnoreCase)) return RCIM_Constant;
+	if (Str.Equals(TEXT("cubic"),    ESearchCase::IgnoreCase)) return RCIM_Cubic;
+	return RCIM_Linear; // default
+}
+
+static TSharedPtr<FJsonObject> SerializeRichCurveKeys(const FRichCurve& Curve)
+{
+	TSharedPtr<FJsonObject> CurveObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> KeysArr;
+
+	const TArray<FRichCurveKey>& Keys = Curve.GetConstRefOfKeys();
+	for (const FRichCurveKey& Key : Keys)
+	{
+		TSharedPtr<FJsonObject> KeyObj = MakeShared<FJsonObject>();
+		KeyObj->SetNumberField(TEXT("time"), Key.Time);
+		KeyObj->SetNumberField(TEXT("value"), Key.Value);
+		KeyObj->SetStringField(TEXT("interp_mode"), InterpModeToString(Key.InterpMode));
+		KeysArr.Add(MakeShared<FJsonValueObject>(KeyObj));
+	}
+
+	CurveObj->SetArrayField(TEXT("keys"), KeysArr);
+	CurveObj->SetNumberField(TEXT("num_keys"), Keys.Num());
+	return CurveObj;
+}
+
+static TSharedPtr<FJsonObject> SerializeTimelineTemplate(const UTimelineTemplate* Template)
+{
+	TSharedPtr<FJsonObject> TLObj = MakeShared<FJsonObject>();
+	TLObj->SetStringField(TEXT("name"), Template->GetVariableName().ToString());
+	TLObj->SetStringField(TEXT("guid"), Template->TimelineGuid.ToString());
+	TLObj->SetNumberField(TEXT("length"), Template->TimelineLength);
+	TLObj->SetBoolField(TEXT("auto_play"), Template->bAutoPlay != 0);
+	TLObj->SetBoolField(TEXT("loop"), Template->bLoop != 0);
+	TLObj->SetBoolField(TEXT("replicated"), Template->bReplicated != 0);
+
+	// Float tracks
+	TArray<TSharedPtr<FJsonValue>> FloatArr;
+	for (const FTTFloatTrack& Track : Template->FloatTracks)
+	{
+		TSharedPtr<FJsonObject> TrackObj = MakeShared<FJsonObject>();
+		TrackObj->SetStringField(TEXT("track_name"), Track.GetTrackName().ToString());
+		TrackObj->SetStringField(TEXT("track_type"), TEXT("float"));
+		if (Track.CurveFloat)
+		{
+			TSharedPtr<FJsonObject> CurveData = SerializeRichCurveKeys(Track.CurveFloat->FloatCurve);
+			TrackObj->SetArrayField(TEXT("keys"), CurveData->GetArrayField(TEXT("keys")));
+			TrackObj->SetNumberField(TEXT("num_keys"), CurveData->GetNumberField(TEXT("num_keys")));
+		}
+		else
+		{
+			TrackObj->SetArrayField(TEXT("keys"), TArray<TSharedPtr<FJsonValue>>());
+			TrackObj->SetNumberField(TEXT("num_keys"), 0);
+		}
+		FloatArr.Add(MakeShared<FJsonValueObject>(TrackObj));
+	}
+	TLObj->SetArrayField(TEXT("float_tracks"), FloatArr);
+
+	// Vector tracks
+	TArray<TSharedPtr<FJsonValue>> VectorArr;
+	for (const FTTVectorTrack& Track : Template->VectorTracks)
+	{
+		TSharedPtr<FJsonObject> TrackObj = MakeShared<FJsonObject>();
+		TrackObj->SetStringField(TEXT("track_name"), Track.GetTrackName().ToString());
+		TrackObj->SetStringField(TEXT("track_type"), TEXT("vector"));
+		if (Track.CurveVector)
+		{
+			TArray<TSharedPtr<FJsonValue>> ChannelArr;
+			static const TCHAR* ChannelNames[] = { TEXT("x"), TEXT("y"), TEXT("z") };
+			for (int32 i = 0; i < 3; ++i)
+			{
+				TSharedPtr<FJsonObject> ChObj = MakeShared<FJsonObject>();
+				ChObj->SetStringField(TEXT("channel"), ChannelNames[i]);
+				TSharedPtr<FJsonObject> CurveData = SerializeRichCurveKeys(Track.CurveVector->FloatCurves[i]);
+				ChObj->SetArrayField(TEXT("keys"), CurveData->GetArrayField(TEXT("keys")));
+				ChannelArr.Add(MakeShared<FJsonValueObject>(ChObj));
+			}
+			TrackObj->SetArrayField(TEXT("channels"), ChannelArr);
+		}
+		VectorArr.Add(MakeShared<FJsonValueObject>(TrackObj));
+	}
+	TLObj->SetArrayField(TEXT("vector_tracks"), VectorArr);
+
+	// Event tracks
+	TArray<TSharedPtr<FJsonValue>> EventArr;
+	for (const FTTEventTrack& Track : Template->EventTracks)
+	{
+		TSharedPtr<FJsonObject> TrackObj = MakeShared<FJsonObject>();
+		TrackObj->SetStringField(TEXT("track_name"), Track.GetTrackName().ToString());
+		TrackObj->SetStringField(TEXT("track_type"), TEXT("event"));
+		if (Track.CurveKeys)
+		{
+			// Event tracks use UCurveFloat but only the time values matter (fire at that time)
+			TArray<TSharedPtr<FJsonValue>> KeysArr;
+			const TArray<FRichCurveKey>& Keys = Track.CurveKeys->FloatCurve.GetConstRefOfKeys();
+			for (const FRichCurveKey& Key : Keys)
+			{
+				TSharedPtr<FJsonObject> KeyObj = MakeShared<FJsonObject>();
+				KeyObj->SetNumberField(TEXT("time"), Key.Time);
+				KeysArr.Add(MakeShared<FJsonValueObject>(KeyObj));
+			}
+			TrackObj->SetArrayField(TEXT("keys"), KeysArr);
+			TrackObj->SetNumberField(TEXT("num_keys"), Keys.Num());
+		}
+		else
+		{
+			TrackObj->SetArrayField(TEXT("keys"), TArray<TSharedPtr<FJsonValue>>());
+			TrackObj->SetNumberField(TEXT("num_keys"), 0);
+		}
+		EventArr.Add(MakeShared<FJsonValueObject>(TrackObj));
+	}
+	TLObj->SetArrayField(TEXT("event_tracks"), EventArr);
+
+	// Linear color tracks
+	TArray<TSharedPtr<FJsonValue>> ColorArr;
+	for (const FTTLinearColorTrack& Track : Template->LinearColorTracks)
+	{
+		TSharedPtr<FJsonObject> TrackObj = MakeShared<FJsonObject>();
+		TrackObj->SetStringField(TEXT("track_name"), Track.GetTrackName().ToString());
+		TrackObj->SetStringField(TEXT("track_type"), TEXT("color"));
+		if (Track.CurveLinearColor)
+		{
+			TArray<TSharedPtr<FJsonValue>> ChannelArr;
+			static const TCHAR* ChannelNames[] = { TEXT("r"), TEXT("g"), TEXT("b"), TEXT("a") };
+			for (int32 i = 0; i < 4; ++i)
+			{
+				TSharedPtr<FJsonObject> ChObj = MakeShared<FJsonObject>();
+				ChObj->SetStringField(TEXT("channel"), ChannelNames[i]);
+				TSharedPtr<FJsonObject> CurveData = SerializeRichCurveKeys(Track.CurveLinearColor->FloatCurves[i]);
+				ChObj->SetArrayField(TEXT("keys"), CurveData->GetArrayField(TEXT("keys")));
+				ChannelArr.Add(MakeShared<FJsonValueObject>(ChObj));
+			}
+			TrackObj->SetArrayField(TEXT("channels"), ChannelArr);
+		}
+		ColorArr.Add(MakeShared<FJsonValueObject>(TrackObj));
+	}
+	TLObj->SetArrayField(TEXT("color_tracks"), ColorArr);
+
+	return TLObj;
+}
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandleGetTimelineData(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString TimelineName = Params->GetStringField(TEXT("timeline_name"));
+
+	TArray<TSharedPtr<FJsonValue>> TimelinesArr;
+
+	for (const UTimelineTemplate* Template : BP->Timelines)
+	{
+		if (!Template) continue;
+
+		// If a specific name was requested, filter
+		if (!TimelineName.IsEmpty() && Template->GetVariableName().ToString() != TimelineName)
+		{
+			continue;
+		}
+
+		TimelinesArr.Add(MakeShared<FJsonValueObject>(SerializeTimelineTemplate(Template)));
+	}
+
+	if (!TimelineName.IsEmpty() && TimelinesArr.Num() == 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Timeline '%s' not found. Available timelines: %s"),
+			*TimelineName,
+			*([&]()
+			{
+				FString Names;
+				for (const UTimelineTemplate* T : BP->Timelines)
+				{
+					if (T)
+					{
+						if (!Names.IsEmpty()) Names += TEXT(", ");
+						Names += T->GetVariableName().ToString();
+					}
+				}
+				return Names.IsEmpty() ? FString(TEXT("(none)")) : Names;
+			}())));
+	}
+
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetArrayField(TEXT("timelines"), TimelinesArr);
+	Root->SetNumberField(TEXT("count"), TimelinesArr.Num());
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  add_timeline_track  (Phase 3A)
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString TimelineName = Params->GetStringField(TEXT("timeline_name"));
+	if (TimelineName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: timeline_name"));
+	}
+
+	FString TrackNameStr = Params->GetStringField(TEXT("track_name"));
+	if (TrackNameStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: track_name"));
+	}
+
+	FString TrackTypeStr = Params->GetStringField(TEXT("track_type"));
+	if (TrackTypeStr.IsEmpty())
+	{
+		TrackTypeStr = TEXT("float");
+	}
+
+	// Find the timeline template
+	UTimelineTemplate* Template = nullptr;
+	for (UTimelineTemplate* T : BP->Timelines)
+	{
+		if (T && T->GetVariableName().ToString() == TimelineName)
+		{
+			Template = T;
+			break;
+		}
+	}
+
+	if (!Template)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Timeline '%s' not found in Blueprint"), *TimelineName));
+	}
+
+	FName TrackName(*TrackNameStr);
+
+	// Check track name uniqueness across all track types
+	if (!Template->IsNewTrackNameValid(TrackName))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Track name '%s' already exists in timeline '%s'"), *TrackNameStr, *TimelineName));
+	}
+
+	// Get the generated class as outer for curve objects (matches engine pattern)
+	UClass* OwnerClass = BP->GeneratedClass;
+	if (!OwnerClass)
+	{
+		return FMonolithActionResult::Error(TEXT("Blueprint has no GeneratedClass — compile the Blueprint first"));
+	}
+
+	Template->Modify();
+
+	FString CreatedType;
+
+	if (TrackTypeStr.Equals(TEXT("float"), ESearchCase::IgnoreCase))
+	{
+		FTTFloatTrack NewTrack;
+		NewTrack.SetTrackName(TrackName, Template);
+		NewTrack.CurveFloat = NewObject<UCurveFloat>(OwnerClass, NAME_None, RF_Public);
+		Template->FloatTracks.Add(NewTrack);
+		CreatedType = TEXT("float");
+	}
+	else if (TrackTypeStr.Equals(TEXT("vector"), ESearchCase::IgnoreCase))
+	{
+		FTTVectorTrack NewTrack;
+		NewTrack.SetTrackName(TrackName, Template);
+		NewTrack.CurveVector = NewObject<UCurveVector>(OwnerClass, NAME_None, RF_Public);
+		Template->VectorTracks.Add(NewTrack);
+		CreatedType = TEXT("vector");
+	}
+	else if (TrackTypeStr.Equals(TEXT("event"), ESearchCase::IgnoreCase))
+	{
+		FTTEventTrack NewTrack;
+		NewTrack.SetTrackName(TrackName, Template);
+		NewTrack.CurveKeys = NewObject<UCurveFloat>(OwnerClass, NAME_None, RF_Public);
+		NewTrack.CurveKeys->bIsEventCurve = true;
+		Template->EventTracks.Add(NewTrack);
+		CreatedType = TEXT("event");
+	}
+	else if (TrackTypeStr.Equals(TEXT("color"), ESearchCase::IgnoreCase))
+	{
+		FTTLinearColorTrack NewTrack;
+		NewTrack.SetTrackName(TrackName, Template);
+		NewTrack.CurveLinearColor = NewObject<UCurveLinearColor>(OwnerClass, NAME_None, RF_Public);
+		Template->LinearColorTracks.Add(NewTrack);
+		CreatedType = TEXT("color");
+	}
+	else
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Unknown track_type '%s'. Must be: float, vector, event, or color"), *TrackTypeStr));
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("timeline_name"), TimelineName);
+	Root->SetStringField(TEXT("track_name"), TrackNameStr);
+	Root->SetStringField(TEXT("track_type"), CreatedType);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  set_timeline_keys  (Phase 3A)
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintNodeActions::HandleSetTimelineKeys(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString TimelineName = Params->GetStringField(TEXT("timeline_name"));
+	if (TimelineName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: timeline_name"));
+	}
+
+	FString TrackNameStr = Params->GetStringField(TEXT("track_name"));
+	if (TrackNameStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: track_name"));
+	}
+
+	// Parse keys array — handle both EJson::Array and EJson::String (Claude Code quirk)
+	TArray<TSharedPtr<FJsonValue>> KeysArr;
+	TSharedPtr<FJsonValue> KeysField = Params->TryGetField(TEXT("keys"));
+	if (!KeysField.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required parameter: keys"));
+	}
+	if (KeysField->Type == EJson::Array)
+	{
+		KeysArr = KeysField->AsArray();
+	}
+	else if (KeysField->Type == EJson::String)
+	{
+		TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(KeysField->AsString());
+		if (!FJsonSerializer::Deserialize(Reader, KeysArr))
+		{
+			return FMonolithActionResult::Error(TEXT("Failed to parse keys string as JSON array"));
+		}
+	}
+	else
+	{
+		return FMonolithActionResult::Error(TEXT("'keys' must be an array"));
+	}
+
+	// Find the timeline template
+	UTimelineTemplate* Template = nullptr;
+	for (UTimelineTemplate* T : BP->Timelines)
+	{
+		if (T && T->GetVariableName().ToString() == TimelineName)
+		{
+			Template = T;
+			break;
+		}
+	}
+
+	if (!Template)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Timeline '%s' not found in Blueprint"), *TimelineName));
+	}
+
+	// Find the float track by name (manual iteration — FindFloatTrackIndex is not exported)
+	FName TrackName(*TrackNameStr);
+	int32 TrackIndex = INDEX_NONE;
+	for (int32 i = 0; i < Template->FloatTracks.Num(); ++i)
+	{
+		if (Template->FloatTracks[i].GetTrackName() == TrackName)
+		{
+			TrackIndex = i;
+			break;
+		}
+	}
+	if (TrackIndex == INDEX_NONE)
+	{
+		// Build available track names for error message
+		FString Available;
+		for (const FTTFloatTrack& T : Template->FloatTracks)
+		{
+			if (!Available.IsEmpty()) Available += TEXT(", ");
+			Available += T.GetTrackName().ToString();
+		}
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Float track '%s' not found in timeline '%s'. Available float tracks: %s"),
+			*TrackNameStr, *TimelineName, Available.IsEmpty() ? TEXT("(none)") : *Available));
+	}
+
+	FTTFloatTrack& Track = Template->FloatTracks[TrackIndex];
+	if (!Track.CurveFloat)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Float track '%s' has no backing UCurveFloat object"), *TrackNameStr));
+	}
+
+	Template->Modify();
+	Track.CurveFloat->Modify();
+
+	// Clear existing keys
+	FRichCurve& Curve = Track.CurveFloat->FloatCurve;
+	Curve.Reset();
+
+	// Add new keys
+	int32 KeyCount = 0;
+	for (const TSharedPtr<FJsonValue>& KeyVal : KeysArr)
+	{
+		const TSharedPtr<FJsonObject>& KeyObj = KeyVal->AsObject();
+		if (!KeyObj.IsValid()) continue;
+
+		double Time = 0.0;
+		double Value = 0.0;
+		KeyObj->TryGetNumberField(TEXT("time"), Time);
+		KeyObj->TryGetNumberField(TEXT("value"), Value);
+
+		FKeyHandle Handle = Curve.AddKey((float)Time, (float)Value);
+
+		// Set interp mode if provided
+		FString InterpStr = KeyObj->GetStringField(TEXT("interp_mode"));
+		if (!InterpStr.IsEmpty())
+		{
+			Curve.SetKeyInterpMode(Handle, StringToInterpMode(InterpStr));
+		}
+
+		KeyCount++;
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("timeline_name"), TimelineName);
+	Root->SetStringField(TEXT("track_name"), TrackNameStr);
+	Root->SetNumberField(TEXT("keys_set"), KeyCount);
 	return FMonolithActionResult::Success(Root);
 }
