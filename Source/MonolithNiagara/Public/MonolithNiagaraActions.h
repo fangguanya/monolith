@@ -190,7 +190,7 @@ private:
 	static UNiagaraNodeFunctionCall* FindFunctionCallNode(UNiagaraSystem* System, const FString& EmitterHandleId, const FString& NodeGuidStr);
 	static UClass* ResolveRendererClass(const FString& RendererClass);
 	static UNiagaraRendererProperties* GetRenderer(UNiagaraSystem* System, const FString& EmitterHandleId, int32 RendererIndex, FVersionedNiagaraEmitterData** OutEmitterData = nullptr);
-	static FNiagaraTypeDefinition ResolveNiagaraType(const FString& TypeName);
+	static FNiagaraTypeDefinition ResolveNiagaraType(const FString& TypeName, bool* bOutFellBack = nullptr);
 	static FNiagaraVariable MakeUserVariable(const FString& ParamName, const FNiagaraTypeDefinition& TypeDef);
 	static FString JsonObjectToString(const TSharedRef<FJsonObject>& JsonObj);
 	static FString JsonArrayToString(const TArray<TSharedPtr<FJsonValue>>& JsonArray);

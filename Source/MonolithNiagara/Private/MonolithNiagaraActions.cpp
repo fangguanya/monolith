@@ -996,8 +996,9 @@ UNiagaraRendererProperties* FMonolithNiagaraActions::GetRenderer(UNiagaraSystem*
 	return R.IsValidIndex(RendererIndex) ? R[RendererIndex] : nullptr;
 }
 
-FNiagaraTypeDefinition FMonolithNiagaraActions::ResolveNiagaraType(const FString& TypeName)
+FNiagaraTypeDefinition FMonolithNiagaraActions::ResolveNiagaraType(const FString& TypeName, bool* bOutFellBack)
 {
+	if (bOutFellBack) *bOutFellBack = false;
 	FString L = TypeName.ToLower();
 	// Bug fix: agents use "NiagaraFloat", "NiagaraBool", "Vector3f" etc. — handle the Niagara-prefixed
 	// and HLSL-suffixed forms so they map correctly instead of silently falling back to float.
@@ -1012,6 +1013,7 @@ FNiagaraTypeDefinition FMonolithNiagaraActions::ResolveNiagaraType(const FString
 	if (L == TEXT("quat") || L == TEXT("quaternion")) return FNiagaraTypeDefinition::GetQuatDef();
 	if (L == TEXT("matrix") || L == TEXT("matrix4")) return FNiagaraTypeDefinition::GetMatrix4Def();
 	UE_LOG(LogMonolithNiagara, Warning, TEXT("ResolveNiagaraType: Unknown type '%s', defaulting to float"), *TypeName);
+	if (bOutFellBack) *bOutFellBack = true;
 	return FNiagaraTypeDefinition::GetFloatDef();
 }
 
@@ -4021,7 +4023,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 	UNiagaraSystem* System = LoadSystem(SystemPath);
 	if (!System) return FMonolithActionResult::Error(TEXT("Failed to load system"));
 
-	FNiagaraTypeDefinition TD = ResolveNiagaraType(TypeName);
+	bool bTypeFellBack = false;
+	FNiagaraTypeDefinition TD = ResolveNiagaraType(TypeName, &bTypeFellBack);
 	FNiagaraVariable NV = MakeUserVariable(ParamName, TD);
 
 	// Pre-set the default value on the FNiagaraVariable BEFORE adding to the store.
@@ -4192,6 +4195,11 @@ FMonolithActionResult FMonolithNiagaraActions::HandleAddUserParameter(const TSha
 	FString ResolvedTypeName = TD.GetName();
 	TSharedRef<FJsonObject> ResultObj = MakeShared<FJsonObject>();
 	ResultObj->SetStringField(TEXT("resolved_type"), ResolvedTypeName);
+
+	if (bTypeFellBack)
+	{
+		ResultObj->SetStringField(TEXT("warning"), FString::Printf(TEXT("Unknown type '%s' — defaulted to float. Valid types: float, int, bool, vec2, vec3, vec4, color, position, quat, matrix"), *TypeName));
+	}
 
 	if (DefaultJV.IsValid() && !bDefaultSet)
 	{
@@ -7869,8 +7877,19 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetSpawnShape(const TShared
 
 	TArray<FString> Warnings;
 
+	// Derive the expected module name substring from the target shape
+	// (e.g. "sphere" -> "SphereLocation", "shape" -> "ShapeLocation")
+	FString TargetModuleKeyword;
+	{
+		FString ShapeCap = Shape;
+		if (ShapeCap.Len() > 0) ShapeCap[0] = FChar::ToUpper(ShapeCap[0]);
+		if (Shape == TEXT("shapev2") || Shape == TEXT("shapelocation")) TargetModuleKeyword = TEXT("ShapeLocation");
+		else TargetModuleKeyword = ShapeCap + TEXT("Location");
+	}
+
 	// -------------------------------------------------------------------------
 	// Step 1: Remove existing location modules if replace_existing is true
+	// If the exact same shape module already exists, skip the whole operation.
 	// -------------------------------------------------------------------------
 	if (bReplaceExisting)
 	{
@@ -7891,6 +7910,7 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetSpawnShape(const TShared
 			const TArray<TSharedPtr<FJsonValue>>* ModulesArr;
 			if (ModResult.Result->TryGetArrayField(TEXT("modules"), ModulesArr))
 			{
+				bool bSameShapeAlreadyPresent = false;
 				for (const TSharedPtr<FJsonValue>& ModVal : *ModulesArr)
 				{
 					const TSharedPtr<FJsonObject> Mod = ModVal->AsObject();
@@ -7899,19 +7919,40 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetSpawnShape(const TShared
 					FString ModName = Mod->GetStringField(TEXT("module_name"));
 					FString NodeGuid = Mod->GetStringField(TEXT("node_guid"));
 
+					bool bIsLocationModule = false;
 					for (const FString& Keyword : LocationKeywords)
 					{
 						if (ModName.Contains(Keyword))
 						{
-							TSharedPtr<FJsonObject> RemoveParams = MakeShared<FJsonObject>();
-							RemoveParams->SetStringField(TEXT("asset_path"), AssetPath);
-							RemoveParams->SetStringField(TEXT("emitter"), EmitterName);
-							RemoveParams->SetStringField(TEXT("module_node"), NodeGuid);
-							HandleRemoveModule(RemoveParams);
-							Warnings.Add(FString::Printf(TEXT("Removed existing location module: %s"), *ModName));
+							bIsLocationModule = true;
+							// Check if this is the SAME shape we're trying to add
+							if (ModName.Contains(TargetModuleKeyword))
+							{
+								bSameShapeAlreadyPresent = true;
+							}
+							else
+							{
+								// Different location module — remove it
+								TSharedPtr<FJsonObject> RemoveParams = MakeShared<FJsonObject>();
+								RemoveParams->SetStringField(TEXT("asset_path"), AssetPath);
+								RemoveParams->SetStringField(TEXT("emitter"), EmitterName);
+								RemoveParams->SetStringField(TEXT("module_node"), NodeGuid);
+								HandleRemoveModule(RemoveParams);
+								Warnings.Add(FString::Printf(TEXT("Removed existing location module: %s"), *ModName));
+							}
 							break;
 						}
 					}
+				}
+
+				// If the exact same shape is already present, skip — nothing to do
+				if (bSameShapeAlreadyPresent)
+				{
+					TSharedRef<FJsonObject> R = MakeShared<FJsonObject>();
+					R->SetBoolField(TEXT("success"), true);
+					R->SetStringField(TEXT("message"), FString::Printf(TEXT("Shape '%s' is already set on emitter '%s' — no changes needed"), *Shape, *EmitterName));
+					R->SetBoolField(TEXT("skipped"), true);
+					return SuccessObj(R);
 				}
 			}
 		}
@@ -9515,20 +9556,25 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetNPCDefault(const TShared
 	NPC->Modify();
 	DefaultInst->Modify();
 
+	// Use direct ParameterStore writes, NOT the Set*Parameter helpers.
+	// Set*Parameter auto-prefixes with NPC namespace (e.g. "Speed" -> "NPC.TestNPC.Speed")
+	// but AddParameter stores bare names. Direct store write matches the correct key.
+	FNiagaraParameterStore& Store = DefaultInst->GetParameterStore();
+
 	if (TD == FNiagaraTypeDefinition::GetFloatDef())
 	{
-		DefaultInst->SetFloatParameter(Found->GetName().ToString(), static_cast<float>(ValueJV->AsNumber()));
+		float FV = static_cast<float>(ValueJV->AsNumber());
+		Store.SetParameterValue(FV, *Found);
 		bSet = true;
 	}
 	else if (TD == FNiagaraTypeDefinition::GetIntDef())
 	{
-		DefaultInst->SetIntParameter(Found->GetName().ToString(), static_cast<int32>(ValueJV->AsNumber()));
+		int32 IV = static_cast<int32>(ValueJV->AsNumber());
+		Store.SetParameterValue(IV, *Found);
 		bSet = true;
 	}
 	else if (TD == FNiagaraTypeDefinition::GetBoolDef())
 	{
-		// NPC may not have SetBoolParameter — use parameter store directly
-		FNiagaraParameterStore& Store = DefaultInst->GetParameterStore();
 		FNiagaraBool BV; BV.SetValue(ValueJV->AsBool());
 		Store.SetParameterValue(BV, *Found);
 		bSet = true;
@@ -9538,7 +9584,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetNPCDefault(const TShared
 		TSharedPtr<FJsonObject> O = AsObjectOrParseString(ValueJV);
 		if (O.IsValid())
 		{
-			DefaultInst->SetVector2DParameter(Found->GetName().ToString(), FVector2D(O->GetNumberField(TEXT("x")), O->GetNumberField(TEXT("y"))));
+			FVector2f V2(O->GetNumberField(TEXT("x")), O->GetNumberField(TEXT("y")));
+			Store.SetParameterValue(V2, *Found);
 			bSet = true;
 		}
 	}
@@ -9547,7 +9594,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetNPCDefault(const TShared
 		TSharedPtr<FJsonObject> O = AsObjectOrParseString(ValueJV);
 		if (O.IsValid())
 		{
-			DefaultInst->SetVectorParameter(Found->GetName().ToString(), FVector(O->GetNumberField(TEXT("x")), O->GetNumberField(TEXT("y")), O->GetNumberField(TEXT("z"))));
+			FVector3f V3(O->GetNumberField(TEXT("x")), O->GetNumberField(TEXT("y")), O->GetNumberField(TEXT("z")));
+			Store.SetParameterValue(V3, *Found);
 			bSet = true;
 		}
 	}
@@ -9556,7 +9604,8 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetNPCDefault(const TShared
 		TSharedPtr<FJsonObject> O = AsObjectOrParseString(ValueJV);
 		if (O.IsValid())
 		{
-			DefaultInst->SetVector4Parameter(Found->GetName().ToString(), FVector4(O->GetNumberField(TEXT("x")), O->GetNumberField(TEXT("y")), O->GetNumberField(TEXT("z")), O->GetNumberField(TEXT("w"))));
+			FVector4f V4(O->GetNumberField(TEXT("x")), O->GetNumberField(TEXT("y")), O->GetNumberField(TEXT("z")), O->GetNumberField(TEXT("w")));
+			Store.SetParameterValue(V4, *Found);
 			bSet = true;
 		}
 	}
@@ -9565,11 +9614,12 @@ FMonolithActionResult FMonolithNiagaraActions::HandleSetNPCDefault(const TShared
 		TSharedPtr<FJsonObject> O = AsObjectOrParseString(ValueJV);
 		if (O.IsValid())
 		{
-			DefaultInst->SetColorParameter(Found->GetName().ToString(), FLinearColor(
+			FLinearColor LC(
 				static_cast<float>(O->GetNumberField(TEXT("r"))),
 				static_cast<float>(O->GetNumberField(TEXT("g"))),
 				static_cast<float>(O->GetNumberField(TEXT("b"))),
-				O->HasField(TEXT("a")) ? static_cast<float>(O->GetNumberField(TEXT("a"))) : 1.0f));
+				O->HasField(TEXT("a")) ? static_cast<float>(O->GetNumberField(TEXT("a"))) : 1.0f);
+			Store.SetParameterValue(LC, *Found);
 			bSet = true;
 		}
 	}
