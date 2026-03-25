@@ -1702,10 +1702,72 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 		SeqNode->AllocateDefaultPins();
 		Node = SeqNode;
 	}
+	else if (NodeType == TEXT("Self"))
+	{
+		UK2Node_Self* SelfNode = NewObject<UK2Node_Self>(TempGraph);
+		SelfNode->AllocateDefaultPins();
+		Node = SelfNode;
+	}
+	else if (NodeType == TEXT("MacroInstance"))
+	{
+		FString MacroName = Params->GetStringField(TEXT("macro_name"));
+		FString MacroBP = Params->GetStringField(TEXT("macro_blueprint"));
+		if (MacroBP.IsEmpty()) MacroBP = TEXT("/Engine/EditorBlueprintResources/StandardMacros");
+
+		UBlueprint* MacroBlueprint = LoadObject<UBlueprint>(nullptr, *MacroBP);
+		if (!MacroBlueprint)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Macro blueprint not found: %s"), *MacroBP));
+		}
+
+		UEdGraph* MacroGraph = nullptr;
+		for (UEdGraph* G : MacroBlueprint->MacroGraphs)
+		{
+			if (G && G->GetName() == MacroName)
+			{
+				MacroGraph = G;
+				break;
+			}
+		}
+		if (!MacroGraph)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Macro '%s' not found in '%s'"), *MacroName, *MacroBP));
+		}
+
+		UK2Node_MacroInstance* MacroNode = NewObject<UK2Node_MacroInstance>(TempGraph);
+		MacroNode->SetMacroGraph(MacroGraph);
+		MacroNode->AllocateDefaultPins();
+		Node = MacroNode;
+	}
+	else if (NodeType == TEXT("Return"))
+	{
+		UK2Node_FunctionResult* ReturnNode = NewObject<UK2Node_FunctionResult>(TempGraph);
+		ReturnNode->AllocateDefaultPins();
+		Node = ReturnNode;
+		Warnings.Add(TEXT("Return node pins depend on the function signature in the actual Blueprint"));
+	}
 	else
 	{
-		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Unsupported node_type for resolve_node: '%s'. Supported: CallFunction, VariableGet, VariableSet, Branch, CustomEvent, Sequence"), *NodeType));
+		// Generic fallback — try to find any UK2Node subclass
+		FString WithoutPrefix = FString::Printf(TEXT("K2Node_%s"), *NodeType);
+		UClass* NodeClass = FindFirstObject<UClass>(*WithoutPrefix, EFindFirstObjectOptions::NativeFirst);
+		if (!NodeClass)
+			NodeClass = FindFirstObject<UClass>(*NodeType, EFindFirstObjectOptions::NativeFirst);
+		if (!NodeClass && NodeType.StartsWith(TEXT("U")))
+			NodeClass = FindFirstObject<UClass>(*NodeType.Mid(1), EFindFirstObjectOptions::NativeFirst);
+
+		if (NodeClass && NodeClass->IsChildOf(UK2Node::StaticClass()))
+		{
+			UK2Node* GenericNode = NewObject<UK2Node>(TempGraph, NodeClass);
+			GenericNode->AllocateDefaultPins();
+			Node = GenericNode;
+			Warnings.Add(TEXT("Resolved via generic K2Node fallback — pins may differ in actual Blueprint context"));
+		}
+		else
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("Unsupported node_type for resolve_node: '%s'. Supported: CallFunction, VariableGet, VariableSet, Branch, CustomEvent, Sequence, Self, MacroInstance, Return, or any UK2Node_ class name"), *NodeType));
+		}
 	}
 
 	if (!Node)
