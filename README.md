@@ -48,7 +48,7 @@ Most MCP integrations register every action as a separate tool, which floods the
 - **Material authoring (57 actions)** — Programmatic PBR graph building, custom HLSL, material functions, texture import, batch operations, preview rendering, compilation stats
 - **Animation pipeline (115 actions)** — Sequences, montages, blend spaces, Animation Blueprints, PoseSearch, Control Rig, Physics Assets, IK Rigs, Retargeters, skeleton management — the full stack
 - **Niagara VFX (96 actions)** — System/emitter lifecycle, dynamic inputs, event handlers, sim stages, Parameter Collections, Effect Types, renderer presets, data interfaces, system diffing, batch execute
-- **UI scaffolding (42 actions)** — Widget Blueprint CRUD, pre-built templates (HUDs, menus, settings, inventory, save slots), styling, animation, accessibility audit, colorblind modes
+- **UI scaffolding (42 actions) `NEW MODULE`** — Widget Blueprint CRUD, pre-built templates (HUDs, menus, settings, inventory, save slots), styling, animation, game system scaffolding (save/load, audio, input remapping), accessibility audit, colorblind modes, text scaling
 - **Editor control (19 actions)** — UBT builds, Live Coding, error diagnosis, log search, scene capture, texture import, crash context
 - **Config intelligence (6 actions)** — Full INI resolution chain, explain, diff, search across all config files
 - **Project search (7 actions)** — SQLite FTS5 across all indexed assets including marketplace/Fab content, reference tracing, 15 deep indexers
