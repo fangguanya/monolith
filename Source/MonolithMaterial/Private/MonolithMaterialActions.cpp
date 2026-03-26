@@ -69,7 +69,25 @@ static FString NormalizeInputPinName(const FString& PinName)
 	if (PinName == TEXT("ALessThanB"))     return TEXT("A < B");
 	if (PinName == TEXT("MipLevel"))       return TEXT("Level");
 	if (PinName == TEXT("MipBias"))        return TEXT("Bias");
-	return PinName;
+
+	// Strip type hints from material function call inputs, e.g. "BaseColor (V3)" -> "BaseColor"
+	// UE's GetInputNameWithType(index, false) returns names without these suffixes,
+	// so we must strip them to match correctly.
+	FString Result = PinName;
+	static const TArray<FString> TypeSuffixes = {
+		TEXT(" (V3)"), TEXT(" (V2)"), TEXT(" (V4)"),
+		TEXT(" (S)"), TEXT(" (T2d)"), TEXT(" (TC)"),
+		TEXT(" (B)"), TEXT(" (MA)"), TEXT(" (MCL)")
+	};
+	for (const FString& Suffix : TypeSuffixes)
+	{
+		if (Result.EndsWith(Suffix))
+		{
+			Result.LeftChopInline(Suffix.Len());
+			break;
+		}
+	}
+	return Result;
 }
 
 // ============================================================================
