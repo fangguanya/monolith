@@ -130,6 +130,54 @@ monolith_discover({ namespace: "mesh" })
 | `validate_interactive_reach` | `region`, `tags`? | Height/distance/obstruction checks |
 | `generate_accessibility_report` | `start`, `end`, `profile`? | Motor/vision/cognitive profile, A-F grade |
 
+### Lighting Analysis (5 actions) — Hybrid scene capture + analytic
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `sample_light_levels` | `points`, `mode`? | Per-point luminance via scene capture or analytic |
+| `find_dark_corners` | `volume_name` or `region`, `threshold`? | Ortho capture + flood-fill dark zones |
+| `analyze_light_transitions` | `path_points`, `sample_interval`? | Flag harsh bright→dark (>4:1 ratio) |
+| `get_light_coverage` | `volume_name` | % lit/shadow/dark, light inventory, histogram |
+| `suggest_light_placement` | `volume_name`, `mood`? | Inverse-square placement for horror_dim/safe_room/clinical |
+
+### Audio & Acoustics (14 actions) — Physical material-aware spatial audio
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `get_audio_volumes` | — | Enumerate AudioVolumes with reverb settings |
+| `get_surface_materials` | `volume_name` or `region` | Physical material breakdown (% concrete, tile, etc.) |
+| `estimate_footstep_sound` | `location` | Surface type → loudness factor (0-1) |
+| `analyze_room_acoustics` | `volume_name` | Sabine RT60 reverb estimation from surfaces |
+| `analyze_sound_propagation` | `from`, `to` | Material-based occlusion, wall count, dB reduction |
+| `find_loud_surfaces` | `volume_name` or `region` | Dangerous surfaces (metal, glass, gravel) |
+| `find_sound_paths` | `from`, `to`, `max_bounces`? | Image-source reflection paths with attenuation |
+| `can_ai_hear_from` | `ai_location`, `player_location` | Monster hearing detection with surface awareness |
+| `get_stealth_map` | `volume_name`, `grid_size`? | Per-cell loudness + detection radius heatmap |
+| `find_quiet_path` | `start`, `end` | Navmesh path preferring quiet surfaces |
+| `suggest_audio_volumes` | `volume_name` | Auto-suggest reverb settings from room materials |
+| `create_audio_volume` | `volume_name`, `reverb_preset` | Spawn AudioVolume with suggested settings |
+| `set_surface_type` | `actor_name`, `surface_type` | Set physical material surface override |
+| `create_surface_datatable` | `template`? | Bootstrap acoustic system (12 horror surfaces) |
+
+### Performance Analysis (5 actions) — Budget-aware placement
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `get_region_performance` | `region_min`, `region_max` | Tri count, draw calls, lights, shadow casters |
+| `estimate_placement_cost` | `assets` (array of {path, count}) | Pre-spawn budgeting without spawning |
+| `find_overdraw_hotspots` | `viewpoint`, `fov`? | Translucent screen-space overlap |
+| `analyze_shadow_cost` | `region_min`, `region_max` | Flag small props casting shadows pointlessly |
+| `get_triangle_budget` | `viewpoint`, `fov`?, `budget`? | Frustum-culled LOD-aware count vs budget |
+
+### Decal & Detail Placement (4 actions) — Environmental storytelling
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `place_decals` | `material`, `locations` or `region`+`count` | Surface-aligned decals, Poisson scatter |
+| `place_along_path` | `path_points`, `pattern`? | Blood trails, footprints, drag marks (Catmull-Rom) |
+| `analyze_prop_density` | `volume_name`, `target_density`? | Grid-cell density vs target |
+| `place_storytelling_scene` | `location`, `pattern`, `intensity`? | 5 horror presets (violence/abandoned/dragged/medical/corruption) |
+
 ## Blockout Tag Convention
 
 Blockout uses standard actor tags (`TArray<FName>`) on `ABlockingVolume` — zero runtime footprint:
@@ -169,6 +217,30 @@ analyze_sightlines → find_hiding_spots → analyze_escape_routes → classify_
 
 ### Accessibility Check
 ```
+generate_accessibility_report (or individual validate_ actions)
+```
+
+### Horror Audio Design
+```
+create_surface_datatable (first time) → get_surface_materials → analyze_room_acoustics → get_stealth_map → can_ai_hear_from → suggest_audio_volumes
+```
+
+### Lighting Audit
+```
+get_light_coverage → find_dark_corners → analyze_light_transitions → suggest_light_placement
+```
+
+### Performance Budget
+```
+get_region_performance → get_triangle_budget → analyze_shadow_cost → find_overdraw_hotspots
+```
+
+### Environmental Storytelling
+```
+place_storytelling_scene → place_along_path → scatter_props → analyze_prop_density
+```
+
+### Understand a Scene
 generate_accessibility_report (or individual validate_ actions)
 ```
 
