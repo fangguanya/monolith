@@ -5,6 +5,10 @@
 #include "MonolithMeshBlockoutActions.h"
 #include "MonolithMeshHorrorActions.h"
 #include "MonolithMeshAccessibilityActions.h"
+#include "MonolithMeshPerformanceActions.h"
+#include "MonolithMeshLightingActions.h"
+#include "MonolithMeshDecalActions.h"
+#include "MonolithMeshAudioActions.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
@@ -30,6 +34,10 @@ void FMonolithMeshModule::StartupModule()
 	FMonolithMeshBlockoutActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshHorrorActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshAccessibilityActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshPerformanceActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshLightingActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshDecalActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshAudioActions::RegisterActions(FMonolithToolRegistry::Get());
 
 #if WITH_GEOMETRYSCRIPT
 	HandlePool = NewObject<UMonolithMeshHandlePool>();

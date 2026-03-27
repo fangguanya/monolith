@@ -27,11 +27,13 @@ public class MonolithMesh : ModuleRules
 			"PhysicsCore",
 			"NavigationSystem",
 			"RenderCore",
+			"RHI",
 			"EditorScriptingUtilities",
 			"Json",
 			"JsonUtilities",
 			"Slate",
-			"SlateCore"
+			"SlateCore",
+			"AssetRegistry"
 		});
 
 		// Optional: GeometryScripting (Tier 5 mesh operations only)

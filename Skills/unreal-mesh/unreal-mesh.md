@@ -1,11 +1,11 @@
 ---
 name: unreal-mesh
-description: Use when working with Unreal Engine meshes, scene spatial queries, level blockout, actor manipulation, or 3D awareness via Monolith MCP. Covers mesh inspection, spatial raycasts/overlaps, blockout volumes, asset matching/replacement, scatter placement, and scene statistics. Triggers on mesh, StaticMesh, SkeletalMesh, blockout, spatial, raycast, overlap, scene, actor, spawn, LOD, collision, UV, triangle, bounds, scan volume, scatter, navmesh.
+description: Use when working with Unreal Engine meshes, scene spatial queries, level blockout, actor manipulation, 3D awareness, horror spatial analysis, accessibility validation, GeometryScript mesh operations, lighting analysis, audio/acoustics, performance budgeting, or decal/detail placement via Monolith MCP. Triggers on mesh, StaticMesh, SkeletalMesh, blockout, spatial, raycast, overlap, scene, actor, spawn, LOD, collision, UV, triangle, bounds, scan volume, scatter, navmesh, sightline, hiding, horror, tension, accessibility, wheelchair, lighting, dark, audio, acoustic, surface, footstep, reverb, performance, budget, draw call, decal, blood trail.
 ---
 
 # Unreal Mesh & Spatial Workflows
 
-You have access to **Monolith** with **46 Mesh actions** (Phases 1-4) via `mesh_query()`.
+You have access to **Monolith** with **73+ Mesh actions** (Phases 1-6 compiled, 7-10 in progress) via `mesh_query()`.
 
 ## Discovery
 
@@ -89,6 +89,47 @@ monolith_discover({ namespace: "mesh" })
 | `scan_volume` | `volume_name`, `ray_density`? | Daredevil scan — walls, floor, ceiling, openings |
 | `scatter_props` | `volume_name`, `asset_paths`, `count`, `min_spacing`?, `seed`? | Poisson disk scatter with collision avoidance |
 
+### Mesh Operations (12 actions) — `#if WITH_GEOMETRYSCRIPT`, require handles
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `create_handle` | `source`, `handle` | Load mesh into editable handle (asset path or "primitive:box") |
+| `release_handle` | `handle` | Free a handle |
+| `list_handles` | — | All handles with tri count, last access time |
+| `save_handle` | `handle`, `target_path`, `overwrite`? | Commit handle to new StaticMesh asset |
+| `mesh_boolean` | `handle_a`, `handle_b`, `operation`, `result_handle` | Union/subtract/intersect |
+| `mesh_simplify` | `handle`, `target_triangles`? | Reduce triangle count |
+| `mesh_remesh` | `handle`, `target_edge_length` | Isotropic remeshing |
+| `generate_collision` | `handle`, `method` | Convex decomp/auto shapes |
+| `generate_lods` | `handle`, `lod_count` | LOD chain via repeated simplification |
+| `fill_holes` | `handle` | Automatic hole detection + fill |
+| `compute_uvs` | `handle`, `method` | Auto-unwrap/box/planar/cylinder projection |
+| `mirror_mesh` | `handle`, `axis` | Mirror across X/Y/Z |
+
+### Horror Spatial Analysis (8 actions)
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `analyze_sightlines` | `location`, `fov`?, `ray_count`? | Claustrophobia score, blocked % at 5/10/20m |
+| `find_hiding_spots` | `region_min/max`, `viewpoints` | Grid-sample concealment from viewpoints |
+| `find_ambush_points` | `path_points`, `lateral_range`? | Concealed positions with surprise angles |
+| `analyze_choke_points` | `start`, `end` | Navmesh path width, flank possibility |
+| `analyze_escape_routes` | `location`, `exit_tags`? | Paths to exits scored by threat exposure |
+| `classify_zone_tension` | `location`, `radius`? | Calm/uneasy/tense/dread/panic composite |
+| `analyze_pacing_curve` | `path_points` | Tension along path, scare point detection |
+| `find_dead_ends` | `region_min/max`? | Navmesh flood-fill for single-exit regions |
+
+### Accessibility Analysis (6 actions) — Serves the hospice mission
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `validate_path_width` | `start`, `end`, `min_width`? | Wheelchair clearance (120cm default) |
+| `validate_navigation_complexity` | `start`, `end` | Cognitive difficulty scoring |
+| `analyze_visual_contrast` | `location`, `forward`? | WCAG-inspired contrast for interactables |
+| `find_rest_points` | `start`, `end`, `max_gap`? | Safe room spacing along path |
+| `validate_interactive_reach` | `region`, `tags`? | Height/distance/obstruction checks |
+| `generate_accessibility_report` | `start`, `end`, `profile`? | Motor/vision/cognitive profile, A-F grade |
+
 ## Blockout Tag Convention
 
 Blockout uses standard actor tags (`TArray<FName>`) on `ABlockingVolume` — zero runtime footprint:
@@ -114,6 +155,21 @@ get_blockout_volumes → scan_volume → create_blockout_primitives_batch → ma
 ### Inspect a Mesh
 ```
 get_mesh_info → analyze_mesh_quality → compare_meshes
+```
+
+### Edit a Mesh (GeometryScript)
+```
+create_handle → [mesh_simplify | mesh_boolean | compute_uvs | ...] → save_handle → release_handle
+```
+
+### Horror Level Design
+```
+analyze_sightlines → find_hiding_spots → analyze_escape_routes → classify_zone_tension → analyze_pacing_curve
+```
+
+### Accessibility Check
+```
+generate_accessibility_report (or individual validate_ actions)
 ```
 
 ### Understand a Scene
