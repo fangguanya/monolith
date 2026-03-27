@@ -125,6 +125,61 @@ ABlockingVolume* FMonolithMeshBlockoutActions::FindBlockingVolume(const FString&
 	return Matches[0];
 }
 
+AActor* FMonolithMeshBlockoutActions::FindBlockoutVolumeAny(const FString& VolumeName, FString& OutError)
+{
+	// Try tag-based ABlockingVolume first (existing path)
+	ABlockingVolume* TagVolume = FindBlockingVolume(VolumeName, OutError);
+	if (TagVolume)
+	{
+		return TagVolume;
+	}
+
+	// Try Blueprint-based MonolithBlockout actors
+	OutError.Reset();
+	UWorld* World = MonolithMeshUtils::GetEditorWorld();
+	if (!World)
+	{
+		OutError = TEXT("No editor world available");
+		return nullptr;
+	}
+
+	TArray<AActor*> BPMatches;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor->GetClass()->GetName().Contains(TEXT("MonolithBlockout")))
+		{
+			continue;
+		}
+		if (Actor->GetClass()->FindPropertyByName(TEXT("RoomType")) == nullptr)
+		{
+			continue;
+		}
+		if (Actor->GetActorNameOrLabel() == VolumeName || Actor->GetActorLabel() == VolumeName || Actor->GetFName().ToString() == VolumeName)
+		{
+			BPMatches.Add(Actor);
+		}
+	}
+
+	if (BPMatches.Num() == 0)
+	{
+		OutError = FString::Printf(TEXT("Blockout volume not found: %s (checked ABlockingVolume tags and BP_MonolithBlockoutVolume actors)"), *VolumeName);
+		return nullptr;
+	}
+
+	if (BPMatches.Num() > 1)
+	{
+		OutError = FString::Printf(TEXT("Ambiguous volume name '%s'. %d BP matches found:"), *VolumeName, BPMatches.Num());
+		for (AActor* V : BPMatches)
+		{
+			OutError += FString::Printf(TEXT("\n  - %s (%s)"), *V->GetPathName(), *V->GetActorLabel());
+		}
+		return nullptr;
+	}
+
+	return BPMatches[0];
+}
+
 UMaterialInstanceDynamic* FMonolithMeshBlockoutActions::GetBlockoutMaterial(const FString& Category)
 {
 	// Check cache first
@@ -412,6 +467,15 @@ void FMonolithMeshBlockoutActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Optional(TEXT("seed"), TEXT("integer"), TEXT("Random seed for reproducibility (0 = random)"), TEXT("0"))
 			.Optional(TEXT("surface_align"), TEXT("boolean"), TEXT("Align to surface normal via floor trace"), TEXT("false"))
 			.Build());
+
+	// 16. create_blockout_blueprint
+	Registry.RegisterAction(TEXT("mesh"), TEXT("create_blockout_blueprint"),
+		TEXT("Create the BP_MonolithBlockoutVolume Blueprint asset in the project. One-time setup — creates /Game/Monolith/Blockout/BP_MonolithBlockoutVolume with editable RoomType, BlockoutTags, Density, physics, wall/ceiling properties. Drag into levels for blockout volumes with proper Details panel UX."),
+		FMonolithActionHandler::CreateStatic(&FMonolithMeshBlockoutActions::CreateBlockoutBlueprint),
+		FParamSchemaBuilder()
+			.Optional(TEXT("save_path"), TEXT("string"), TEXT("Asset path to save the Blueprint"), TEXT("/Game/Monolith/Blockout/BP_MonolithBlockoutVolume"))
+			.Optional(TEXT("force"), TEXT("boolean"), TEXT("Recreate even if already exists"), TEXT("false"))
+			.Build());
 }
 
 // ============================================================================
@@ -435,6 +499,15 @@ FMonolithActionResult FMonolithMeshBlockoutActions::GetBlockoutVolumes(const TSh
 		bool bHasBlockoutSentinel = HasMonolithTag(Actor, TEXT("Monolith.Blockout"));
 		bool bHasAnyMonolithTag = false;
 
+		// Check for Blueprint-based blockout volume (has RoomType property + MonolithBlockout class name)
+		bool bIsBPBlockout = false;
+		if (!bHasBlockoutSentinel
+			&& Actor->GetClass()->GetName().Contains(TEXT("MonolithBlockout"))
+			&& Actor->GetClass()->FindPropertyByName(TEXT("RoomType")) != nullptr)
+		{
+			bIsBPBlockout = true;
+		}
+
 		for (const FName& Tag : Actor->Tags)
 		{
 			if (Tag.ToString().StartsWith(TEXT("Monolith."), ESearchCase::IgnoreCase))
@@ -444,7 +517,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::GetBlockoutVolumes(const TSh
 			}
 		}
 
-		if (bHasBlockoutSentinel)
+		if (bHasBlockoutSentinel || bIsBPBlockout)
 		{
 			MonolithMeshUtils::FBlockoutTags Parsed = MonolithMeshUtils::ParseBlockoutTags(Actor);
 
@@ -459,6 +532,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::GetBlockoutVolumes(const TSh
 			}
 			VolObj->SetArrayField(TEXT("tags"), TagsJsonArr);
 			VolObj->SetStringField(TEXT("density"), Parsed.Density.IsEmpty() ? TEXT("Normal") : Parsed.Density);
+			VolObj->SetStringField(TEXT("source"), bIsBPBlockout ? TEXT("blueprint") : TEXT("tag"));
 
 			// Bounds
 			FVector Origin, Extent;
@@ -524,10 +598,15 @@ FMonolithActionResult FMonolithMeshBlockoutActions::GetBlockoutVolumeInfo(const 
 		return FMonolithActionResult::Error(Error);
 	}
 
-	if (!HasMonolithTag(VolumeActor, TEXT("Monolith.Blockout")))
+	// Check if it's a blockout volume — either tagged or Blueprint-based
+	bool bIsBlockout = HasMonolithTag(VolumeActor, TEXT("Monolith.Blockout"));
+	bool bIsBPBlockout = (!bIsBlockout &&
+		VolumeActor->GetClass()->FindPropertyByName(TEXT("RoomType")) != nullptr &&
+		VolumeActor->GetClass()->GetName().Contains(TEXT("MonolithBlockout")));
+	if (!bIsBlockout && !bIsBPBlockout)
 	{
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Actor '%s' is not a blockout volume (missing Monolith.Blockout tag)"), *VolumeName));
+			TEXT("Actor '%s' is not a blockout volume (missing Monolith.Blockout tag or BP_MonolithBlockoutVolume class)"), *VolumeName));
 	}
 
 	MonolithMeshUtils::FBlockoutTags Parsed = MonolithMeshUtils::ParseBlockoutTags(VolumeActor);
@@ -984,7 +1063,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::CreateBlockoutGrid(const TSh
 	Params->TryGetNumberField(TEXT("wall_thickness"), WallThickness);
 
 	FString Error;
-	ABlockingVolume* Volume = FindBlockingVolume(VolumeName, Error);
+	AActor* Volume = FindBlockoutVolumeAny(VolumeName, Error);
 	if (!Volume)
 	{
 		return FMonolithActionResult::Error(Error);
@@ -1714,7 +1793,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ExportBlockoutLayout(const T
 	}
 
 	FString Error;
-	ABlockingVolume* Volume = FindBlockingVolume(VolumeName, Error);
+	AActor* Volume = FindBlockoutVolumeAny(VolumeName, Error);
 	if (!Volume)
 	{
 		return FMonolithActionResult::Error(Error);
@@ -1796,7 +1875,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ImportBlockoutLayout(const T
 	}
 
 	FString Error;
-	ABlockingVolume* Volume = FindBlockingVolume(VolumeName, Error);
+	AActor* Volume = FindBlockoutVolumeAny(VolumeName, Error);
 	if (!Volume)
 	{
 		return FMonolithActionResult::Error(Error);
@@ -1971,7 +2050,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScanVolume(const TSharedPtr<
 	}
 
 	FString Error;
-	ABlockingVolume* Volume = FindBlockingVolume(VolumeName, Error);
+	AActor* Volume = FindBlockoutVolumeAny(VolumeName, Error);
 	if (!Volume)
 	{
 		return FMonolithActionResult::Error(Error);
@@ -2367,7 +2446,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScatterProps(const TSharedPt
 
 	// Validate volume
 	FString Error;
-	ABlockingVolume* Volume = FindBlockingVolume(VolumeName, Error);
+	AActor* Volume = FindBlockoutVolumeAny(VolumeName, Error);
 	if (!Volume)
 	{
 		return FMonolithActionResult::Error(Error);
@@ -2581,5 +2660,115 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScatterProps(const TSharedPt
 	Result->SetNumberField(TEXT("seed"), Seed);
 	Result->SetArrayField(TEXT("props"), PlacedArr);
 
+	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// 16. create_blockout_blueprint
+// ============================================================================
+
+FMonolithActionResult FMonolithMeshBlockoutActions::CreateBlockoutBlueprint(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SavePath = TEXT("/Game/Monolith/Blockout/BP_MonolithBlockoutVolume");
+	if (Params->HasField(TEXT("save_path")))
+	{
+		SavePath = Params->GetStringField(TEXT("save_path"));
+	}
+
+	bool bForce = false;
+	if (Params->HasField(TEXT("force")))
+	{
+		bForce = Params->GetBoolField(TEXT("force"));
+	}
+
+	// Check if already exists
+	if (!bForce && FPackageName::DoesPackageExist(SavePath))
+	{
+		auto Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("asset_path"), SavePath);
+		Result->SetBoolField(TEXT("already_exists"), true);
+		Result->SetStringField(TEXT("message"), TEXT("Blueprint already exists. Use force: true to recreate."));
+		return FMonolithActionResult::Success(Result);
+	}
+
+	auto& Registry = FMonolithToolRegistry::Get();
+
+	// Step 1: Create the Blueprint
+	{
+		auto P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("save_path"), SavePath);
+		P->SetStringField(TEXT("parent_class"), TEXT("Actor"));
+		auto R = Registry.ExecuteAction(TEXT("blueprint"), TEXT("create_blueprint"), P);
+		if (!R.bSuccess)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create Blueprint: %s"), *R.ErrorMessage));
+		}
+	}
+
+	// Step 2: Add BoxComponent root
+	{
+		auto P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("asset_path"), SavePath);
+		P->SetStringField(TEXT("component_class"), TEXT("BoxComponent"));
+		P->SetStringField(TEXT("component_name"), TEXT("VolumeExtent"));
+		Registry.ExecuteAction(TEXT("blueprint"), TEXT("add_component"), P);
+	}
+
+	// Step 3: Configure box component
+	auto SetComponentProp = [&](const FString& PropName, const FString& Value)
+	{
+		auto P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("asset_path"), SavePath);
+		P->SetStringField(TEXT("component_name"), TEXT("VolumeExtent"));
+		P->SetStringField(TEXT("property_name"), PropName);
+		P->SetStringField(TEXT("value"), Value);
+		Registry.ExecuteAction(TEXT("blueprint"), TEXT("set_component_property"), P);
+	};
+
+	SetComponentProp(TEXT("BoxExtent"), TEXT("(X=200.0,Y=200.0,Z=150.0)"));
+	SetComponentProp(TEXT("ShapeColor"), TEXT("(R=0,G=255,B=128,A=255)"));
+	SetComponentProp(TEXT("bHiddenInGame"), TEXT("true"));
+	SetComponentProp(TEXT("LineThickness"), TEXT("2.0"));
+
+	// Step 4: Add blockout variables
+	struct FVarDef { const TCHAR* Name; const TCHAR* Type; const TCHAR* Default; };
+	const FVarDef Vars[] = {
+		{ TEXT("RoomType"),     TEXT("string"),       TEXT("") },
+		{ TEXT("BlockoutTags"), TEXT("array:string"), TEXT("") },
+		{ TEXT("Density"),      TEXT("string"),       TEXT("Normal") },
+		{ TEXT("bAllowPhysics"),TEXT("bool"),          TEXT("true") },
+		{ TEXT("FloorHeight"),  TEXT("float"),         TEXT("0.0") },
+		{ TEXT("bHasWalls"),    TEXT("bool"),          TEXT("true") },
+		{ TEXT("bHasCeiling"),  TEXT("bool"),          TEXT("true") },
+	};
+
+	for (const auto& Var : Vars)
+	{
+		auto P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("asset_path"), SavePath);
+		P->SetStringField(TEXT("name"), Var.Name);
+		P->SetStringField(TEXT("type"), Var.Type);
+		if (FCString::Strlen(Var.Default) > 0)
+		{
+			P->SetStringField(TEXT("default_value"), Var.Default);
+		}
+		P->SetStringField(TEXT("category"), TEXT("Blockout"));
+		P->SetBoolField(TEXT("instance_editable"), true);
+		Registry.ExecuteAction(TEXT("blueprint"), TEXT("add_variable"), P);
+	}
+
+	// Step 5: Compile and save
+	{
+		auto P = MakeShared<FJsonObject>();
+		P->SetStringField(TEXT("asset_path"), SavePath);
+		Registry.ExecuteAction(TEXT("blueprint"), TEXT("compile_blueprint"), P);
+		Registry.ExecuteAction(TEXT("blueprint"), TEXT("save_asset"), P);
+	}
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("asset_path"), SavePath);
+	Result->SetBoolField(TEXT("created"), true);
+	Result->SetNumberField(TEXT("variables"), 7);
+	Result->SetStringField(TEXT("message"), TEXT("BP_MonolithBlockoutVolume created. Drag from Content Browser into levels. Configure RoomType, BlockoutTags, Density in Details panel."));
 	return FMonolithActionResult::Success(Result);
 }

@@ -382,27 +382,30 @@ FMonolithActionResult FMonolithMeshSpatialActions::QueryRadialSweep(const TShare
 	double Radius = 1000.0;
 	Params->TryGetNumberField(TEXT("radius"), Radius);
 
-	int32 RayCount = 36;
+	int32 RequestedRayCount = 36;
 	double RayCountD;
 	if (Params->TryGetNumberField(TEXT("ray_count"), RayCountD))
 	{
-		RayCount = FMath::Clamp(static_cast<int32>(RayCountD), 1, 72);
+		RequestedRayCount = static_cast<int32>(RayCountD);
 	}
+	int32 RayCount = FMath::Clamp(RequestedRayCount, 1, 72);
 
-	int32 VerticalAngles = 3;
+	int32 RequestedVerticalAngles = 3;
 	double VerticalAnglesD;
 	if (Params->TryGetNumberField(TEXT("vertical_angles"), VerticalAnglesD))
 	{
-		VerticalAngles = FMath::Clamp(static_cast<int32>(VerticalAnglesD), 1, 8);
+		RequestedVerticalAngles = static_cast<int32>(VerticalAnglesD);
 	}
+	int32 VerticalAngles = FMath::Clamp(RequestedVerticalAngles, 1, 8);
 
 	// HARD CAP: 512 total rays
 	const int32 TotalRays = RayCount * VerticalAngles;
 	if (TotalRays > 512)
 	{
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Total ray count (%d = ray_count %d * vertical_angles %d) exceeds hard cap of 512. Reduce ray_count or vertical_angles."),
-			TotalRays, RayCount, VerticalAngles));
+			TEXT("Requested %d*%d=%d, clamped to %d*%d=%d, exceeds hard cap of 512. Reduce ray_count or vertical_angles."),
+			RequestedRayCount, RequestedVerticalAngles, RequestedRayCount * RequestedVerticalAngles,
+			RayCount, VerticalAngles, TotalRays));
 	}
 
 	UWorld* World = MonolithMeshUtils::GetEditorWorld();

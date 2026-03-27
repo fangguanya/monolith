@@ -12,16 +12,21 @@ Last updated: 2026-03-27
 - [x] **Phase 3 — Spatial Queries (11):** `query_raycast`, `query_multi_raycast`, `query_radial_sweep`, `query_overlap`, `query_nearest`, `query_line_of_sight`, `get_actors_in_volume`, `get_scene_bounds`, `get_scene_statistics`, `get_spatial_relationships`, `query_navmesh`
 - [x] **Phase 4 — Level Blockout (15):** `get_blockout_volumes`, `get_blockout_volume_info`, `setup_blockout_volume`, `create_blockout_primitive`, `create_blockout_primitives_batch`, `create_blockout_grid`, `match_asset_to_blockout`, `match_all_in_volume`, `apply_replacement`, `set_actor_tags`, `clear_blockout`, `export_blockout_layout`, `import_blockout_layout`, `scan_volume`, `scatter_props`
 
-#### MonolithMesh — Remaining Work (Phases 5-12)
+#### MonolithMesh — Known Issues / Improvements
 
-- [ ] **Phase 5 — Mesh modification (GeometryScript):** Decimate, merge meshes, generate LODs, auto-UV, bake normals. Requires GeometryScripting plugin (optional dep already wired).
-- [ ] **Phase 6 — Instanced mesh support:** Foliage/HISM manipulation, instance transforms, bulk operations.
-- [ ] **Phase 7 — Procedural mesh generation:** Create meshes from vertex data, spline meshes, landscape queries.
-- [ ] **Phase 8 — Level streaming integration:** Streaming level queries, sub-level actor management.
-- [ ] **Phase 9 — Physics body operations:** Physics asset inspection/modification, constraint setup.
-- [ ] **Phase 10 — Lightmap/UV2 tooling:** Lightmap UV generation, density analysis, overlap detection.
-- [ ] **Phase 11 — Mesh merge/proxy:** HLOD proxy generation, mesh merge for draw call reduction.
-- [ ] **Phase 12 — Skill file + agent integration:** `unreal-mesh` skill, agent preloading, wiki Tool-Reference update.
+- [ ] **Placement collision avoidance:** `scatter_props`, `create_blockout_primitives_batch`, `import_blockout_layout`, and `apply_replacement` should check for overlap with EXISTING actors in the volume before placing. Currently primitives can clip into existing furniture/geometry. Fix: before placing each actor, run `OverlapMultiByChannel` at the target location with the prop's bounds. If overlapping an existing non-blockout actor, either offset, skip, or warn. `scan_volume` already detects existing actors — cross-reference that data during placement.
+- [ ] **BP_MonolithBlockoutVolume** — Construction Script for per-RoomType wireframe colors (polish pass)
+
+#### MonolithMesh — Remaining Phases (from locked spec)
+
+- [ ] **Phase 5 — Mesh Operations (12 actions, optional GeometryScript):** `create_handle`, `release_handle`, `list_handles`, `save_handle`, `mesh_boolean`, `mesh_simplify`, `mesh_remesh`, `generate_collision`, `generate_lods`, `fill_holes`, `compute_uvs`, `mirror_mesh`. Behind `#if WITH_GEOMETRYSCRIPT`.
+- [ ] **Phase 6 — Horror & Accessibility (14 actions):** `analyze_sightlines`, `find_hiding_spots`, `find_ambush_points`, `analyze_choke_points`, `analyze_escape_routes`, `classify_zone_tension`, `analyze_pacing_curve`, `find_dead_ends`, `validate_path_width`, `validate_navigation_complexity`, `analyze_visual_contrast`, `find_rest_points`, `validate_interactive_reach`, `generate_accessibility_report`
+- [ ] **Phase 7 — Lighting Analysis (5 actions):** `sample_light_levels`, `find_dark_corners`, `analyze_light_transitions`, `get_light_coverage`, `suggest_light_placement`. Hybrid scene capture + analytic.
+- [ ] **Phase 8 — Audio & Acoustics (14 actions):** Material-aware spatial audio. `get_audio_volumes`, `get_surface_materials`, `estimate_footstep_sound`, `analyze_room_acoustics`, `analyze_sound_propagation`, `find_loud_surfaces`, `find_sound_paths`, `can_ai_hear_from`, `get_stealth_map`, `find_quiet_path`, `suggest_audio_volumes`, `create_audio_volume`, `set_surface_type`, `create_surface_datatable`
+- [ ] **Phase 9 — Performance Analysis (5 actions):** `get_region_performance`, `estimate_placement_cost`, `find_overdraw_hotspots`, `analyze_shadow_cost`, `get_triangle_budget`
+- [ ] **Phase 10 — Decal & Detail Placement (4 actions):** `place_decals`, `place_along_path`, `analyze_prop_density`, `place_storytelling_scene`. Poisson disk, Catmull-Rom, 5 horror patterns.
+- [ ] **Phase 11 — Room Templates & Mesh Validation (8 actions):** `list_room_templates`, `get_room_template`, `apply_room_template`, `create_room_template`, `validate_game_ready`, `suggest_lod_strategy`, `batch_validate`, `compare_lod_chain`
+- [ ] **Phase 12 — Polish:** `align_actors`, `snap_to_floor`, discover workflow hints, tier filtering, integration testing, doc sync.
 
 ---
 

@@ -46,6 +46,7 @@
 #include "AssetToolsModule.h"
 #include "AssetImportTask.h"
 #include "Engine/Texture2D.h"
+#include "Engine/EngineTypes.h"
 #include "Engine/TextureCollection.h"
 #include "Engine/Font.h"
 #include "VT/RuntimeVirtualTexture.h"
@@ -76,8 +77,10 @@ static FString NormalizeInputPinName(const FString& PinName)
 	FString Result = PinName;
 	static const TArray<FString> TypeSuffixes = {
 		TEXT(" (V3)"), TEXT(" (V2)"), TEXT(" (V4)"),
-		TEXT(" (S)"), TEXT(" (T2d)"), TEXT(" (TC)"),
-		TEXT(" (B)"), TEXT(" (MA)"), TEXT(" (MCL)")
+		TEXT(" (S)"), TEXT(" (T2d)"), TEXT(" (TCube)"),
+		TEXT(" (T2dArr)"), TEXT(" (TVol)"), TEXT(" (SB)"),
+		TEXT(" (MA)"), TEXT(" (TExt)"), TEXT(" (B)"),
+		TEXT(" (Stra)"), TEXT(" (MCL)")
 	};
 	for (const FString& Suffix : TypeSuffixes)
 	{
@@ -298,6 +301,7 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::RecompileMaterial),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material asset path"))
+			.Optional(TEXT("include_stats"), TEXT("bool"), TEXT("If true, wait for compilation and return errors/instruction counts (default: false)"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("material"), TEXT("duplicate_material"),
@@ -1149,6 +1153,8 @@ FMonolithActionResult FMonolithMaterialActions::DisconnectExpression(const TShar
 
 	if (!bDisconnectOutputs)
 	{
+		FString NormalizedInputName = InputName.IsEmpty() ? TEXT("") : NormalizeInputPinName(InputName);
+
 		for (int32 i = 0; ; ++i)
 		{
 			FExpressionInput* Input = TargetExpr->GetInput(i);
@@ -1158,7 +1164,8 @@ FMonolithActionResult FMonolithMaterialActions::DisconnectExpression(const TShar
 			}
 
 			FString PinName = TargetExpr->GetInputName(i).ToString();
-			if (InputName.IsEmpty() || PinName == InputName)
+			FString NormalizedPinName = NormalizeInputPinName(PinName);
+			if (InputName.IsEmpty() || PinName == InputName || NormalizedPinName == NormalizedInputName)
 			{
 				if (Input->Expression != nullptr)
 				{
@@ -1234,6 +1241,22 @@ FMonolithActionResult FMonolithMaterialActions::DisconnectExpression(const TShar
 	Mat->PreEditChange(nullptr);
 	Mat->PostEditChange();
 	GEditor->EndTransaction();
+
+	if (DisconnectedArray.Num() == 0 && !InputName.IsEmpty())
+	{
+		TArray<FString> AvailablePins;
+		for (int32 i = 0; ; ++i)
+		{
+			FExpressionInput* Input = TargetExpr->GetInput(i);
+			if (!Input) break;
+			FString PinName = TargetExpr->GetInputName(i).ToString();
+			AvailablePins.Add(FString::Printf(TEXT("%s%s"), *PinName,
+				Input->Expression ? TEXT(" [connected]") : TEXT(" [disconnected]")));
+		}
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No input '%s' found on '%s'. Available pins: %s"),
+			*InputName, *ExpressionName, *FString::Join(AvailablePins, TEXT(", "))));
+	}
 
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
@@ -3022,7 +3045,21 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameter(const TShar
 	UMaterialInstanceConstant* MIC = LoadedAsset ? Cast<UMaterialInstanceConstant>(LoadedAsset) : nullptr;
 	if (!MIC)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load material instance at '%s'"), *AssetPath));
+		if (Cast<UMaterial>(LoadedAsset))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' is a Material, not a Material Instance. Use 'set_expression_property' to modify expression defaults on base materials, or create a Material Instance with 'create_material_instance'."),
+				*AssetPath));
+		}
+		if (Cast<UMaterialFunction>(LoadedAsset))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' is a Material Function, not a Material Instance. Use 'set_expression_property' to modify expression defaults."),
+				*AssetPath));
+		}
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to load material instance at '%s' (loaded as %s)"),
+			*AssetPath, LoadedAsset ? *LoadedAsset->GetClass()->GetName() : TEXT("null")));
 	}
 
 	MIC->Modify();
@@ -3122,6 +3159,48 @@ FMonolithActionResult FMonolithMaterialActions::RecompileMaterial(const TSharedP
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
 	ResultJson->SetStringField(TEXT("status"), TEXT("recompiled"));
+
+	// Optional inline compilation stats
+	bool bIncludeStats = false;
+	if (Params->HasField(TEXT("include_stats")))
+	{
+		bIncludeStats = Params->GetBoolField(TEXT("include_stats"));
+	}
+
+	if (bIncludeStats && BaseMat)
+	{
+		// GetStatistics internally calls FinishCompilation(), blocking until shaders are done
+		FMaterialStatistics Stats = UMaterialEditingLibrary::GetStatistics(MatInterface);
+		ResultJson->SetNumberField(TEXT("num_pixel_shader_instructions"), Stats.NumPixelShaderInstructions);
+		ResultJson->SetNumberField(TEXT("num_vertex_shader_instructions"), Stats.NumVertexShaderInstructions);
+
+		const EShaderPlatform ShaderPlatform = GShaderPlatformForFeatureLevel[GMaxRHIFeatureLevel];
+		FMaterialResource* MatResource = BaseMat->GetMaterialResource(ShaderPlatform);
+		bool bIsCompiled = false;
+		if (MatResource)
+		{
+			bIsCompiled = MatResource->IsGameThreadShaderMapComplete();
+
+			const TArray<FString>& Errors = MatResource->GetCompileErrors();
+			if (Errors.Num() > 0)
+			{
+				TArray<TSharedPtr<FJsonValue>> ErrorsArray;
+				for (const FString& Err : Errors)
+				{
+					ErrorsArray.Add(MakeShared<FJsonValueString>(Err));
+				}
+				ResultJson->SetArrayField(TEXT("compile_errors"), ErrorsArray);
+			}
+		}
+
+		// Override is_compiled if we got valid instruction counts — shader map may not be loaded in memory
+		// but stats are cached from a previous compilation
+		if (!bIsCompiled && (Stats.NumVertexShaderInstructions > 0 || Stats.NumPixelShaderInstructions > 0))
+		{
+			bIsCompiled = true;
+		}
+		ResultJson->SetBoolField(TEXT("is_compiled"), bIsCompiled);
+	}
 
 	return FMonolithActionResult::Success(ResultJson);
 }
@@ -3395,6 +3474,11 @@ FMonolithActionResult FMonolithMaterialActions::SetExpressionProperty(const TSha
 
 	if (bSuccess)
 	{
+		// Fire PostEditChangeProperty on the expression first (matches editor behavior).
+		// This triggers AutoSetSampleType() for texture expressions.
+		FPropertyChangedEvent ExprChangeEvent(Prop);
+		TargetExpr->PostEditChangeProperty(ExprChangeEvent);
+
 		// Pass the actual property so PostEditChangePropertyInternal calls
 		// MaterialGraph->RebuildGraph() and the editor display updates correctly.
 		FPropertyChangedEvent ChangeEvent(Prop);
@@ -3417,11 +3501,49 @@ FMonolithActionResult FMonolithMaterialActions::SetExpressionProperty(const TSha
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to set property '%s' to '%s' on expression '%s'"), *PropName, *ValueStr, *ExprName));
 	}
 
+	// VT compatibility check — warn on texture/sampler mismatch
+	TArray<FString> Warnings;
+	if (PropName.Equals(TEXT("Texture"), ESearchCase::IgnoreCase))
+	{
+		if (UMaterialExpressionTextureBase* TexExpr = Cast<UMaterialExpressionTextureBase>(TargetExpr))
+		{
+			UTexture* AssignedTex = TexExpr->Texture;
+			if (AssignedTex)
+			{
+				bool bSamplerIsVT = IsVirtualSamplerType(TexExpr->SamplerType);
+				bool bTextureIsVT = AssignedTex->VirtualTextureStreaming;
+
+				if (bTextureIsVT && !bSamplerIsVT)
+				{
+					Warnings.Add(FString::Printf(
+						TEXT("Texture '%s' has VirtualTextureStreaming=true but sampler type is non-VT. This will cause compilation errors. Disable VirtualTextureStreaming on the texture or change sampler type."),
+						*AssignedTex->GetName()));
+				}
+				else if (!bTextureIsVT && bSamplerIsVT)
+				{
+					Warnings.Add(FString::Printf(
+						TEXT("Texture '%s' has VirtualTextureStreaming=false but sampler type is VT. This will cause compilation errors."),
+						*AssignedTex->GetName()));
+				}
+			}
+		}
+	}
+
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
 	ResultJson->SetStringField(TEXT("expression_name"), ExprName);
 	ResultJson->SetStringField(TEXT("property_name"), PropName);
 	ResultJson->SetStringField(TEXT("value"), ValueStr);
+
+	if (Warnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarningArray;
+		for (const FString& W : Warnings)
+		{
+			WarningArray.Add(MakeShared<FJsonValueString>(W));
+		}
+		ResultJson->SetArrayField(TEXT("warnings"), WarningArray);
+	}
 
 	return FMonolithActionResult::Success(ResultJson);
 }
@@ -4306,7 +4428,21 @@ FMonolithActionResult FMonolithMaterialActions::SetInstanceParameters(const TSha
 	UMaterialInstanceConstant* MIC = LoadedAsset ? Cast<UMaterialInstanceConstant>(LoadedAsset) : nullptr;
 	if (!MIC)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load material instance at '%s'"), *AssetPath));
+		if (Cast<UMaterial>(LoadedAsset))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' is a Material, not a Material Instance. Use 'set_expression_property' to modify expression defaults on base materials, or create a Material Instance with 'create_material_instance'."),
+				*AssetPath));
+		}
+		if (Cast<UMaterialFunction>(LoadedAsset))
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("'%s' is a Material Function, not a Material Instance. Use 'set_expression_property' to modify expression defaults."),
+				*AssetPath));
+		}
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Failed to load material instance at '%s' (loaded as %s)"),
+			*AssetPath, LoadedAsset ? *LoadedAsset->GetClass()->GetName() : TEXT("null")));
 	}
 
 	const TArray<TSharedPtr<FJsonValue>>* ParamArray = nullptr;

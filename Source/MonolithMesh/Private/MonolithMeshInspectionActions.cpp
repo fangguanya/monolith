@@ -10,6 +10,7 @@
 
 #include "Engine/StaticMesh.h"
 #include "Engine/SkeletalMesh.h"
+#include "MeshDescription.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "Rendering/SkeletalMeshRenderData.h"
 #include "StaticMeshResources.h"
@@ -1059,6 +1060,103 @@ FMonolithActionResult FMonolithMeshInspectionActions::AnalyzeMeshQuality(const T
 		Issue->SetStringField(TEXT("message"), FString::Printf(TEXT("Mesh uses %d materials — consider merging for fewer draw calls"), MatCount));
 		Issues.Add(MakeShared<FJsonValueObject>(Issue));
 		OverallScore -= (MatCount - 4) * 2;
+	}
+
+	// -- Topology checks via FMeshDescription (non-manifold edges, loose vertices, open borders) --
+	int32 NonManifoldEdges = 0;
+	int32 LooseVertices = 0;
+	int32 OpenBorderEdges = 0;
+	bool bTopologySkipped = false;
+
+	static constexpr int32 TopologyTriangleLimit = 500000;
+	if (NumTris > TopologyTriangleLimit)
+	{
+		UE_LOG(LogMonolith, Warning,
+			TEXT("MonolithMesh: analyze_mesh_quality skipping topology checks — mesh has %d triangles (limit %d)"),
+			NumTris, TopologyTriangleLimit);
+		bTopologySkipped = true;
+		NonManifoldEdges = -1;
+		LooseVertices = -1;
+		OpenBorderEdges = -1;
+	}
+	else
+	{
+		FMeshDescription* MeshDesc = SM->GetMeshDescription(0);
+		if (MeshDesc)
+		{
+			// Ensure indexers are built so edge/vertex connectivity queries work
+			MeshDesc->BuildIndexers();
+
+			// Non-manifold edges: >2 connected triangles
+			// Open border edges: exactly 1 connected triangle
+			for (const FEdgeID EdgeID : MeshDesc->Edges().GetElementIDs())
+			{
+				const int32 NumConnectedTris = MeshDesc->GetNumEdgeConnectedTriangles(EdgeID);
+				if (NumConnectedTris > 2)
+				{
+					NonManifoldEdges++;
+				}
+				else if (NumConnectedTris == 1)
+				{
+					OpenBorderEdges++;
+				}
+			}
+
+			// Loose vertices: no connected triangles (orphaned)
+			for (const FVertexID VertexID : MeshDesc->Vertices().GetElementIDs())
+			{
+				if (MeshDesc->IsVertexOrphaned(VertexID))
+				{
+					LooseVertices++;
+				}
+			}
+		}
+		else
+		{
+			UE_LOG(LogMonolith, Warning,
+				TEXT("MonolithMesh: analyze_mesh_quality — GetMeshDescription(0) returned null, topology checks unavailable"));
+			bTopologySkipped = true;
+			NonManifoldEdges = -1;
+			LooseVertices = -1;
+			OpenBorderEdges = -1;
+		}
+	}
+
+	Metrics->SetNumberField(TEXT("non_manifold_edges"), NonManifoldEdges);
+	Metrics->SetNumberField(TEXT("loose_vertices"), LooseVertices);
+	Metrics->SetNumberField(TEXT("open_border_edges"), OpenBorderEdges);
+
+	if (!bTopologySkipped)
+	{
+		if (NonManifoldEdges > 0)
+		{
+			auto Issue = MakeShared<FJsonObject>();
+			Issue->SetStringField(TEXT("type"), TEXT("non_manifold_edges"));
+			Issue->SetStringField(TEXT("severity"), TEXT("warning"));
+			Issue->SetStringField(TEXT("message"), FString::Printf(TEXT("%d non-manifold edges detected (>2 connected triangles)"), NonManifoldEdges));
+			Issues.Add(MakeShared<FJsonValueObject>(Issue));
+			OverallScore -= FMath::Min(NonManifoldEdges * 3, 20);
+		}
+
+		if (LooseVertices > 0)
+		{
+			auto Issue = MakeShared<FJsonObject>();
+			Issue->SetStringField(TEXT("type"), TEXT("loose_vertices"));
+			Issue->SetStringField(TEXT("severity"), LooseVertices > 50 ? TEXT("warning") : TEXT("info"));
+			Issue->SetStringField(TEXT("message"), FString::Printf(TEXT("%d loose vertices (not connected to any polygon)"), LooseVertices));
+			Issues.Add(MakeShared<FJsonValueObject>(Issue));
+			OverallScore -= FMath::Min(LooseVertices, 10);
+		}
+
+		if (OpenBorderEdges > 0)
+		{
+			auto Issue = MakeShared<FJsonObject>();
+			Issue->SetStringField(TEXT("type"), TEXT("open_border_edges"));
+			Issue->SetStringField(TEXT("severity"), TEXT("info"));
+			Issue->SetStringField(TEXT("message"), FString::Printf(TEXT("%d open border edges (mesh has holes)"), OpenBorderEdges));
+			Issues.Add(MakeShared<FJsonValueObject>(Issue));
+			OverallScore -= FMath::Min(OpenBorderEdges / 2, 10);
+		}
 	}
 
 	// -- Vertex color presence --

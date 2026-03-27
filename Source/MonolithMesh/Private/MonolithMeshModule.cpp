@@ -22,7 +22,7 @@ void FMonolithMeshModule::StartupModule()
 	FMonolithMeshSpatialActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshBlockoutActions::RegisterActions(FMonolithToolRegistry::Get());
 
-	UE_LOG(LogMonolith, Log, TEXT("Monolith — Mesh module loaded (46 actions)"));
+	UE_LOG(LogMonolith, Log, TEXT("Monolith — Mesh module loaded (47 actions)"));
 }
 
 void FMonolithMeshModule::ShutdownModule()

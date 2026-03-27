@@ -167,6 +167,80 @@ MonolithMeshUtils::FBlockoutTags ParseBlockoutTags(const AActor* Actor)
 	FBlockoutTags Result;
 	if (!Actor) return Result;
 
+	// --- Blueprint property reflection path (BP_MonolithBlockoutVolume) ---
+	// If the actor has a "RoomType" UPROPERTY, read all blockout properties directly
+	// from the Blueprint CDO instead of parsing actor tags. This avoids any compile-time
+	// dependency on the Blueprint class.
+	UClass* ActorClass = Actor->GetClass();
+	FProperty* RoomTypeProp = ActorClass->FindPropertyByName(TEXT("RoomType"));
+	if (RoomTypeProp && ActorClass->GetName().Contains(TEXT("MonolithBlockout")))
+	{
+		const void* ActorPtr = static_cast<const void*>(Actor);
+
+		if (FStrProperty* StrProp = CastField<FStrProperty>(RoomTypeProp))
+		{
+			Result.RoomType = StrProp->GetPropertyValue_InContainer(ActorPtr);
+		}
+
+		if (FProperty* DensityProp = ActorClass->FindPropertyByName(TEXT("Density")))
+		{
+			if (FStrProperty* StrProp = CastField<FStrProperty>(DensityProp))
+			{
+				Result.Density = StrProp->GetPropertyValue_InContainer(ActorPtr);
+			}
+		}
+
+		if (FProperty* PhysicsProp = ActorClass->FindPropertyByName(TEXT("bAllowPhysics")))
+		{
+			if (FBoolProperty* BoolProp = CastField<FBoolProperty>(PhysicsProp))
+			{
+				Result.bAllowPhysics = BoolProp->GetPropertyValue_InContainer(ActorPtr);
+			}
+		}
+
+		if (FProperty* FloorProp = ActorClass->FindPropertyByName(TEXT("FloorHeight")))
+		{
+			if (FFloatProperty* FloatProp = CastField<FFloatProperty>(FloorProp))
+			{
+				Result.FloorHeight = FloatProp->GetPropertyValue_InContainer(ActorPtr);
+			}
+		}
+
+		if (FProperty* WallsProp = ActorClass->FindPropertyByName(TEXT("bHasWalls")))
+		{
+			if (FBoolProperty* BoolProp = CastField<FBoolProperty>(WallsProp))
+			{
+				Result.bHasWalls = BoolProp->GetPropertyValue_InContainer(ActorPtr);
+			}
+		}
+
+		if (FProperty* CeilingProp = ActorClass->FindPropertyByName(TEXT("bHasCeiling")))
+		{
+			if (FBoolProperty* BoolProp = CastField<FBoolProperty>(CeilingProp))
+			{
+				Result.bHasCeiling = BoolProp->GetPropertyValue_InContainer(ActorPtr);
+			}
+		}
+
+		if (FProperty* TagsProp = ActorClass->FindPropertyByName(TEXT("BlockoutTags")))
+		{
+			if (FArrayProperty* ArrayProp = CastField<FArrayProperty>(TagsProp))
+			{
+				if (FStrProperty* InnerProp = CastField<FStrProperty>(ArrayProp->Inner))
+				{
+					FScriptArrayHelper ArrayHelper(ArrayProp, ArrayProp->ContainerPtrToValuePtr<void>(ActorPtr));
+					for (int32 i = 0; i < ArrayHelper.Num(); ++i)
+					{
+						Result.Tags.Add(InnerProp->GetPropertyValue(ArrayHelper.GetRawPtr(i)));
+					}
+				}
+			}
+		}
+
+		return Result;
+	}
+
+	// --- Tag parsing path (ABlockingVolume with Monolith.* actor tags) ---
 	for (const FName& Tag : Actor->Tags)
 	{
 		FString TagStr = Tag.ToString();

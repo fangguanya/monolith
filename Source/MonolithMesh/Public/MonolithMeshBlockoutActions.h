@@ -52,10 +52,18 @@ private:
 	// --- Prop scattering ---
 	static FMonolithActionResult ScatterProps(const TSharedPtr<FJsonObject>& Params);
 
+	// --- Blueprint volume creation ---
+	static FMonolithActionResult CreateBlockoutBlueprint(const TSharedPtr<FJsonObject>& Params);
+
 	// --- Helpers ---
 
 	/** Find a BlockingVolume by name. Returns nullptr and sets OutError on failure. */
 	static ABlockingVolume* FindBlockingVolume(const FString& VolumeName, FString& OutError);
+
+	/** Find a blockout volume by name — searches both ABlockingVolume (tag-based) and
+	 *  BP_MonolithBlockoutVolume actors (Blueprint property-based). Returns AActor* since
+	 *  callers only need GetActorBounds/Tags which live on AActor. */
+	static AActor* FindBlockoutVolumeAny(const FString& VolumeName, FString& OutError);
 
 	/** Get or create a transient blockout material instance for a category color */
 	static UMaterialInstanceDynamic* GetBlockoutMaterial(const FString& Category);
