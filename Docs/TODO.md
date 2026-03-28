@@ -4,12 +4,21 @@ Last updated: 2026-03-28
 
 ---
 
-### MonolithMesh Module — 240 Actions, ALL 22 PHASES COMPLETE + Proc Geo Overhaul + Procedural Town Generator (2026-03-28)
+### MonolithMesh Module — 241 Actions, ALL 22 PHASES COMPLETE + Proc Geo Overhaul + Procedural Town Generator + Fix Plan v2 (2026-03-28)
 
 - [x] Phase 0-12 — Original 111 actions compiled and tested.
 - [x] Phase 13-22 — Expansion 76 actions compiled (lights, volumes, horror intel, tech art, sublevels, context props, proc geo, presets, encounters, polish).
 - [x] Proc Geo Overhaul — 5 new actions (list_cached_meshes, clear_cache, validate_cache, get_cache_stats, create_blueprint_prefab). Sweep-based thin walls, auto-collision, collision-aware prop placement, proc mesh caching, blueprint prefabs, door trim frames, floor-aware spawning, human-scale defaults. 187 → 192 actions.
 - [x] Procedural Town Generator — 45 new actions across 11 sub-projects (SP1-SP10). Grid-based buildings, floor plans, facades, roofs, city blocks, spatial registry, auto-volumes, terrain adaptation, architectural features, debug views, room furnishing. 195 → 240 mesh actions, 638 → 683 total.
+- [x] Fix Plan v2 — 20 fixes across 3 phases (geometry, floor plan, integration). Stair angles, switchbacks, corridor/door widths, per-floor assignment, aspect ratios, footprint validation, exterior entrance guarantee, building_context/wall_openings on arch features, validate_building action. 240 → 241 mesh actions, 683 → 684 total.
+
+#### Procedural Town Generator — Fix Plan v2 Follow-Up (2026-03-28)
+
+- [ ] **Door mesh placement** — Place closed door meshes in doorways for horror pacing (doors block sightlines, create tension before opening)
+- [ ] **Interior lighting policy** — Define per-room-type lighting defaults for generated buildings (e.g., flickering fluorescent in corridors, warm lamp in bedrooms, no light in storage). Wire into `furnish_room` or separate `light_building` action
+- [ ] **Per-building retry in orchestrator** — When `generate_floor_plan` fails for one building in a `create_city_block` call, retry that building with adjusted params instead of failing the entire block
+- [ ] **Multiple entrances for large buildings** — Buildings above a size threshold should have 2+ exterior entrances (front + back door, or front + fire exit). Currently only one entrance guaranteed
+- [ ] **Batch validation action** — `validate_block` to run `validate_building` across all buildings in a block and return aggregate results
 
 #### Procedural Town Generator — Follow-Up (2026-03-28)
 
@@ -31,7 +40,7 @@ Last updated: 2026-03-28
   - Step-by-step: "How to create a Fantasy Dungeon preset pack"
   - How to test presets via MCP before distributing
   - How to export/import/share preset packs
-- [ ] **SPEC.md MonolithMesh section** — Full 240-action reference with param schemas (currently has Phase 1-4 section + proc geo overhaul + Procedural Town Generator SP1-SP10)
+- [ ] **SPEC.md MonolithMesh section** — Full 241-action reference with param schemas (currently has Phase 1-4 section + proc geo overhaul + Procedural Town Generator SP1-SP10 + validate_building)
 - [ ] **MCP.md mesh_query docs** — Tool reference for mesh_query namespace
 - [ ] **README update** — Feature highlight for MonolithMesh in the plugin README
 

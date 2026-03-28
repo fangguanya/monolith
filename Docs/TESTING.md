@@ -45,9 +45,9 @@ def test_action(namespace, action, params=None):
 
 ---
 
-## Current Status: 480/534 ACTIONS PASS (9 PENDING, 45 UNTESTED) + Incremental Indexer PASS
+## Current Status: 480/535 ACTIONS PASS (9 PENDING, 46 UNTESTED) + Incremental Indexer PASS
 
-All 11 modules tested. 2026-03-28: Procedural Town Generator — 45 new actions across 11 sub-projects (489→534 total). Compilation verified, runtime testing pending. 2026-03-27: MonolithMesh module — 46 new actions (443→489 total). Compilation verified, basic MCP registration verified. 2026-03-25: Niagara expansion — 31 new actions (65→96 niagara, 349→443 total). 40/40 PASS, 3 SKIPPED, 3 bugs found and fixed during testing (type fallback warning, spawn shape duplicate, NPC namespace mismatch). Also 9 new material function actions (48→57 mat). Polish pass 2026-03-14 added 4 Niagara actions + get_system_property (213→218). 2026-03-15: HLSL module/function creation tested end-to-end (CPU + GPU), 3 bugs fixed (input exposure, dot validation, numeric index lookup). 2026-03-17: Blueprint module waves 2-7 full test pass (48/48 + 17 retests). 21 bugs found and fixed during testing session. Total actions now 278. 2026-03-17: Material module full test pass (44/44 + 11 retests). 11 bugs found and fixed. 2026-03-18: Niagara module full test pass (37/37 + 8 retests). 16 bugs found and fixed. 2026-03-18: Animation Wave 8-10 full test pass (33/33 + 4 retests). 12 bugs found and fixed. 2026-03-22: MonolithUI module full test pass (42/42). All 8 action classes verified.
+All 11 modules tested. 2026-03-28: Fix Plan v2 — 20 fixes across 3 phases + `validate_building` action (534→535 total, 241 mesh actions). Stair/fire escape/ramp angle fixes, floor plan corridor/door/entrance guarantees, building_context on arch features. 2026-03-28: Procedural Town Generator — 45 new actions across 11 sub-projects (489→534 total). Compilation verified, runtime testing pending. 2026-03-27: MonolithMesh module — 46 new actions (443→489 total). Compilation verified, basic MCP registration verified. 2026-03-25: Niagara expansion — 31 new actions (65→96 niagara, 349→443 total). 40/40 PASS, 3 SKIPPED, 3 bugs found and fixed during testing (type fallback warning, spawn shape duplicate, NPC namespace mismatch). Also 9 new material function actions (48→57 mat). Polish pass 2026-03-14 added 4 Niagara actions + get_system_property (213→218). 2026-03-15: HLSL module/function creation tested end-to-end (CPU + GPU), 3 bugs fixed (input exposure, dot validation, numeric index lookup). 2026-03-17: Blueprint module waves 2-7 full test pass (48/48 + 17 retests). 21 bugs found and fixed during testing session. Total actions now 278. 2026-03-17: Material module full test pass (44/44 + 11 retests). 11 bugs found and fixed. 2026-03-18: Niagara module full test pass (37/37 + 8 retests). 16 bugs found and fixed. 2026-03-18: Animation Wave 8-10 full test pass (33/33 + 4 retests). 12 bugs found and fixed. 2026-03-22: MonolithUI module full test pass (42/42). All 8 action classes verified.
 
 ---
 
@@ -65,9 +65,9 @@ All 11 modules tested. 2026-03-28: Procedural Town Generator — 45 new actions 
 
 ---
 
-## Procedural Town Generator — 45 Actions, 11 Sub-Projects (2026-03-28)
+## Procedural Town Generator — 46 Actions, 11 Sub-Projects (2026-03-28)
 
-45 new actions across 11 sub-projects. Compilation verified. Runtime testing pending.
+46 actions across 11 sub-projects (45 original + `validate_building`). Compilation verified. Runtime testing pending. Fix Plan v2 applied: 20 fixes across geometry, floor plan, and integration phases.
 
 **Master plan:** `Docs/plans/2026-03-28-proc-town-generator-master-plan.md`
 
@@ -75,14 +75,14 @@ All 11 modules tested. 2026-03-28: Procedural Town Generator — 45 new actions 
 
 | Action | Status | Test Plan | Notes |
 |--------|--------|-----------|-------|
-| `create_building_from_grid` | **UNTESTED** | Create a 3-room grid (kitchen, living room, hallway) with 2 doors. Verify: no duplicate walls, doors connect rooms, collision works, player can walk between rooms. Then create a 2-story building with stairwell — verify stairs connect floors, stairwell cutout in ceiling slab | Foundation action — everything downstream depends on this |
+| `create_building_from_grid` | **UNTESTED** | Create a 3-room grid (kitchen, living room, hallway) with 2 doors. Verify: no duplicate walls, doors connect rooms, collision works, player can walk between rooms. Then create a 2-story building with stairwell — verify stairs connect floors (32-degree angle, switchback support), stairwell cutout in ceiling slab. Test `omit_exterior_walls=true` for facade workflow | Foundation action — everything downstream depends on this. Fix Plan v2: stair angle 70->32 deg, switchback support, omit_exterior_walls param |
 | `create_grid_from_rooms` | **UNTESTED** | Provide room list + adjacency requirements. Verify grid output matches expected layout | Helper for programmatic grid construction |
 
 ### SP2: Automatic Floor Plan Generation (3 actions)
 
 | Action | Status | Test Plan | Notes |
 |--------|--------|-----------|-------|
-| `generate_floor_plan` | **UNTESTED** | Generate "residential_house" floor plan at 800x600. Verify: kitchen connects to dining, bathroom off hallway (not through bedroom), bedrooms upstairs, ALL rooms reachable via hallway or direct adjacency. Test hospice_mode: min 100cm doors, 180cm corridors | Core algorithm: squarified treemap + corridor insertion |
+| `generate_floor_plan` | **UNTESTED** | Generate "residential_house" floor plan at 800x600. Verify: kitchen connects to dining, bathroom off hallway (not through bedroom), bedrooms upstairs (per-floor assignment), ALL rooms reachable via hallway or direct adjacency. Verify corridor width >= 120cm, door width >= 90cm, at least one exterior entrance on ground floor, no room aspect ratio worse than 1:4, rooms within footprint bounds. Test hospice_mode: min 100cm doors, 180cm corridors | Core algorithm: squarified treemap + corridor insertion. Fix Plan v2: corridor width min, door width min, per-floor assignment, aspect ratios, footprint validation, guaranteed exterior entrance |
 | `list_building_archetypes` | **UNTESTED** | Call with no params, verify returns archetype list from BuildingArchetypes/ | Read-only, should be straightforward |
 | `get_building_archetype` | **UNTESTED** | Get "residential_house" archetype, verify JSON contains room types, sizes, adjacency requirements | Read-only |
 
@@ -146,10 +146,10 @@ All 11 modules tested. 2026-03-28: Procedural Town Generator — 45 new actions 
 
 | Action | Status | Test Plan | Notes |
 |--------|--------|-----------|-------|
-| `create_balcony` | **UNTESTED** | Add balcony to 2-story building second floor. Verify: extends outward, has railing, doesn't intersect building walls | Upper floor exterior feature |
-| `create_porch` | **UNTESTED** | Add porch to building entrance. Verify: ground-level, covered, columns present | Ground-level entry feature |
-| `create_fire_escape` | **UNTESTED** | Add fire escape to 3-story building. Verify: zigzag stairs connect all floors, landings at each floor | Multi-floor exterior stairs |
-| `create_ramp_connector` | **UNTESTED** | Create ramp between two heights. Verify ADA compliance (1:12 slope, max 76cm rise per run) | Accessibility feature |
+| `create_balcony` | **UNTESTED** | Add balcony to 2-story building second floor. Verify: extends outward, has railing, doesn't intersect building walls. Test `building_context` collision checks, `wall_openings` in response | Upper floor exterior feature. Fix Plan v2: building_context param, wall_openings output |
+| `create_porch` | **UNTESTED** | Add porch to building entrance. Verify: ground-level, covered, columns present. Test `building_context` collision checks, `wall_openings` in response | Ground-level entry feature. Fix Plan v2: building_context param, wall_openings output |
+| `create_fire_escape` | **UNTESTED** | Add fire escape to 3-story building. Verify: zigzag stairs connect all floors (45-degree angle), landings at each floor, `building_context` collision checks, `wall_openings` in response | Multi-floor exterior stairs. Fix Plan v2: angle 66->45 deg, building_context param, wall_openings output |
+| `create_ramp_connector` | **UNTESTED** | Create ramp between two heights. Verify ADA compliance (1:12 slope, max 76cm rise per run). Verify switchback geometry does not self-intersect. Test `building_context` collision checks, `wall_openings` in response | Accessibility feature. Fix Plan v2: switchback self-intersection fix, building_context param, wall_openings output |
 | `create_railing` | **UNTESTED** | Create railing along a path. Verify swept profile follows path correctly | Swept geometry along edge |
 
 ### SP9: Daredevil Debug View (6 actions)
@@ -171,6 +171,12 @@ All 11 modules tested. 2026-03-28: Procedural Town Generator — 45 new actions 
 | `furnish_building` | **UNTESTED** | Furnish all rooms in a 5-room building. Verify: each room type gets appropriate furniture, horror decay applied proportionally | Building-level furnishing |
 | `list_furniture_presets` | **UNTESTED** | List presets for room_type="kitchen". Verify returns furniture configs from FurniturePresets/ | Read-only preset listing |
 
+### Validation (1 action)
+
+| Action | Status | Test Plan | Notes |
+|--------|--------|-----------|-------|
+| `validate_building` | **UNTESTED** | Run on a building with known issues (disconnected room, missing entrance, steep stairs). Verify: returns `valid: false` with correct `issues[]` entries. Run on a correct building, verify `valid: true`. Test each validation check: room connectivity, door reachability, stair angles, wall thickness, exterior entrance, floor slab coverage | Added in Fix Plan v2. Post-generation integrity checker |
+
 ### Procedural Town Generator — Summary
 
 | Sub-Project | Actions | Status | Notes |
@@ -186,7 +192,8 @@ All 11 modules tested. 2026-03-28: Procedural Town Generator — 45 new actions 
 | SP8b: Arch Features | 5 | **COMPILED** | Balconies, porches, fire escapes, railings |
 | SP9: Debug View | 6 | **COMPILED** | Section clip, floor plan capture, bookmarks |
 | SP10: Furnishing | 3 | **COMPILED** | Room-type furniture, horror dressing |
-| **Total** | **45** | **COMPILED** | Full MCP runtime test pass pending |
+| Validation | 1 | **COMPILED** | `validate_building` — Fix Plan v2 |
+| **Total** | **46** | **COMPILED** | Full MCP runtime test pass pending |
 
 ---
 

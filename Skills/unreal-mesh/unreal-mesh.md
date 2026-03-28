@@ -1,11 +1,11 @@
 ---
 name: unreal-mesh
-description: Use when working with Unreal Engine meshes, scene spatial queries, level blockout, actor manipulation, 3D awareness, horror spatial analysis, accessibility validation, GeometryScript mesh operations, lighting analysis, audio/acoustics, performance budgeting, decal/detail placement, level design (lights, volumes, sublevels, prefabs), tech art (import, LOD, texel density, collision), context-aware prop placement (surface scatter, disturbance, physics sleep), procedural geometry (furniture, structures, mazes, pipes, terrain), procedural town generation (buildings, facades, roofs, streets, city blocks, floor plans, spatial registry, foundations, balconies, fire escapes, room furnishing, debug views), genre presets, encounter design, or hospice accessibility reports via Monolith MCP. Triggers on mesh, StaticMesh, SkeletalMesh, blockout, spatial, raycast, overlap, scene, actor, spawn, LOD, collision, UV, triangle, bounds, scan volume, scatter, navmesh, sightline, hiding, horror, tension, accessibility, wheelchair, lighting, dark, audio, acoustic, surface, footstep, reverb, performance, budget, draw call, decal, blood trail, light, volume, trigger, sublevel, prefab, spline, import, texel, instancing, HISM, material swap, parametric, structure, maze, pipe, terrain, fragment, preset, encounter, patrol, safe room, hospice report, prop kit, disturbance, town, city, block, building, facade, roof, street, floor plan, archetype, lot, foundation, balcony, porch, fire escape, ramp, railing, furnish, furniture, bookmark, section view.
+description: Use when working with Unreal Engine meshes, scene spatial queries, level blockout, actor manipulation, 3D awareness, horror spatial analysis, accessibility validation, GeometryScript mesh operations, lighting analysis, audio/acoustics, performance budgeting, decal/detail placement, level design (lights, volumes, sublevels, prefabs), tech art (import, LOD, texel density, collision), context-aware prop placement (surface scatter, disturbance, physics sleep), procedural geometry (furniture, structures, mazes, pipes, terrain), procedural town generation (buildings, facades, roofs, streets, city blocks, floor plans, spatial registry, foundations, balconies, fire escapes, room furnishing, debug views, validation), genre presets, encounter design, or hospice accessibility reports via Monolith MCP. Triggers on mesh, StaticMesh, SkeletalMesh, blockout, spatial, raycast, overlap, scene, actor, spawn, LOD, collision, UV, triangle, bounds, scan volume, scatter, navmesh, sightline, hiding, horror, tension, accessibility, wheelchair, lighting, dark, audio, acoustic, surface, footstep, reverb, performance, budget, draw call, decal, blood trail, light, volume, trigger, sublevel, prefab, spline, import, texel, instancing, HISM, material swap, parametric, structure, maze, pipe, terrain, fragment, preset, encounter, patrol, safe room, hospice report, prop kit, disturbance, town, city, block, building, facade, roof, street, floor plan, archetype, lot, foundation, balcony, porch, fire escape, ramp, railing, furnish, furniture, bookmark, section view, validate building.
 ---
 
 # Unreal Mesh & Spatial Workflows
 
-You have access to **Monolith** with **240 Mesh actions** (Phases 0-22 + Proc Geo Overhaul + Procedural Town Generator) via `mesh_query()`.
+You have access to **Monolith** with **241 Mesh actions** (Phases 0-22 + Proc Geo Overhaul + Procedural Town Generator) via `mesh_query()`.
 
 ### New in Overhaul (5 new actions + major feature upgrades):
 - `create_blueprint_prefab` -- Dialog-free Blueprint prefab from world actors
@@ -312,7 +312,7 @@ monolith_discover({ namespace: "mesh" })
 | `create_fragments` | `source_handle`, `count`?, `seed`? | Plane-slice mesh fragmentation |
 | `create_terrain_patch` | `size`, `noise`? | Perlin noise heightmap mesh |
 
-### Procedural Town Generation (45 actions) -- Full building-to-block pipeline
+### Procedural Town Generation (46 actions) -- Full building-to-block pipeline
 
 Generates entire city blocks from archetype definitions through a layered pipeline: floor plans -> grid geometry -> facades -> roofs -> streets -> spatial registry -> volumes -> furnishing. Each sprint (SP) adds a layer.
 
@@ -320,14 +320,14 @@ Generates entire city blocks from archetype definitions through a layered pipeli
 
 | Action | Key Params | Purpose |
 |--------|-----------|---------|
-| `create_building_from_grid` | `grid`, `descriptor`? | Grid -> geometry + Building Descriptor output |
+| `create_building_from_grid` | `grid`, `descriptor`?, `omit_exterior_walls`? | Grid -> geometry + Building Descriptor output. `omit_exterior_walls: true` defers walls to `generate_facade`. Door width default 110cm |
 | `create_grid_from_rooms` | `rooms` | Room rects -> occupancy grid |
 
 #### SP2: Floor Plan Generator (3 actions)
 
 | Action | Key Params | Purpose |
 |--------|-----------|---------|
-| `generate_floor_plan` | `archetype`, `footprint` | Archetype + footprint -> grid/rooms/doors |
+| `generate_floor_plan` | `archetype`, `footprint`, `floor_index`? | Archetype + footprint -> grid/rooms/doors. Per-floor room assignment, aspect ratio constraints, footprint validation, guaranteed exterior entrance, corridor width 3 cells |
 | `list_building_archetypes` | -- | List available archetype JSON definitions |
 | `get_building_archetype` | `archetype` | Get a specific archetype definition |
 
@@ -343,7 +343,7 @@ Generates entire city blocks from archetype definitions through a layered pipeli
 
 | Action | Key Params | Purpose |
 |--------|-----------|---------|
-| `generate_roof` | `footprint`, `type` | Footprint + type -> roof geometry (gable/hip/flat/shed/gambrel) |
+| `generate_roof` | `footprint`, `type` | Footprint + type -> roof geometry (gable/hip/flat/shed/gambrel). Works with `omit_exterior_walls` buildings |
 
 #### SP5: City Block Layout (4 actions)
 
@@ -391,11 +391,11 @@ Generates entire city blocks from archetype definitions through a layered pipeli
 
 | Action | Key Params | Purpose |
 |--------|-----------|---------|
-| `create_balcony` | `location`, `size`?, `railing_style`? | Floor slab + railing |
-| `create_porch` | `location`, `size`?, `columns`? | Covered entry with columns |
-| `create_fire_escape` | `building_id`?, `floors`? | Zigzag exterior stairs |
-| `create_ramp_connector` | `start`, `end`, `width`? | ADA-compliant ramp (hospice accessibility) |
-| `create_railing` | `path_points`, `style`? | Railing along arbitrary path |
+| `create_balcony` | `location`, `size`?, `railing_style`?, `building_context`? | Floor slab + railing. Optional `building_context` for auto-orientation; emits `wall_openings` in result |
+| `create_porch` | `location`, `size`?, `columns`?, `building_context`? | Covered entry with columns. Optional `building_context` for auto-orientation; emits `wall_openings` in result |
+| `create_fire_escape` | `building_id`?, `floors`?, `building_context`? | Zigzag exterior stairs. Optional `building_context` for auto-orientation; emits `wall_openings` in result |
+| `create_ramp_connector` | `start`, `end`, `width`?, `building_context`? | ADA-compliant ramp (hospice accessibility). Optional `building_context` for auto-orientation; emits `wall_openings` in result |
+| `create_railing` | `path_points`, `style`?, `building_context`? | Railing along arbitrary path. Optional `building_context` for auto-orientation; emits `wall_openings` in result |
 
 #### SP9: Daredevil Debug View (6 actions)
 
@@ -415,6 +415,12 @@ Generates entire city blocks from archetype definitions through a layered pipeli
 | `furnish_room` | `room_id`, `preset`? | Place furniture by room type |
 | `furnish_building` | `building_id`, `preset`? | Furnish all rooms in a building |
 | `list_furniture_presets` | -- | List available furniture config presets |
+
+#### Building Validation (1 action)
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `validate_building` | `building_id` | Playability validation: capsule sweep walkability, BFS room connectivity, stair angle checks, window exterior raycasts. Returns pass/fail per check with details |
 
 ### Genre Presets (8 actions) -- Extensible preset system
 
@@ -522,13 +528,13 @@ get_scene_statistics -> query_radial_sweep -> get_spatial_relationships
 
 ### Generate a Single Building (Town Gen)
 ```
-list_building_archetypes -> generate_floor_plan -> create_building_from_grid -> generate_facade -> generate_roof -> register_building -> auto_volumes_for_building -> furnish_building
+list_building_archetypes -> generate_floor_plan -> create_building_from_grid -> generate_facade -> generate_roof -> register_building -> auto_volumes_for_building -> furnish_building -> validate_building
 ```
 
 ### Generate a City Block (Town Gen -- Full Pipeline)
 ```
 create_city_block (does it all) OR step-by-step:
-create_lot_layout -> [generate_floor_plan -> create_building_from_grid -> generate_facade -> generate_roof per lot] -> create_street -> place_street_furniture -> auto_volumes_for_block -> save_block_descriptor
+create_lot_layout -> [generate_floor_plan -> create_building_from_grid -> generate_facade -> generate_roof -> validate_building per lot] -> create_street -> place_street_furniture -> auto_volumes_for_block -> save_block_descriptor
 ```
 
 ### Place Building on Terrain (Town Gen)
@@ -561,3 +567,7 @@ create_balcony / create_porch / create_fire_escape / create_ramp_connector -> ap
 - `save_block_descriptor` / `load_block_descriptor` persist to JSON, not uasset -- these are editor-time descriptors
 - `create_ramp_connector` follows ADA slope guidelines by default -- override with `max_slope` param for non-accessible ramps
 - `furnish_room` uses the spatial registry -- the room must be registered first
+- Stairwells need minimum 4x6 cells (24 grid cells) for switchback stairs at 270cm floor height
+- Use `omit_exterior_walls: true` when calling `generate_facade` to avoid double-wall issue
+- Pass `building_context` to architectural features (`create_balcony`, `create_porch`, `create_fire_escape`, `create_ramp_connector`, `create_railing`) for auto-orientation from Building Descriptor's `exterior_faces`
+- Run `validate_building` after generation to verify playability (capsule sweep, BFS connectivity, stair angles, window raycasts)

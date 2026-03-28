@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 14 MCP tools (683 total actions across 11 domains), cutting AI assistant context consumption by ~95%.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 14 MCP tools (684 total actions across 11 domains), cutting AI assistant context consumption by ~95%.
 
 ### What It Replaces
 
@@ -44,7 +44,7 @@ Monolith.uplugin
   MonolithIndex         — SQLite FTS5 deep project indexer, 14 internal indexers (7 MCP actions)
   MonolithSource        — Engine source + API lookup (11 actions)
   MonolithUI            — Widget blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility (42 actions)
-  MonolithMesh          — Mesh inspection, scene manipulation, spatial queries, level blockout, GeometryScript ops, horror/accessibility, lighting, audio/acoustics, performance, decals, level design, tech art, context props, procedural geometry (sweep walls, auto-collision, proc mesh caching, blueprint prefabs), genre presets, encounter design, hospice reports, procedural town generator (240 actions)
+  MonolithMesh          — Mesh inspection, scene manipulation, spatial queries, level blockout, GeometryScript ops, horror/accessibility, lighting, audio/acoustics, performance, decals, level design, tech art, context props, procedural geometry (sweep walls, auto-collision, proc mesh caching, blueprint prefabs), genre presets, encounter design, hospice reports, procedural town generator (241 actions)
   MonolithBABridge      — Optional IModularFeatures bridge for Blueprint Assist integration. Exposes IMonolithGraphFormatter; enables BA-powered auto_layout across blueprint, material, animation, and niagara modules when Blueprint Assist is present (0 MCP actions — integration only)
 ```
 
@@ -911,9 +911,9 @@ The `bInstalled` filter on plugin content paths was replaced with explicit path 
 | `FMonolithMeshCatalog` | Mesh catalog database for search_meshes_by_size and get_mesh_catalog_stats |
 | `FMonolithMeshUtils` | Shared helpers for mesh loading, bounds calculation, actor queries |
 
-#### Actions (240 — namespace: "mesh")
+#### Actions (241 — namespace: "mesh")
 
-> **Note:** 195 original actions (Phases 1-22 + Proc Geo Overhaul) + 45 Procedural Town Generator actions (SP1-SP10).
+> **Note:** 195 original actions (Phases 1-22 + Proc Geo Overhaul) + 46 Procedural Town Generator actions (SP1-SP10 + `validate_building`).
 
 **Inspection (12)**
 | Action | Params | Description |
@@ -992,7 +992,7 @@ The `bInstalled` filter on plugin content paths was replaced with explicit path 
 
 > **Procedural Geometry Overhaul (2026-03-28):** The proc gen actions (`create_parametric_mesh`, `create_structure`, `create_horror_prop`, etc.) now feature sweep-based thin walls (`wall_mode: "sweep"` default), auto snap-to-floor (`snap_to_floor` param), auto-collision on all saved meshes (`collision: auto/box/convex/complex_as_simple/none`), human-scale defaults (stairs 90/28/18cm, doors 90cm, floor 3cm), door/window/vent trim frames (`add_trim` param), and vent openings via `create_structure`. Collision-aware prop placement uses `collision_mode: none/warn/reject/adjust` on scatter actions with SweepSingle box traces for floor finding. All proc gen actions support `use_cache` and `auto_save` params for the caching system.
 
-#### Procedural Town Generator (45 actions — 11 sub-projects)
+#### Procedural Town Generator (46 actions — 11 sub-projects)
 
 Procedural city block generation from a single MCP call. 11 sub-projects composing into a pipeline: grid-based buildings with connected rooms, roofs, facades, furniture, lighting, horror dressing, navmesh, and volumes, all adaptive to terrain. The critical interface is the **Building Descriptor** — a JSON contract that SP1 outputs and SP2-SP10 consume. All building specs are generated server-side (not sent over MCP wire).
 
@@ -1010,13 +1010,13 @@ SP1's `create_building_from_grid` returns a JSON descriptor consumed by all down
 **SP1: Grid-Based Building Construction (2 actions)**
 | Action | Params | Description |
 |--------|--------|-------------|
-| `create_building_from_grid` | `grid`, `rooms`, `doors`, `floors`, `cell_size`?, `materials`? | Grid of room IDs → geometry + Building Descriptor. Auto-detects interior/exterior walls, generates floor/ceiling slabs, stairwell cutouts, trim frames, actor tags |
+| `create_building_from_grid` | `grid`, `rooms`, `doors`, `floors`, `cell_size`?, `materials`?, `omit_exterior_walls`? | Grid of room IDs → geometry + Building Descriptor. Auto-detects interior/exterior walls, generates floor/ceiling slabs, stairwell cutouts, trim frames, actor tags. `omit_exterior_walls` (default false) skips exterior wall generation for facade-only workflows |
 | `create_grid_from_rooms` | `rooms`, `adjacency` | Room list + adjacency requirements → grid layout |
 
 **SP2: Automatic Floor Plan Generation (3 actions)**
 | Action | Params | Description |
 |--------|--------|-------------|
-| `generate_floor_plan` | `archetype`, `width`, `depth`, `floors`?, `hospice_mode`? | Building archetype + footprint → grid + rooms + doors. Squarified treemap with corridor insertion. Hospice mode: 100cm doors, 180cm corridors, rest alcoves |
+| `generate_floor_plan` | `archetype`, `width`, `depth`, `floors`?, `hospice_mode`? | Building archetype + footprint → grid + rooms + doors. Squarified treemap with per-floor room assignment, aspect ratio enforcement, footprint boundary validation, and guaranteed exterior entrance on ground floor. Corridor width min 120cm, door width min 90cm. Hospice mode: 100cm doors, 180cm corridors, rest alcoves |
 | `list_building_archetypes` | none | List available archetype definitions (residential, clinic, police_station, apartment, etc.) |
 | `get_building_archetype` | `archetype` | Get archetype JSON: room types, sizes, adjacency requirements |
 
@@ -1073,10 +1073,10 @@ SP1's `create_building_from_grid` returns a JSON descriptor consumed by all down
 **SP8b: Architectural Features (5 actions)**
 | Action | Params | Description |
 |--------|--------|-------------|
-| `create_balcony` | `building_descriptor`, `floor`, `face`, `width`?, `depth`? | Floor slab + railing extending from upper floor exterior |
-| `create_porch` | `building_descriptor`, `face`, `depth`?, `columns`? | Ground-level covered entry with columns |
-| `create_fire_escape` | `building_descriptor`, `face`, `floors`? | Zigzag exterior stairs between floor landings |
-| `create_ramp_connector` | `start`, `end`, `width`?, `slope`? | ADA-compliant ramp between two heights |
+| `create_balcony` | `building_descriptor`, `floor`, `face`, `width`?, `depth`?, `building_context`? | Floor slab + railing extending from upper floor exterior. `building_context` enables collision checks against existing geometry. Returns `wall_openings` for facade integration |
+| `create_porch` | `building_descriptor`, `face`, `depth`?, `columns`?, `building_context`? | Ground-level covered entry with columns. `building_context` enables collision checks. Returns `wall_openings` for facade integration |
+| `create_fire_escape` | `building_descriptor`, `face`, `floors`?, `building_context`? | Zigzag exterior stairs between floor landings (45-degree angle). `building_context` enables collision checks. Returns `wall_openings` for facade integration |
+| `create_ramp_connector` | `start`, `end`, `width`?, `slope`?, `building_context`? | ADA-compliant ramp between two heights with switchback support. Returns `wall_openings` for facade integration |
 | `create_railing` | `path`, `height`?, `style`? | Swept profile railing along edge path |
 
 **SP9: Daredevil Debug View (6 actions)**
@@ -1095,6 +1095,41 @@ SP1's `create_building_from_grid` returns a JSON descriptor consumed by all down
 | `furnish_room` | `building_descriptor`, `room_id`, `preset`?, `disturbance`? | Place appropriate furniture per room type. Horror dressing via optional disturbance level (orderly/slightly_messy/ransacked/abandoned) |
 | `furnish_building` | `building_descriptor`, `decay`? | Furnish all rooms in a building, applying horror decay per room |
 | `list_furniture_presets` | `room_type`? | List available furniture preset configurations per room type |
+
+**Validation (1 action)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `validate_building` | `building_descriptor` | Post-generation validation: checks room connectivity, door reachability, stair angle limits, wall thickness, exterior entrance existence, floor slab coverage. Returns `valid` bool + `issues[]` with severity, location, and description per problem found |
+
+#### Fix Plan v2 Changes (2026-03-28)
+
+20 issues fixed across 3 phases targeting building generation correctness and playability:
+
+**Phase 1 — Geometry Fixes:**
+1. Building stairs angle reduced from 70 degrees to 32 degrees (standard residential)
+2. Building stairs switchback support for multi-story buildings
+3. Fire escape angle reduced from 66 degrees to 45 degrees
+4. Ramp connector switchback self-intersection fix
+5. Exterior wall omission via `omit_exterior_walls` param on `create_building_from_grid`
+6. Wall thickness validation (minimum 10cm, maximum 60cm)
+
+**Phase 2 — Floor Plan Fixes:**
+7. Corridor minimum width enforced at 120cm
+8. Door minimum width enforced at 90cm
+9. Per-floor room assignment in `generate_floor_plan` (bedrooms upstairs, living areas ground floor)
+10. Room aspect ratio enforcement (no rooms narrower than 1:4)
+11. Footprint boundary validation (rooms cannot exceed building footprint)
+12. Guaranteed exterior entrance on ground floor
+
+**Phase 3 — Integration Fixes:**
+13. `building_context` param on architectural feature actions (balcony, porch, fire escape, ramp)
+14. `wall_openings` output on architectural feature actions for facade coordination
+15. Stairwell ceiling cutout geometry correctness
+16. Floor slab coverage validation (no gaps between rooms)
+17. Room connectivity validation (all rooms reachable)
+18. Door placement validation (doors on shared walls only)
+19. `validate_building` action added for post-generation integrity checks
+20. Graceful error reporting with per-issue severity levels
 
 **Data Files (Procedural Town Generator)**
 | Directory | Sub-Project | Contents |
