@@ -71,6 +71,8 @@ void FMonolithMeshCityBlockActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("skip_roofs"), TEXT("boolean"), TEXT("Skip roof generation"), TEXT("false"))
 			.Optional(TEXT("skip_streets"), TEXT("boolean"), TEXT("Skip street generation"), TEXT("false"))
 			.Optional(TEXT("skip_furniture"), TEXT("boolean"), TEXT("Skip street furniture"), TEXT("false"))
+			.Optional(TEXT("skip_validation"), TEXT("boolean"), TEXT("Skip post-generation validation for faster iteration"), TEXT("false"))
+			.Optional(TEXT("validate_and_retry"), TEXT("boolean"), TEXT("Retry buildings that fail validation (score < 0.5) with different seeds, max 2 retries"), TEXT("false"))
 			.Build());
 
 	// 2. create_lot_layout — standalone subdivision
@@ -1206,6 +1208,10 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 		? Params->GetBoolField(TEXT("skip_streets")) : false;
 	const bool bSkipFurniture = Params->HasField(TEXT("skip_furniture"))
 		? Params->GetBoolField(TEXT("skip_furniture")) : false;
+	const bool bSkipValidation = Params->HasField(TEXT("skip_validation"))
+		? Params->GetBoolField(TEXT("skip_validation")) : false;
+	const bool bValidateAndRetry = Params->HasField(TEXT("validate_and_retry"))
+		? Params->GetBoolField(TEXT("validate_and_retry")) : false;
 
 	FVector BlockOrigin = FVector::ZeroVector;
 	MonolithMeshUtils::ParseVector(Params, TEXT("location"), BlockOrigin);
@@ -1263,6 +1269,11 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 
 	TArray<TSharedPtr<FJsonValue>> BuildingResults;
 	TArray<FString> DestroyedBuildings;
+
+	// Validation tracking
+	int32 BuildingsValidated = 0;
+	int32 BuildingsPassed = 0;
+	double ValidationScoreSum = 0.0;
 
 	for (int32 i = 0; i < LotsArr->Num() && i < BuildingCount; ++i)
 	{
@@ -1598,6 +1609,127 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 			}
 		}
 
+		// ---- Post-generation validation ----
+		if (!bSkipValidation)
+		{
+			const FString BuildingId = FString::Printf(TEXT("Building_%02d"), i);
+
+			auto ValParams = MakeShared<FJsonObject>();
+			ValParams->SetStringField(TEXT("building_id"), BuildingId);
+			ValParams->SetBoolField(TEXT("check_doors"), true);
+			ValParams->SetBoolField(TEXT("check_connectivity"), true);
+			ValParams->SetBoolField(TEXT("check_stairs"), true);
+
+			TSharedPtr<FJsonObject> ValResult;
+			FString ValError;
+			if (TryExecuteAction(TEXT("validate_building"), ValParams, ValResult, ValError))
+			{
+				float ValScore = ValResult.IsValid() && ValResult->HasField(TEXT("score"))
+					? static_cast<float>(ValResult->GetNumberField(TEXT("score"))) : 1.0f;
+
+				UE_LOG(LogMonolithCityBlock, Log, TEXT("    Validation building %d: score=%.2f"), i, ValScore);
+
+				// Retry logic: if score < 0.5 and validate_and_retry is enabled
+				if (bValidateAndRetry && ValScore < 0.5f)
+				{
+					float BestScore = ValScore;
+					TSharedPtr<FJsonObject> BestValResult = ValResult;
+					TSharedPtr<FJsonObject> BestBuildingResult = BuildingResult;
+
+					constexpr int32 MaxRetries = 2;
+					for (int32 Retry = 1; Retry <= MaxRetries; ++Retry)
+					{
+						const int32 RetrySeed = Seed + i + Retry * 100;
+						UE_LOG(LogMonolithCityBlock, Log, TEXT("    Retry %d/%d for building %d (score %.2f < 0.5), seed=%d"),
+							Retry, MaxRetries, i, BestScore, RetrySeed);
+
+						// Regenerate with new seed
+						BuildingGridParams->SetNumberField(TEXT("seed"), RetrySeed);
+						BuildingGridParams->SetBoolField(TEXT("overwrite"), true);
+
+						TSharedPtr<FJsonObject> RetryBuildResult;
+						FString RetryBuildError;
+						if (!TryExecuteAction(TEXT("create_building_from_grid"), BuildingGridParams, RetryBuildResult, RetryBuildError))
+						{
+							UE_LOG(LogMonolithCityBlock, Warning, TEXT("    Retry %d build failed: %s"), Retry, *RetryBuildError);
+							continue;
+						}
+
+						// Re-register in spatial registry
+						auto RetryRegParams = MakeShared<FJsonObject>();
+						RetryRegParams->SetStringField(TEXT("building_id"), BuildingId);
+						if (RetryBuildResult.IsValid())
+						{
+							RetryRegParams->SetObjectField(TEXT("building_descriptor"), RetryBuildResult);
+						}
+						TSharedPtr<FJsonObject> RetryRegResult;
+						FString RetryRegError;
+						TryExecuteAction(TEXT("register_building"), RetryRegParams, RetryRegResult, RetryRegError);
+
+						// Re-validate
+						TSharedPtr<FJsonObject> RetryValResult;
+						FString RetryValError;
+						if (TryExecuteAction(TEXT("validate_building"), ValParams, RetryValResult, RetryValError))
+						{
+							float RetryScore = RetryValResult.IsValid() && RetryValResult->HasField(TEXT("score"))
+								? static_cast<float>(RetryValResult->GetNumberField(TEXT("score"))) : 0.0f;
+
+							UE_LOG(LogMonolithCityBlock, Log, TEXT("    Retry %d score: %.2f (best: %.2f)"), Retry, RetryScore, BestScore);
+
+							if (RetryScore > BestScore)
+							{
+								BestScore = RetryScore;
+								BestValResult = RetryValResult;
+								BestBuildingResult = RetryBuildResult;
+							}
+
+							// Early out if we pass
+							if (BestScore >= 0.5f)
+							{
+								break;
+							}
+						}
+						else
+						{
+							UE_LOG(LogMonolithCityBlock, Warning, TEXT("    Retry %d validation failed: %s"), Retry, *RetryValError);
+						}
+					}
+
+					// Use the best attempt
+					ValResult = BestValResult;
+					ValScore = BestScore;
+					BuildingResult = BestBuildingResult;
+
+					UE_LOG(LogMonolithCityBlock, Log, TEXT("    Final score for building %d after retries: %.2f"), i, ValScore);
+				}
+
+				// Track validation stats
+				BuildingsValidated++;
+				ValidationScoreSum += ValScore;
+				bool bPassed = ValResult.IsValid() && ValResult->HasField(TEXT("valid"))
+					? ValResult->GetBoolField(TEXT("valid")) : (ValScore >= 0.5f);
+				if (bPassed)
+				{
+					BuildingsPassed++;
+				}
+
+				// Attach validation to building result
+				if (BuildingResult.IsValid())
+				{
+					BuildingResult->SetObjectField(TEXT("validation"), ValResult);
+				}
+			}
+			else
+			{
+				UE_LOG(LogMonolithCityBlock, Warning, TEXT("    Validation skipped (action unavailable): %s"), *ValError);
+				SkippedSteps.AddUnique(TEXT("validation"));
+			}
+		}
+		else
+		{
+			SkippedSteps.AddUnique(TEXT("validation"));
+		}
+
 		// Add to results
 		if (BuildingResult.IsValid())
 		{
@@ -1747,6 +1879,17 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 	Result->SetArrayField(TEXT("buildings"), BuildingResults);
 	Result->SetNumberField(TEXT("buildings_generated"), BuildingResults.Num());
 	Result->SetNumberField(TEXT("buildings_destroyed"), DestroyedBuildings.Num());
+
+	// Validation summary
+	if (!bSkipValidation && BuildingsValidated > 0)
+	{
+		auto ValSummary = MakeShared<FJsonObject>();
+		ValSummary->SetNumberField(TEXT("buildings_validated"), BuildingsValidated);
+		ValSummary->SetNumberField(TEXT("buildings_passed"), BuildingsPassed);
+		ValSummary->SetNumberField(TEXT("average_score"),
+			FMath::RoundToFloat(static_cast<float>(ValidationScoreSum / BuildingsValidated) * 100.0f) / 100.0f);
+		Result->SetObjectField(TEXT("validation_summary"), ValSummary);
+	}
 
 	// Streets
 	Result->SetArrayField(TEXT("streets"), StreetResults);

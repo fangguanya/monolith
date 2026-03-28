@@ -126,6 +126,21 @@ void FMonolithMeshDebugViewActions::RegisterActions(FMonolithToolRegistry& Regis
 		FParamSchemaBuilder()
 			.Required(TEXT("name"), TEXT("string"), TEXT("Bookmark name to load"))
 			.Build());
+
+	// 7. capture_building_views
+	Registry.RegisterAction(TEXT("mesh"), TEXT("capture_building_views"),
+		TEXT("Multi-angle diagnostic capture of a building for quality review. "
+			"Produces 6 views: floor_plan (orthographic top-down), north/south/east/west (orthographic elevations), "
+			"and perspective (45-degree corner view). All saved as PNGs. Uses spatial registry for building bounds."),
+		FMonolithActionHandler::CreateStatic(&FMonolithMeshDebugViewActions::CaptureBuildingViews),
+		FParamSchemaBuilder()
+			.Required(TEXT("building_id"), TEXT("string"), TEXT("Building ID in spatial registry"))
+			.Optional(TEXT("block_id"), TEXT("string"), TEXT("Block ID for spatial registry"), TEXT("default"))
+			.Optional(TEXT("resolution"), TEXT("integer"), TEXT("Image resolution in pixels (square)"), TEXT("512"))
+			.Optional(TEXT("output_dir"), TEXT("string"), TEXT("Directory for PNG output (default: Saved/Monolith/Captures/)"))
+			.Optional(TEXT("hide_ceiling"), TEXT("boolean"), TEXT("Auto-hide ceilings/roofs for floor_plan view"), TEXT("true"))
+			.Optional(TEXT("padding"), TEXT("number"), TEXT("Extra padding around building bounds in cm"), TEXT("100"))
+			.Build());
 }
 
 // ============================================================================
@@ -1025,5 +1040,467 @@ FMonolithActionResult FMonolithMeshDebugViewActions::LoadCameraBookmark(const TS
 	Result->SetArrayField(TEXT("location"), LocResult);
 	Result->SetArrayField(TEXT("rotation"), RotResult);
 	Result->SetBoolField(TEXT("loaded"), true);
+	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// Shared Helpers for capture_building_views
+// ============================================================================
+
+bool FMonolithMeshDebugViewActions::ComputeBuildingBounds(
+	const FSpatialBlock& Block, const FSpatialBuilding& Building, FBox& OutBounds)
+{
+	OutBounds = FBox(ForceInit);
+
+	// Accumulate bounds from all rooms across all floors
+	for (const auto& FloorEntry : Building.FloorToRoomIds)
+	{
+		for (const FString& RoomId : FloorEntry.Value)
+		{
+			const FSpatialRoom* Room = Block.Rooms.Find(RoomId);
+			if (Room && Room->WorldBounds.IsValid)
+			{
+				OutBounds += Room->WorldBounds;
+			}
+		}
+	}
+
+	// Fallback: use footprint polygon + estimated height
+	if (!OutBounds.IsValid)
+	{
+		FVector2D MinXY(FLT_MAX, FLT_MAX), MaxXY(-FLT_MAX, -FLT_MAX);
+		for (const FVector2D& V : Building.FootprintPolygon)
+		{
+			MinXY.X = FMath::Min(MinXY.X, V.X);
+			MinXY.Y = FMath::Min(MinXY.Y, V.Y);
+			MaxXY.X = FMath::Max(MaxXY.X, V.X);
+			MaxXY.Y = FMath::Max(MaxXY.Y, V.Y);
+		}
+		if (MinXY.X < FLT_MAX)
+		{
+			int32 NumFloors = FMath::Max(Building.FloorToRoomIds.Num(), 1);
+			float TotalHeight = NumFloors * 273.0f;
+			OutBounds = FBox(
+				FVector(MinXY.X, MinXY.Y, Building.WorldOrigin.Z),
+				FVector(MaxXY.X, MaxXY.Y, Building.WorldOrigin.Z + TotalHeight));
+		}
+	}
+
+	return OutBounds.IsValid != 0;
+}
+
+TArray<AActor*> FMonolithMeshDebugViewActions::HideCeilingActors(UWorld* World, const FString& BuildingId)
+{
+	TArray<AActor*> Hidden;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor || Actor->IsPendingKillPending())
+		{
+			continue;
+		}
+
+		// Filter by building_id if specified
+		if (!BuildingId.IsEmpty())
+		{
+			bool bBelongsToBuilding = false;
+			for (const FName& Tag : Actor->Tags)
+			{
+				if (Tag.ToString().Contains(BuildingId))
+				{
+					bBelongsToBuilding = true;
+					break;
+				}
+			}
+			if (!bBelongsToBuilding)
+			{
+				continue;
+			}
+		}
+
+		bool bIsCeiling = Actor->Tags.Contains(FName(TEXT("BuildingCeiling")));
+		bool bIsRoof = Actor->Tags.Contains(FName(TEXT("BuildingRoof")));
+		if ((bIsCeiling || bIsRoof) && !Actor->IsHidden())
+		{
+			Actor->SetActorHiddenInGame(true);
+			Actor->SetIsTemporarilyHiddenInEditor(true);
+			Hidden.Add(Actor);
+		}
+	}
+	return Hidden;
+}
+
+void FMonolithMeshDebugViewActions::RestoreHiddenActors(const TArray<AActor*>& Actors)
+{
+	for (AActor* Actor : Actors)
+	{
+		if (Actor && !Actor->IsPendingKillPending())
+		{
+			Actor->SetActorHiddenInGame(false);
+			Actor->SetIsTemporarilyHiddenInEditor(false);
+		}
+	}
+}
+
+bool FMonolithMeshDebugViewActions::CaptureViewToPNG(
+	UWorld* World,
+	const FVector& CameraLocation,
+	const FRotator& CameraRotation,
+	int32 Resolution,
+	const FString& OutputPath,
+	bool bOrthographic,
+	float OrthoWidth,
+	float FOVAngle)
+{
+	// Create render target
+	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	RT->RenderTargetFormat = RTF_RGBA8;
+	RT->InitCustomFormat(Resolution, Resolution, PF_B8G8R8A8, false);
+	RT->ClearColor = FLinearColor::White;
+	RT->bAutoGenerateMips = false;
+	RT->UpdateResourceImmediate(true);
+
+	// Create scene capture component
+	USceneCaptureComponent2D* Capture = NewObject<USceneCaptureComponent2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	Capture->bTickInEditor = false;
+	Capture->SetComponentTickEnabled(false);
+	Capture->bCaptureEveryFrame = false;
+	Capture->bCaptureOnMovement = false;
+	Capture->bAlwaysPersistRenderingState = true;
+	Capture->TextureTarget = RT;
+	Capture->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+	Capture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
+
+	if (bOrthographic)
+	{
+		Capture->ProjectionType = ECameraProjectionMode::Orthographic;
+		Capture->OrthoWidth = OrthoWidth;
+	}
+	else
+	{
+		Capture->ProjectionType = ECameraProjectionMode::Perspective;
+		Capture->FOVAngle = FOVAngle;
+	}
+
+	// Unlit show flags for clean diagnostic views
+	Capture->ShowFlags.SetLighting(false);
+	Capture->ShowFlags.SetPostProcessing(false);
+	Capture->ShowFlags.SetTonemapper(false);
+	Capture->ShowFlags.SetEyeAdaptation(false);
+	Capture->ShowFlags.SetBloom(false);
+	Capture->ShowFlags.SetMotionBlur(false);
+	Capture->ShowFlags.SetFog(false);
+	Capture->ShowFlags.SetVolumetricFog(false);
+	Capture->ShowFlags.SetAtmosphere(false);
+
+	Capture->RegisterComponentWithWorld(World);
+	Capture->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
+	Capture->CaptureScene();
+
+	// Read pixels and save
+	FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
+	bool bSaveOk = false;
+	if (RTResource)
+	{
+		TArray<FColor> Pixels;
+		if (RTResource->ReadPixels(Pixels) && Pixels.Num() > 0)
+		{
+			FString Dir = FPaths::GetPath(OutputPath);
+			IFileManager::Get().MakeDirectory(*Dir, true);
+
+			FImage Image;
+			Image.Init(Resolution, Resolution, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+			FMemory::Memcpy(Image.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+			bSaveOk = FImageUtils::SaveImageAutoFormat(*OutputPath, Image);
+		}
+	}
+
+	// Cleanup
+	Capture->TextureTarget = nullptr;
+	if (Capture->IsRegistered())
+	{
+		Capture->UnregisterComponent();
+	}
+
+	return bSaveOk;
+}
+
+// ============================================================================
+// capture_building_views
+// ============================================================================
+
+FMonolithActionResult FMonolithMeshDebugViewActions::CaptureBuildingViews(const TSharedPtr<FJsonObject>& Params)
+{
+	UWorld* World = MonolithMeshUtils::GetEditorWorld();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("No editor world available"));
+	}
+
+	// --- Parse params ---
+
+	FString BuildingId;
+	if (!Params->TryGetStringField(TEXT("building_id"), BuildingId) || BuildingId.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("'building_id' (string) is required"));
+	}
+
+	FString BlockId = TEXT("default");
+	Params->TryGetStringField(TEXT("block_id"), BlockId);
+
+	if (!FMonolithMeshSpatialRegistry::HasBlock(BlockId))
+	{
+		return FMonolithActionResult::Error(
+			FString::Printf(TEXT("Block '%s' not found in spatial registry"), *BlockId));
+	}
+
+	const FSpatialBlock& Block = FMonolithMeshSpatialRegistry::GetBlock(BlockId);
+	const FSpatialBuilding* Building = Block.Buildings.Find(BuildingId);
+	if (!Building)
+	{
+		return FMonolithActionResult::Error(
+			FString::Printf(TEXT("Building '%s' not found in block '%s'"), *BuildingId, *BlockId));
+	}
+
+	int32 Resolution = 512;
+	{
+		double V = 0.0;
+		if (Params->TryGetNumberField(TEXT("resolution"), V))
+		{
+			Resolution = static_cast<int32>(V);
+		}
+	}
+	Resolution = FMath::Clamp(Resolution, 128, 4096);
+
+	float Padding = 100.0f;
+	if (Params->HasField(TEXT("padding")))
+	{
+		Padding = static_cast<float>(Params->GetNumberField(TEXT("padding")));
+	}
+
+	bool bHideCeiling = true;
+	Params->TryGetBoolField(TEXT("hide_ceiling"), bHideCeiling);
+
+	FString OutputDir;
+	if (!Params->TryGetStringField(TEXT("output_dir"), OutputDir) || OutputDir.IsEmpty())
+	{
+		OutputDir = GetCapturesDirectory();
+	}
+	EnsureDirectory(OutputDir);
+
+	// --- Compute building bounds ---
+
+	FBox BuildingBounds;
+	if (!ComputeBuildingBounds(Block, *Building, BuildingBounds))
+	{
+		return FMonolithActionResult::Error(TEXT("Could not determine building bounds for capture"));
+	}
+
+	FBox PaddedBounds = BuildingBounds.ExpandBy(Padding);
+	FVector Center = PaddedBounds.GetCenter();
+	FVector Extent = PaddedBounds.GetExtent();
+
+	float BuildingWidth  = Extent.X * 2.0f;  // X dimension
+	float BuildingDepth  = Extent.Y * 2.0f;  // Y dimension
+	float BuildingHeight = Extent.Z * 2.0f;  // Z dimension
+
+	// --- Define the 6 views ---
+
+	struct FViewSpec
+	{
+		FString Type;
+		FVector Location;
+		FRotator Rotation;
+		bool bOrthographic;
+		float OrthoWidth;
+		float FOVAngle;
+		bool bHideCeiling;
+	};
+
+	TArray<FViewSpec> Views;
+
+	// 1. Floor plan — orthographic top-down
+	{
+		float OrthoW = FMath::Max(BuildingWidth, BuildingDepth) * 1.2f;
+		float CaptureZ = PaddedBounds.Max.Z + 500.0f;
+		Views.Add({
+			TEXT("floor_plan"),
+			FVector(Center.X, Center.Y, CaptureZ),
+			FRotator(-90.0f, 0.0f, 0.0f),
+			true,
+			OrthoW,
+			0.0f,
+			true  // hide ceiling for floor plan
+		});
+	}
+
+	// 2-5. Cardinal elevation views — orthographic, perpendicular to each wall face
+	// Camera distance = max(building_width_along_view, building_height) * 1.5
+	{
+		// North: camera looks south (-Y), placed at +Y
+		float ElevOrthoW = FMath::Max(BuildingWidth, BuildingHeight);
+		float Distance = FMath::Max(BuildingDepth, BuildingHeight) * 1.5f;
+		Views.Add({
+			TEXT("north"),
+			FVector(Center.X, Center.Y + Distance, Center.Z),
+			FRotator(0.0f, -90.0f, 0.0f),  // Yaw -90 = looking towards -Y (south)
+			true,
+			ElevOrthoW * 1.2f,
+			0.0f,
+			false
+		});
+	}
+	{
+		// South: camera looks north (+Y), placed at -Y
+		float ElevOrthoW = FMath::Max(BuildingWidth, BuildingHeight);
+		float Distance = FMath::Max(BuildingDepth, BuildingHeight) * 1.5f;
+		Views.Add({
+			TEXT("south"),
+			FVector(Center.X, Center.Y - Distance, Center.Z),
+			FRotator(0.0f, 90.0f, 0.0f),  // Yaw +90 = looking towards +Y (north)
+			true,
+			ElevOrthoW * 1.2f,
+			0.0f,
+			false
+		});
+	}
+	{
+		// East: camera looks west (-X), placed at +X
+		float ElevOrthoW = FMath::Max(BuildingDepth, BuildingHeight);
+		float Distance = FMath::Max(BuildingWidth, BuildingHeight) * 1.5f;
+		Views.Add({
+			TEXT("east"),
+			FVector(Center.X + Distance, Center.Y, Center.Z),
+			FRotator(0.0f, 180.0f, 0.0f),  // Yaw 180 = looking towards -X (west)
+			true,
+			ElevOrthoW * 1.2f,
+			0.0f,
+			false
+		});
+	}
+	{
+		// West: camera looks east (+X), placed at -X
+		float ElevOrthoW = FMath::Max(BuildingDepth, BuildingHeight);
+		float Distance = FMath::Max(BuildingWidth, BuildingHeight) * 1.5f;
+		Views.Add({
+			TEXT("west"),
+			FVector(Center.X - Distance, Center.Y, Center.Z),
+			FRotator(0.0f, 0.0f, 0.0f),  // Yaw 0 = looking towards +X (east)
+			true,
+			ElevOrthoW * 1.2f,
+			0.0f,
+			false
+		});
+	}
+
+	// 6. Perspective — 45° corner view from the NE, pitched down 30°
+	{
+		// Diagonal distance from center — use the bounding sphere radius * 2
+		float DiagonalExtent = FMath::Sqrt(Extent.X * Extent.X + Extent.Y * Extent.Y + Extent.Z * Extent.Z);
+		float Distance = DiagonalExtent * 2.0f;
+
+		// 45° azimuth (NE corner), 30° pitch down
+		float Azimuth = 45.0f;
+		float Pitch = -30.0f;
+		float AzimuthRad = FMath::DegreesToRadians(Azimuth);
+
+		FVector CamOffset(
+			FMath::Cos(AzimuthRad) * FMath::Cos(FMath::DegreesToRadians(Pitch)) * Distance,
+			FMath::Sin(AzimuthRad) * FMath::Cos(FMath::DegreesToRadians(Pitch)) * Distance,
+			FMath::Sin(FMath::DegreesToRadians(-Pitch)) * Distance  // negate pitch for upward offset
+		);
+
+		FVector CamPos = Center + CamOffset;
+		// Look back at center
+		FRotator LookAt = (Center - CamPos).Rotation();
+
+		Views.Add({
+			TEXT("perspective"),
+			CamPos,
+			LookAt,
+			false,
+			0.0f,
+			60.0f,
+			false
+		});
+	}
+
+	// --- Capture all views ---
+
+	TArray<TSharedPtr<FJsonValue>> ViewResults;
+	int32 ViewsCaptured = 0;
+
+	for (const FViewSpec& View : Views)
+	{
+		// Hide ceiling actors for floor_plan if requested
+		TArray<AActor*> TempHidden;
+		if (View.bHideCeiling && bHideCeiling)
+		{
+			TempHidden = HideCeilingActors(World, BuildingId);
+		}
+
+		FString FileName = FString::Printf(TEXT("%s_%s.png"), *BuildingId, *View.Type);
+		FString FullPath = OutputDir / FileName;
+
+		bool bOk = CaptureViewToPNG(
+			World,
+			View.Location,
+			View.Rotation,
+			Resolution,
+			FullPath,
+			View.bOrthographic,
+			View.OrthoWidth,
+			View.FOVAngle);
+
+		// Restore hidden actors
+		if (TempHidden.Num() > 0)
+		{
+			RestoreHiddenActors(TempHidden);
+		}
+
+		auto ViewObj = MakeShared<FJsonObject>();
+		ViewObj->SetStringField(TEXT("type"), View.Type);
+		ViewObj->SetStringField(TEXT("path"), FullPath);
+		ViewObj->SetBoolField(TEXT("success"), bOk);
+
+		if (!bOk)
+		{
+			UE_LOG(LogMonolithDebugView, Warning,
+				TEXT("capture_building_views: Failed to capture '%s' view for building '%s'"),
+				*View.Type, *BuildingId);
+		}
+		else
+		{
+			++ViewsCaptured;
+		}
+
+		ViewResults.Add(MakeShared<FJsonValueObject>(ViewObj));
+	}
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("building_id"), BuildingId);
+	Result->SetNumberField(TEXT("views_captured"), ViewsCaptured);
+	Result->SetArrayField(TEXT("views"), ViewResults);
+
+	// Include building bounds in result for reference
+	auto BoundsObj = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> MinArr, MaxArr;
+	MinArr.Add(MakeShared<FJsonValueNumber>(BuildingBounds.Min.X));
+	MinArr.Add(MakeShared<FJsonValueNumber>(BuildingBounds.Min.Y));
+	MinArr.Add(MakeShared<FJsonValueNumber>(BuildingBounds.Min.Z));
+	MaxArr.Add(MakeShared<FJsonValueNumber>(BuildingBounds.Max.X));
+	MaxArr.Add(MakeShared<FJsonValueNumber>(BuildingBounds.Max.Y));
+	MaxArr.Add(MakeShared<FJsonValueNumber>(BuildingBounds.Max.Z));
+	BoundsObj->SetArrayField(TEXT("min"), MinArr);
+	BoundsObj->SetArrayField(TEXT("max"), MaxArr);
+	Result->SetObjectField(TEXT("building_bounds"), BoundsObj);
+
+	if (ViewsCaptured == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("All view captures failed — check editor world and render state"));
+	}
+
 	return FMonolithActionResult::Success(Result);
 }
