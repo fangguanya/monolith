@@ -18,6 +18,8 @@
 #include "GeometryScript/MeshDeformFunctions.h"
 #include "GeometryScript/MeshTransformFunctions.h"
 #include "GeometryScript/MeshDecompositionFunctions.h"
+#include "GeometryScript/MeshUVFunctions.h"
+#include "GeometryScript/MeshQueryFunctions.h"
 
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
@@ -88,10 +90,11 @@ void FMonolithMeshProceduralActions::RegisterActions(FMonolithToolRegistry& Regi
 			.Required(TEXT("type"), TEXT("string"), TEXT("Structure type: room, corridor, L_corridor, T_junction, stairwell"))
 			.Optional(TEXT("dimensions"), TEXT("object"), TEXT("{ width, depth, height } in cm"))
 			.Optional(TEXT("wall_thickness"), TEXT("number"), TEXT("Wall thickness in cm"), TEXT("20"))
-			.Optional(TEXT("floor_thickness"), TEXT("number"), TEXT("Floor/ceiling slab thickness in cm"), TEXT("15"))
+			.Optional(TEXT("floor_thickness"), TEXT("number"), TEXT("Floor/ceiling slab thickness in cm"), TEXT("3"))
 			.Optional(TEXT("has_ceiling"), TEXT("boolean"), TEXT("Include ceiling slab"), TEXT("true"))
 			.Optional(TEXT("has_floor"), TEXT("boolean"), TEXT("Include floor slab"), TEXT("true"))
 			.Optional(TEXT("openings"), TEXT("array"), TEXT("Array of opening specs: { wall: north|south|east|west, type: door|window, width, height, offset_x, offset_z }"))
+			.Optional(TEXT("wall_mode"), TEXT("string"), TEXT("Wall construction: sweep (thin walls) or box (legacy cubes)"), TEXT("sweep"))
 			.Optional(TEXT("handle"), TEXT("string"), TEXT("Save result to a mesh handle"))
 			.Optional(TEXT("save_path"), TEXT("string"), TEXT("Asset path to save as StaticMesh"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Allow overwriting existing asset"), TEXT("false"))
@@ -1500,6 +1503,20 @@ TArray<FVector2D> FMonolithMeshProceduralActions::MakeCirclePolygon(float Radius
 	return Poly;
 }
 
+/** Create a rectangular wall cross-section profile for sweep-based wall construction.
+ *  Profile X axis maps perpendicular to sweep path (wall thickness), Y axis maps to up (wall height).
+ *  Profile is centered on X so the sweep path traces the wall centerline. */
+static TArray<FVector2D> MakeWallProfile(float Thickness, float Height)
+{
+	TArray<FVector2D> Profile;
+	float HalfT = Thickness * 0.5f;
+	Profile.Add(FVector2D(-HalfT, 0.0f));
+	Profile.Add(FVector2D( HalfT, 0.0f));
+	Profile.Add(FVector2D( HalfT, Height));
+	Profile.Add(FVector2D(-HalfT, Height));
+	return Profile;
+}
+
 TArray<FVector2D> FMonolithMeshProceduralActions::InsetPolygon2D(const TArray<FVector2D>& Polygon, float InsetDist)
 {
 	const int32 N = Polygon.Num();
@@ -1629,9 +1646,13 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateStructure(const TSha
 	}
 
 	float WallT = Params->HasField(TEXT("wall_thickness"))  ? static_cast<float>(Params->GetNumberField(TEXT("wall_thickness")))  : 20.0f;
-	float FloorT = Params->HasField(TEXT("floor_thickness")) ? static_cast<float>(Params->GetNumberField(TEXT("floor_thickness"))) : 15.0f;
+	float FloorT = Params->HasField(TEXT("floor_thickness")) ? static_cast<float>(Params->GetNumberField(TEXT("floor_thickness"))) : 3.0f;
 	bool bCeiling = Params->HasField(TEXT("has_ceiling")) ? Params->GetBoolField(TEXT("has_ceiling")) : true;
 	bool bFloor = Params->HasField(TEXT("has_floor")) ? Params->GetBoolField(TEXT("has_floor")) : true;
+
+	FString WallMode = TEXT("sweep");
+	Params->TryGetStringField(TEXT("wall_mode"), WallMode);
+	WallMode = WallMode.ToLower().TrimStartAndEnd();
 
 	UDynamicMesh* Mesh = NewObject<UDynamicMesh>(Pool);
 	if (!Mesh)
@@ -1642,7 +1663,8 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateStructure(const TSha
 	FGeometryScriptPrimitiveOptions Opts;
 	bool bHadBooleans = false;
 
-	auto BuildWalls = [&](float W, float D, float H, float WT, FVector Offset)
+	// Legacy box-based wall construction (4 separate AppendBox calls per room)
+	auto BuildWallsBox = [&](float W, float D, float H, float WT, FVector Offset)
 	{
 		// North wall (Y = -D/2)
 		FTransform NorthXf(FRotator::ZeroRotator, Offset + FVector(0, -D * 0.5f + WT * 0.5f, 0), FVector::OneVector);
@@ -1656,6 +1678,43 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateStructure(const TSha
 		// West wall (X = -W/2)
 		FTransform WestXf(FRotator::ZeroRotator, Offset + FVector(-W * 0.5f + WT * 0.5f, 0, 0), FVector::OneVector);
 		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(Mesh, Opts, WestXf, WT, D - WT * 2, H, 0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+	};
+
+	// Sweep-based thin wall construction: single AppendSimpleSweptPolygon per room
+	// Sweeps a rectangular cross-section (Thickness x Height) along the room perimeter.
+	// Produces proper mitered corners, fewer triangles, and natural UV flow.
+	auto BuildWallsSweep = [&](float W, float D, float H, float WT, FVector Offset)
+	{
+		TArray<FVector2D> WallProfile = MakeWallProfile(WT, H);
+
+		// Perimeter path: centerline of walls, CCW when viewed from above
+		float HW = W * 0.5f;
+		float HD = D * 0.5f;
+		TArray<FVector> Path;
+		Path.Add(Offset + FVector(-HW, -HD, 0.0f));  // NW corner
+		Path.Add(Offset + FVector( HW, -HD, 0.0f));  // NE corner
+		Path.Add(Offset + FVector( HW,  HD, 0.0f));  // SE corner
+		Path.Add(Offset + FVector(-HW,  HD, 0.0f));  // SW corner
+
+		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendSimpleSweptPolygon(
+			Mesh, Opts, FTransform::Identity,
+			WallProfile, Path,
+			/*bLoop=*/true, /*bCapped=*/false,
+			/*StartScale=*/1.0f, /*EndScale=*/1.0f,
+			/*RotationAngleDeg=*/0.0f, /*MiterLimit=*/1.5f);
+	};
+
+	// Select wall construction method
+	auto BuildWalls = [&](float W, float D, float H, float WT, FVector Offset)
+	{
+		if (WallMode == TEXT("box"))
+		{
+			BuildWallsBox(W, D, H, WT, Offset);
+		}
+		else
+		{
+			BuildWallsSweep(W, D, H, WT, Offset);
+		}
 	};
 
 	float FloorZ = bFloor ? FloorT : 0.0f;
@@ -1784,10 +1843,21 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateStructure(const TSha
 
 	CleanupMesh(Mesh, bHadBooleans);
 
+	// Box UV projection for proper material tiling on architectural surfaces
+	// Scale = 100cm per UV tile (1m tiling). Projects from 6 axes, picks best per triangle.
+	{
+		FGeometryScriptMeshSelection EmptySelection;
+		FTransform UVBox = FTransform::Identity;
+		UVBox.SetScale3D(FVector(100.0f));
+		UGeometryScriptLibrary_MeshUVFunctions::SetMeshUVsFromBoxProjection(
+			Mesh, 0, UVBox, EmptySelection, 2);
+	}
+
 	int32 TriCount = Mesh->GetTriangleCount();
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("type"), Type);
+	Result->SetStringField(TEXT("wall_mode"), WallMode);
 	Result->SetNumberField(TEXT("triangle_count"), TriCount);
 	Result->SetBoolField(TEXT("had_booleans"), bHadBooleans);
 
