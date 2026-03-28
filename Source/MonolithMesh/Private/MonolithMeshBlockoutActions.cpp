@@ -536,6 +536,7 @@ void FMonolithMeshBlockoutActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Optional(TEXT("random_scale_range"), TEXT("array"), TEXT("Scale range [min, max]"), TEXT("[0.9, 1.1]"))
 			.Optional(TEXT("seed"), TEXT("integer"), TEXT("Random seed for reproducibility (0 = random)"), TEXT("0"))
 			.Optional(TEXT("surface_align"), TEXT("boolean"), TEXT("Align to surface normal via floor trace"), TEXT("false"))
+			.Optional(TEXT("collision_mode"), TEXT("string"), TEXT("Collision handling: none (skip validation), warn (validate+place anyway), reject (skip overlapping), adjust (push-out then reject)"), TEXT("warn"))
 			.Build());
 
 	// 16. create_blockout_blueprint
@@ -2543,6 +2544,20 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScatterProps(const TSharedPt
 	bool bSurfaceAlign = false;
 	Params->TryGetBoolField(TEXT("surface_align"), bSurfaceAlign);
 
+	// Collision mode: none, warn, reject, adjust
+	FString CollisionMode = TEXT("warn");
+	Params->TryGetStringField(TEXT("collision_mode"), CollisionMode);
+	CollisionMode = CollisionMode.ToLower();
+	if (CollisionMode != TEXT("none") && CollisionMode != TEXT("warn") &&
+		CollisionMode != TEXT("reject") && CollisionMode != TEXT("adjust"))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Invalid collision_mode '%s'. Must be: none, warn, reject, adjust"), *CollisionMode));
+	}
+	const bool bDoCollision = (CollisionMode != TEXT("none"));
+	const bool bRejectOnOverlap = (CollisionMode == TEXT("reject") || CollisionMode == TEXT("adjust"));
+	const bool bAllowPushOut = (CollisionMode == TEXT("adjust"));
+
 	// Validate volume
 	FString Error;
 	AActor* Volume = FindBlockoutVolumeAny(VolumeName, Error);
@@ -2676,14 +2691,21 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScatterProps(const TSharedPt
 		Samples.SetNum(Count);
 	}
 
-	// Spawn actors
+	// Spawn actors with collision-aware placement
 	FScopedMeshTransaction Transaction(FText::FromString(TEXT("Monolith: Scatter Props")));
 
 	int32 Placed = 0;
+	int32 RejectedCount = 0;
+	int32 AdjustedCount = 0;
 	TArray<TSharedPtr<FJsonValue>> PlacedArr;
+	TArray<TSharedPtr<FJsonValue>> ScatterWarnings;
 
 	FCollisionQueryParams FloorTraceParams(SCENE_QUERY_STAT(MonolithFloorTrace), true);
 	FloorTraceParams.AddIgnoredActor(Volume);
+
+	// Track spawned actors so we can ignore them in collision checks for subsequent props
+	TArray<AActor*> SpawnedActors;
+	SpawnedActors.Add(Volume);
 
 	for (const FSample& Sample : Samples)
 	{
@@ -2691,44 +2713,151 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScatterProps(const TSharedPt
 		float WorldX = VolumeMin.X + Sample.Pos.X;
 		float WorldY = VolumeMin.Y + Sample.Pos.Y;
 
-		// Floor trace from top of volume downward
-		FVector TraceStart(WorldX, WorldY, VolumeMax.Z);
-		FVector TraceEnd(WorldX, WorldY, VolumeMin.Z - 100.0f);
-
-		FHitResult FloorHit;
-		bool bHitFloor = World->LineTraceSingleByChannel(FloorHit, TraceStart, TraceEnd, ECC_Visibility, FloorTraceParams);
-
-		FVector SpawnLocation;
-		FRotator SpawnRotation = FRotator::ZeroRotator;
-
-		if (bHitFloor)
-		{
-			SpawnLocation = FloorHit.Location;
-			if (bSurfaceAlign)
-			{
-				SpawnRotation = FloorHit.Normal.Rotation();
-				// Adjust so Z-up maps to the surface normal
-				SpawnRotation.Pitch -= 90.0f;
-			}
-		}
-		else
-		{
-			// No floor hit — place at volume bottom
-			SpawnLocation = FVector(WorldX, WorldY, VolumeMin.Z);
-		}
-
-		// Random yaw rotation
-		if (bRandomRotation)
-		{
-			SpawnRotation.Yaw += RandStream.FRandRange(0.0f, 360.0f);
-		}
-
-		// Random scale
+		// Random scale (compute early so we can use it for collision shape)
 		float Scale = RandStream.FRandRange(ScaleMin, ScaleMax);
 
 		// Pick random mesh from the pool
 		int32 MeshIdx = RandStream.RandRange(0, Meshes.Num() - 1);
 		UStaticMesh* ChosenMesh = Meshes[MeshIdx];
+
+		// Compute prop half-extent for sweep/overlap queries (0.9x shrink to avoid AABB false positives)
+		FVector PropHalfExtent = ChosenMesh->GetBounds().BoxExtent * Scale * 0.9f;
+		PropHalfExtent = PropHalfExtent.ComponentMax(FVector(1.0f));
+
+		// Floor finding: use SweepSingle with prop footprint when collision is enabled,
+		// fall back to LineTrace when collision_mode is "none" (preserves exact legacy behavior)
+		FVector TraceStart(WorldX, WorldY, VolumeMax.Z);
+		FVector TraceEnd(WorldX, WorldY, VolumeMin.Z - 100.0f);
+
+		FHitResult FloorHit;
+		bool bHitFloor = false;
+		FVector SpawnLocation;
+		FRotator SpawnRotation = FRotator::ZeroRotator;
+
+		if (bDoCollision)
+		{
+			// Pre-compute random yaw so we can pass it to the OBB sweep query
+			if (bRandomRotation)
+			{
+				SpawnRotation.Yaw = RandStream.FRandRange(0.0f, 360.0f);
+			}
+
+			// Sweep a thin box (prop's XY footprint, 1cm tall) to find a floor position
+			// that accounts for the prop's full footprint, not just a single point
+			FCollisionShape FootprintShape = FCollisionShape::MakeBox(
+				FVector(PropHalfExtent.X, PropHalfExtent.Y, 1.0f));
+
+			bHitFloor = World->SweepSingleByChannel(
+				FloorHit, TraceStart, TraceEnd,
+				SpawnRotation.Quaternion(),
+				ECC_WorldStatic, FootprintShape, FloorTraceParams);
+
+			if (bHitFloor && FloorHit.bStartPenetrating)
+			{
+				// Footprint started inside geometry — candidate is invalid
+				RejectedCount++;
+				ScatterWarnings.Add(MakeShared<FJsonValueString>(
+					FString::Printf(TEXT("Sample at (%.0f, %.0f) rejected: footprint starts inside geometry"),
+						WorldX, WorldY)));
+				continue;
+			}
+
+			if (bHitFloor)
+			{
+				// Sweep Location is center of the swept shape; offset up by prop half-height
+				SpawnLocation = FloorHit.Location + FVector(0, 0, PropHalfExtent.Z);
+
+				if (bSurfaceAlign)
+				{
+					SpawnRotation = FloorHit.Normal.Rotation();
+					SpawnRotation.Pitch -= 90.0f;
+					if (bRandomRotation)
+					{
+						SpawnRotation.Yaw += RandStream.FRandRange(0.0f, 360.0f);
+					}
+				}
+			}
+			else
+			{
+				SpawnLocation = FVector(WorldX, WorldY, VolumeMin.Z);
+			}
+		}
+		else
+		{
+			// Legacy line trace for "none" mode — preserves exact original behavior + RNG sequence
+			bHitFloor = World->LineTraceSingleByChannel(
+				FloorHit, TraceStart, TraceEnd, ECC_Visibility, FloorTraceParams);
+
+			if (bHitFloor)
+			{
+				SpawnLocation = FloorHit.Location;
+				if (bSurfaceAlign)
+				{
+					SpawnRotation = FloorHit.Normal.Rotation();
+					SpawnRotation.Pitch -= 90.0f;
+				}
+			}
+			else
+			{
+				SpawnLocation = FVector(WorldX, WorldY, VolumeMin.Z);
+			}
+
+			if (bRandomRotation)
+			{
+				SpawnRotation.Yaw += RandStream.FRandRange(0.0f, 360.0f);
+			}
+		}
+
+		// Pre-spawn collision validation
+		if (bDoCollision)
+		{
+			MonolithMeshUtils::FPropPlacementResult PlacementResult =
+				MonolithMeshUtils::ValidatePropPlacement(
+					World,
+					SpawnLocation,
+					SpawnRotation.Quaternion(),
+					PropHalfExtent,
+					SpawnedActors,
+					bAllowPushOut,
+					/*MaxPushOutDistance=*/50.0f);
+
+			if (!PlacementResult.bValid)
+			{
+				if (bRejectOnOverlap)
+				{
+					// Skip this candidate entirely
+					RejectedCount++;
+					ScatterWarnings.Add(MakeShared<FJsonValueString>(
+						FString::Printf(TEXT("Prop rejected at (%.0f, %.0f, %.0f): %s"),
+							SpawnLocation.X, SpawnLocation.Y, SpawnLocation.Z,
+							*PlacementResult.RejectReason)));
+					continue;
+				}
+				else
+				{
+					// "warn" mode: place anyway but record the issue
+					ScatterWarnings.Add(MakeShared<FJsonValueString>(
+						FString::Printf(TEXT("Overlap at (%.0f, %.0f, %.0f): %s"),
+							SpawnLocation.X, SpawnLocation.Y, SpawnLocation.Z,
+							*PlacementResult.RejectReason)));
+				}
+			}
+			else
+			{
+				// Placement is valid — may have been adjusted
+				if (!FVector::PointsAreNear(SpawnLocation, PlacementResult.FinalLocation, UE_KINDA_SMALL_NUMBER))
+				{
+					SpawnLocation = PlacementResult.FinalLocation;
+					AdjustedCount++;
+				}
+
+				// Propagate any push-out warnings
+				for (const FString& Warning : PlacementResult.Warnings)
+				{
+					ScatterWarnings.Add(MakeShared<FJsonValueString>(Warning));
+				}
+			}
+		}
 
 		FActorSpawnParameters SpawnParams;
 		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
@@ -2743,33 +2872,40 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScatterProps(const TSharedPt
 		PropActor->Tags.Add(FName(TEXT("Monolith.ScatteredProp")));
 		PropActor->SetFolderPath(FName(*FString::Printf(TEXT("Blockout/%s/Props"), *VolumeName)));
 
+		// Track for subsequent collision checks
+		SpawnedActors.Add(PropActor);
+
 		auto PlacedObj = MakeShared<FJsonObject>();
 		PlacedObj->SetStringField(TEXT("actor"), PropActor->GetActorNameOrLabel());
 		PlacedObj->SetStringField(TEXT("mesh"), ChosenMesh->GetPathName());
 		PlacedObj->SetArrayField(TEXT("location"), VectorToJsonArray(SpawnLocation));
 		PlacedObj->SetNumberField(TEXT("scale"), Scale);
 
-		// Check for overlaps with existing non-blockout geometry
-		FString OverlapWarning = CheckBlockoutOverlap(World, PropActor, PropActor->GetActorNameOrLabel());
-		if (!OverlapWarning.IsEmpty())
+		// Legacy overlap warning for "none" mode (post-spawn check like before)
+		if (!bDoCollision)
 		{
-			PlacedObj->SetStringField(TEXT("warning"), OverlapWarning);
+			FString OverlapWarning = CheckBlockoutOverlap(World, PropActor, PropActor->GetActorNameOrLabel());
+			if (!OverlapWarning.IsEmpty())
+			{
+				PlacedObj->SetStringField(TEXT("warning"), OverlapWarning);
+			}
 		}
 
 		PlacedArr.Add(MakeShared<FJsonValueObject>(PlacedObj));
-
 		Placed++;
 	}
 
-	// Collect all overlap warnings into a top-level array for easy scanning
-	TArray<TSharedPtr<FJsonValue>> ScatterWarnings;
-	for (const auto& P : PlacedArr)
+	// For non-"none" modes, also collect per-prop warnings from PlacedArr
+	if (!bDoCollision)
 	{
-		const TSharedPtr<FJsonObject>& Obj = P->AsObject();
-		FString Warn;
-		if (Obj.IsValid() && Obj->TryGetStringField(TEXT("warning"), Warn))
+		for (const auto& P : PlacedArr)
 		{
-			ScatterWarnings.Add(MakeShared<FJsonValueString>(Warn));
+			const TSharedPtr<FJsonObject>& Obj = P->AsObject();
+			FString Warn;
+			if (Obj.IsValid() && Obj->TryGetStringField(TEXT("warning"), Warn))
+			{
+				ScatterWarnings.Add(MakeShared<FJsonValueString>(Warn));
+			}
 		}
 	}
 
@@ -2777,7 +2913,16 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScatterProps(const TSharedPt
 	Result->SetNumberField(TEXT("placed"), Placed);
 	Result->SetNumberField(TEXT("requested"), Count);
 	Result->SetNumberField(TEXT("seed"), Seed);
+	Result->SetStringField(TEXT("collision_mode"), CollisionMode);
 	Result->SetArrayField(TEXT("props"), PlacedArr);
+	if (RejectedCount > 0)
+	{
+		Result->SetNumberField(TEXT("rejected_count"), RejectedCount);
+	}
+	if (AdjustedCount > 0)
+	{
+		Result->SetNumberField(TEXT("adjusted_count"), AdjustedCount);
+	}
 	if (ScatterWarnings.Num() > 0)
 	{
 		Result->SetArrayField(TEXT("warnings"), ScatterWarnings);

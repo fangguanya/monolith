@@ -281,6 +281,7 @@ void FMonolithMeshContextPropActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("random_rotation"), TEXT("boolean"), TEXT("Randomize yaw rotation"), TEXT("true"))
 			.Optional(TEXT("seed"), TEXT("integer"), TEXT("Random seed (0 = random)"), TEXT("0"))
 			.Optional(TEXT("random_scale_range"), TEXT("array"), TEXT("Scale range [min, max]"), TEXT("[0.9, 1.1]"))
+			.Optional(TEXT("collision_mode"), TEXT("string"), TEXT("How to handle prop-geometry collisions: 'none' (always place), 'warn' (place but report overlaps), 'reject' (skip overlapping placements), 'adjust' (try push-out, reject if can't)"), TEXT("warn"))
 			.Build());
 
 	// 2. set_room_disturbance
@@ -340,6 +341,7 @@ void FMonolithMeshContextPropActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("rotation"), TEXT("array"), TEXT("Rotation [pitch, yaw, roll]"), TEXT("[0,0,0]"))
 			.Optional(TEXT("seed"), TEXT("integer"), TEXT("Random seed (0 = random)"), TEXT("0"))
 			.Optional(TEXT("folder"), TEXT("string"), TEXT("Actor folder path in the outliner"))
+			.Optional(TEXT("validate_placement"), TEXT("boolean"), TEXT("Validate each item with overlap check before spawning"), TEXT("true"))
 			.Build());
 
 	// 7. scatter_on_walls
@@ -354,6 +356,7 @@ void FMonolithMeshContextPropActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("min_spacing"), TEXT("number"), TEXT("Minimum distance between wall props in cm"), TEXT("80"))
 			.Optional(TEXT("height_range"), TEXT("array"), TEXT("Height range within volume [min_fraction, max_fraction] 0-1"), TEXT("[0.3, 0.8]"))
 			.Optional(TEXT("seed"), TEXT("integer"), TEXT("Random seed (0 = random)"), TEXT("0"))
+			.Optional(TEXT("collision_mode"), TEXT("string"), TEXT("How to handle prop-geometry collisions: 'none' (always place), 'warn' (place but report overlaps), 'reject' (skip overlapping placements), 'adjust' (try push-out, reject if can't)"), TEXT("warn"))
 			.Build());
 
 	// 8. scatter_on_ceiling
@@ -367,6 +370,7 @@ void FMonolithMeshContextPropActions::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("ceiling_offset"), TEXT("number"), TEXT("Offset below ceiling surface in cm"), TEXT("2"))
 			.Optional(TEXT("min_spacing"), TEXT("number"), TEXT("Minimum distance between ceiling props in cm"), TEXT("100"))
 			.Optional(TEXT("seed"), TEXT("integer"), TEXT("Random seed (0 = random)"), TEXT("0"))
+			.Optional(TEXT("collision_mode"), TEXT("string"), TEXT("How to handle prop-geometry collisions: 'none' (always place), 'warn' (place but report overlaps), 'reject' (skip overlapping placements), 'adjust' (try push-out, reject if can't)"), TEXT("warn"))
 			.Build());
 }
 
@@ -1299,6 +1303,9 @@ FMonolithActionResult FMonolithMeshContextPropActions::PlacePropKit(const TShare
 	FString FolderPath;
 	Params->TryGetStringField(TEXT("folder"), FolderPath);
 
+	bool bValidatePlacement = true;
+	Params->TryGetBoolField(TEXT("validate_placement"), bValidatePlacement);
+
 	// Load the kit
 	FString LoadError;
 	TSharedPtr<FJsonObject> KitObj = LoadPropKit(KitName, LoadError);
@@ -1326,8 +1333,13 @@ FMonolithActionResult FMonolithMeshContextPropActions::PlacePropKit(const TShare
 	FQuat KitQuat = Rotation.Quaternion();
 
 	int32 Placed = 0;
+	int32 Rejected = 0;
 	TArray<TSharedPtr<FJsonValue>> PlacedArr;
 	TArray<FString> SkippedMissingAssets;
+	TArray<FString> CollisionWarnings;
+
+	// Collect spawned actors for ignore list during validation
+	TArray<AActor*> SpawnedActors;
 
 	for (const auto& ItemVal : *ItemsArr)
 	{
@@ -1401,12 +1413,44 @@ FMonolithActionResult FMonolithMeshContextPropActions::PlacePropKit(const TShare
 		// Combine rotations
 		FRotator SpawnRotation = (KitQuat * ItemRotation.Quaternion()).Rotator();
 
+		// Collision validation (if enabled)
+		if (bValidatePlacement)
+		{
+			FVector PropHalfExtent = Mesh->GetBounds().BoxExtent * FVector(static_cast<float>(ItemScale)) * 0.9f;
+			PropHalfExtent = PropHalfExtent.ComponentMax(FVector(1.0f));
+
+			TArray<AActor*> IgnoreActors;
+			IgnoreActors.Append(SpawnedActors);
+
+			MonolithMeshUtils::FPropPlacementResult PlacementResult = MonolithMeshUtils::ValidatePropPlacement(
+				World, SpawnLocation, SpawnRotation.Quaternion(), PropHalfExtent, IgnoreActors, false);
+
+			if (!PlacementResult.bValid)
+			{
+				FString Label;
+				ItemObj->TryGetStringField(TEXT("label"), Label);
+				CollisionWarnings.Add(FString::Printf(TEXT("Kit item '%s' at (%.0f, %.0f, %.0f): %s"),
+					*Label, SpawnLocation.X, SpawnLocation.Y, SpawnLocation.Z, *PlacementResult.RejectReason));
+				Rejected++;
+				continue;
+			}
+			else
+			{
+				SpawnLocation = PlacementResult.FinalLocation;
+				for (const FString& W : PlacementResult.Warnings)
+				{
+					CollisionWarnings.Add(W);
+				}
+			}
+		}
+
 		FActorSpawnParameters SpawnParams;
 		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
 		AStaticMeshActor* PropActor = World->SpawnActor<AStaticMeshActor>(SpawnLocation, SpawnRotation, SpawnParams);
 		if (!PropActor) continue;
 
+		SpawnedActors.Add(PropActor);
 		PropActor->GetStaticMeshComponent()->SetStaticMesh(Mesh);
 		PropActor->SetActorScale3D(FVector(static_cast<float>(ItemScale)));
 
@@ -1444,7 +1488,9 @@ FMonolithActionResult FMonolithMeshContextPropActions::PlacePropKit(const TShare
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetNumberField(TEXT("placed_count"), Placed);
+	Result->SetNumberField(TEXT("rejected"), Rejected);
 	Result->SetStringField(TEXT("kit_name"), KitName);
+	Result->SetBoolField(TEXT("validate_placement"), bValidatePlacement);
 	Result->SetNumberField(TEXT("seed"), Seed);
 	Result->SetArrayField(TEXT("actors"), PlacedArr);
 	if (SkippedMissingAssets.Num() > 0)
@@ -1455,6 +1501,15 @@ FMonolithActionResult FMonolithMeshContextPropActions::PlacePropKit(const TShare
 			SkippedArr.Add(MakeShared<FJsonValueString>(S));
 		}
 		Result->SetArrayField(TEXT("skipped_missing_assets"), SkippedArr);
+	}
+	if (CollisionWarnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarningsArr;
+		for (const FString& W : CollisionWarnings)
+		{
+			WarningsArr.Add(MakeShared<FJsonValueString>(W));
+		}
+		Result->SetArrayField(TEXT("collision_warnings"), WarningsArr);
 	}
 
 	return FMonolithActionResult::Success(Result);
@@ -1506,6 +1561,9 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnWalls(const TSha
 	{
 		Seed = FMath::Rand();
 	}
+
+	FString CollisionMode = TEXT("warn");
+	Params->TryGetStringField(TEXT("collision_mode"), CollisionMode);
 
 	// Validate meshes
 	TArray<UStaticMesh*> Meshes;
@@ -1614,7 +1672,12 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnWalls(const TSha
 	FScopedMeshTransaction Transaction(FText::FromString(TEXT("Monolith: Scatter On Walls")));
 
 	int32 Placed = 0;
+	int32 Rejected = 0;
 	TArray<TSharedPtr<FJsonValue>> PlacedArr;
+	TArray<FString> CollisionWarnings;
+
+	// Collect spawned actors for ignore list
+	TArray<AActor*> SpawnedActors;
 
 	for (const FWallHit& WH : FilteredHits)
 	{
@@ -1628,12 +1691,48 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnWalls(const TSha
 		// FRotationMatrix::MakeFromX with -Normal gives us "looking at the wall"
 		FRotator SpawnRotation = FRotationMatrix::MakeFromX(-WH.Normal).Rotator();
 
+		// Collision validation (unless mode is "none")
+		if (!CollisionMode.Equals(TEXT("none"), ESearchCase::IgnoreCase))
+		{
+			FVector PropHalfExtent = ChosenMesh->GetBounds().BoxExtent * 0.9f;
+			PropHalfExtent = PropHalfExtent.ComponentMax(FVector(1.0f));
+
+			TArray<AActor*> IgnoreActors;
+			IgnoreActors.Add(Volume);
+			IgnoreActors.Append(SpawnedActors);
+
+			bool bAllowPushOut = CollisionMode.Equals(TEXT("adjust"), ESearchCase::IgnoreCase);
+			MonolithMeshUtils::FPropPlacementResult PlacementResult = MonolithMeshUtils::ValidatePropPlacement(
+				World, SpawnLocation, SpawnRotation.Quaternion(), PropHalfExtent, IgnoreActors, bAllowPushOut);
+
+			if (!PlacementResult.bValid)
+			{
+				if (CollisionMode.Equals(TEXT("reject"), ESearchCase::IgnoreCase) || CollisionMode.Equals(TEXT("adjust"), ESearchCase::IgnoreCase))
+				{
+					Rejected++;
+					continue;
+				}
+				// "warn" mode: place anyway but record warning
+				CollisionWarnings.Add(FString::Printf(TEXT("Wall prop at (%.0f, %.0f, %.0f): %s"),
+					SpawnLocation.X, SpawnLocation.Y, SpawnLocation.Z, *PlacementResult.RejectReason));
+			}
+			else
+			{
+				SpawnLocation = PlacementResult.FinalLocation;
+				for (const FString& W : PlacementResult.Warnings)
+				{
+					CollisionWarnings.Add(W);
+				}
+			}
+		}
+
 		FActorSpawnParameters SpawnParams;
 		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
 		AStaticMeshActor* PropActor = World->SpawnActor<AStaticMeshActor>(SpawnLocation, SpawnRotation, SpawnParams);
 		if (!PropActor) continue;
 
+		SpawnedActors.Add(PropActor);
 		PropActor->GetStaticMeshComponent()->SetStaticMesh(ChosenMesh);
 
 		PropActor->Tags.Add(FName(*FString::Printf(TEXT("Monolith.Owner:%s"), *VolumeName)));
@@ -1654,9 +1753,20 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnWalls(const TSha
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetNumberField(TEXT("placed"), Placed);
 	Result->SetNumberField(TEXT("requested"), Count);
+	Result->SetNumberField(TEXT("rejected"), Rejected);
 	Result->SetNumberField(TEXT("wall_hits_found"), WallHits.Num());
+	Result->SetStringField(TEXT("collision_mode"), CollisionMode);
 	Result->SetNumberField(TEXT("seed"), Seed);
 	Result->SetArrayField(TEXT("props"), PlacedArr);
+	if (CollisionWarnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarningsArr;
+		for (const FString& W : CollisionWarnings)
+		{
+			WarningsArr.Add(MakeShared<FJsonValueString>(W));
+		}
+		Result->SetArrayField(TEXT("collision_warnings"), WarningsArr);
+	}
 
 	return FMonolithActionResult::Success(Result);
 }
@@ -1699,6 +1809,9 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnCeiling(const TS
 	{
 		Seed = FMath::Rand();
 	}
+
+	FString CollisionMode = TEXT("warn");
+	Params->TryGetStringField(TEXT("collision_mode"), CollisionMode);
 
 	// Validate meshes
 	TArray<UStaticMesh*> Meshes;
@@ -1780,7 +1893,12 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnCeiling(const TS
 	FScopedMeshTransaction Transaction(FText::FromString(TEXT("Monolith: Scatter On Ceiling")));
 
 	int32 Placed = 0;
+	int32 Rejected = 0;
 	TArray<TSharedPtr<FJsonValue>> PlacedArr;
+	TArray<FString> CollisionWarnings;
+
+	// Collect spawned actors for ignore list
+	TArray<AActor*> SpawnedActors;
 
 	for (const FCeilingHit& CH : CeilingHits)
 	{
@@ -1799,12 +1917,48 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnCeiling(const TS
 		// Add some random yaw
 		SpawnRotation.Yaw = RandStream.FRandRange(0.0f, 360.0f);
 
+		// Collision validation (unless mode is "none")
+		if (!CollisionMode.Equals(TEXT("none"), ESearchCase::IgnoreCase))
+		{
+			FVector PropHalfExtent = ChosenMesh->GetBounds().BoxExtent * 0.9f;
+			PropHalfExtent = PropHalfExtent.ComponentMax(FVector(1.0f));
+
+			TArray<AActor*> IgnoreActors;
+			IgnoreActors.Add(Volume);
+			IgnoreActors.Append(SpawnedActors);
+
+			bool bAllowPushOut = CollisionMode.Equals(TEXT("adjust"), ESearchCase::IgnoreCase);
+			MonolithMeshUtils::FPropPlacementResult PlacementResult = MonolithMeshUtils::ValidatePropPlacement(
+				World, SpawnLocation, SpawnRotation.Quaternion(), PropHalfExtent, IgnoreActors, bAllowPushOut);
+
+			if (!PlacementResult.bValid)
+			{
+				if (CollisionMode.Equals(TEXT("reject"), ESearchCase::IgnoreCase) || CollisionMode.Equals(TEXT("adjust"), ESearchCase::IgnoreCase))
+				{
+					Rejected++;
+					continue;
+				}
+				// "warn" mode: place anyway but record warning
+				CollisionWarnings.Add(FString::Printf(TEXT("Ceiling prop at (%.0f, %.0f, %.0f): %s"),
+					SpawnLocation.X, SpawnLocation.Y, SpawnLocation.Z, *PlacementResult.RejectReason));
+			}
+			else
+			{
+				SpawnLocation = PlacementResult.FinalLocation;
+				for (const FString& W : PlacementResult.Warnings)
+				{
+					CollisionWarnings.Add(W);
+				}
+			}
+		}
+
 		FActorSpawnParameters SpawnParams;
 		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
 		AStaticMeshActor* PropActor = World->SpawnActor<AStaticMeshActor>(SpawnLocation, SpawnRotation, SpawnParams);
 		if (!PropActor) continue;
 
+		SpawnedActors.Add(PropActor);
 		PropActor->GetStaticMeshComponent()->SetStaticMesh(ChosenMesh);
 
 		PropActor->Tags.Add(FName(*FString::Printf(TEXT("Monolith.Owner:%s"), *VolumeName)));
@@ -1824,9 +1978,20 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnCeiling(const TS
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetNumberField(TEXT("placed"), Placed);
 	Result->SetNumberField(TEXT("requested"), Count);
+	Result->SetNumberField(TEXT("rejected"), Rejected);
 	Result->SetNumberField(TEXT("ceiling_hits_found"), CeilingHits.Num());
+	Result->SetStringField(TEXT("collision_mode"), CollisionMode);
 	Result->SetNumberField(TEXT("seed"), Seed);
 	Result->SetArrayField(TEXT("props"), PlacedArr);
+	if (CollisionWarnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarningsArr;
+		for (const FString& W : CollisionWarnings)
+		{
+			WarningsArr.Add(MakeShared<FJsonValueString>(W));
+		}
+		Result->SetArrayField(TEXT("collision_warnings"), WarningsArr);
+	}
 
 	return FMonolithActionResult::Success(Result);
 }
