@@ -4,9 +4,26 @@ Last updated: 2026-03-27
 
 ---
 
-### MonolithMesh Module — 111 Actions, ALL 12 PHASES COMPLETE (2026-03-28)
+### MonolithMesh Module — 187 Actions, ALL 22 PHASES COMPLETE (2026-03-28)
 
-- [x] Phase 0-12 — ALL COMPLETE. 111 actions compiled and tested.
+- [x] Phase 0-12 — Original 111 actions compiled and tested.
+- [x] Phase 13-22 — Expansion 76 actions compiled (lights, volumes, horror intel, tech art, sublevels, context props, proc geo, presets, encounters, polish).
+
+#### MonolithMesh — Release / Wiki TODO
+
+- [ ] **Wiki major update** — All 187 mesh actions need wiki documentation. Current wiki covers original modules only.
+- [ ] **Genre Preset Authoring Guide** — Dedicated wiki page (or `PRESET_AUTHORING.md`) explaining how LLMs/users create presets for OTHER genres (fantasy, sci-fi, detective, cozy). Include:
+  - Room template JSON format with examples
+  - Storytelling pattern format (element types, radial distribution)
+  - Acoustic profile format (surface absorption/transmission/loudness)
+  - Tension profile format (factor weights, threshold mappings)
+  - Prop kit format (items, relative positions, spawn_chance)
+  - Step-by-step: "How to create a Fantasy Dungeon preset pack"
+  - How to test presets via MCP before distributing
+  - How to export/import/share preset packs
+- [ ] **SPEC.md MonolithMesh section** — Full 187-action reference with param schemas (currently only has Phase 1-4 section)
+- [ ] **MCP.md mesh_query docs** — Tool reference for mesh_query namespace
+- [ ] **README update** — Feature highlight for MonolithMesh in the plugin README
 
 #### MonolithMesh — Known Issues / Polish
 
