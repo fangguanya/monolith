@@ -66,6 +66,7 @@ void FMonolithMeshBuildingActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Optional(TEXT("label"), TEXT("string"), TEXT("Actor label"))
 			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
 			.Optional(TEXT("building_id"), TEXT("string"), TEXT("Building ID for the descriptor"))
+			.Optional(TEXT("omit_exterior_walls"), TEXT("boolean"), TEXT("Skip exterior wall geometry (use when facade will replace exterior walls). FExteriorFaceDef entries still emitted."), TEXT("false"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Allow overwriting existing asset at save_path"), TEXT("false"))
 			.Build());
 
@@ -459,7 +460,8 @@ TArray<FMonolithMeshBuildingActions::FWallSegment> FMonolithMeshBuildingActions:
 
 void FMonolithMeshBuildingActions::GenerateWallGeometry(UDynamicMesh* Mesh,
 	const TArray<FWallSegment>& Segments, float CellSize, float FloorHeight, float FloorZ,
-	float ExteriorT, float InteriorT, TArray<FExteriorFaceDef>& OutExteriorFaces, int32 FloorIndex)
+	float ExteriorT, float InteriorT, TArray<FExteriorFaceDef>& OutExteriorFaces, int32 FloorIndex,
+	bool bOmitExteriorWalls)
 {
 	FGeometryScriptPrimitiveOptions Opts;
 
@@ -475,27 +477,27 @@ void FMonolithMeshBuildingActions::GenerateWallGeometry(UDynamicMesh* Mesh,
 
 		if (Seg.bVertical)
 		{
-			// Wall runs along Y at X = FixedAxis * CellSize
 			float WallX = static_cast<float>(Seg.FixedAxis) * CellSize;
 			float WallYCenter = (static_cast<float>(Seg.RunStart) + static_cast<float>(Seg.RunEnd)) * 0.5f * CellSize;
 
-			FTransform WallXf(FRotator::ZeroRotator,
-				FVector(WallX, WallYCenter, FloorZ),
-				FVector::OneVector);
+			// Emit exterior wall geometry UNLESS omit flag is set
+			if (!(bOmitExteriorWalls && Seg.bExterior))
+			{
+				FTransform WallXf(FRotator::ZeroRotator,
+					FVector(WallX, WallYCenter, FloorZ),
+					FVector::OneVector);
 
-			// AppendBox: (Width=X, Depth=Y, Height=Z)
-			// For vertical wall: thin in X (WallT), long in Y (RunLen), tall in Z (FloorHeight)
-			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
-				Mesh, Opts, WallXf,
-				WallT, RunLen, FloorHeight,
-				0, 0, 0,
-				EGeometryScriptPrimitiveOriginMode::Base);
+				UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+					Mesh, Opts, WallXf,
+					WallT, RunLen, FloorHeight,
+					0, 0, 0,
+					EGeometryScriptPrimitiveOriginMode::Base);
+			}
 
-			// Record exterior face
+			// ALWAYS record exterior face — facade needs this data even when geometry is omitted
 			if (Seg.bExterior)
 			{
 				FExteriorFaceDef Face;
-				// Determine which side is exterior to set normal
 				if (Seg.LeftId == -1)
 				{
 					Face.Wall = TEXT("west");
@@ -515,21 +517,24 @@ void FMonolithMeshBuildingActions::GenerateWallGeometry(UDynamicMesh* Mesh,
 		}
 		else
 		{
-			// Horizontal wall runs along X at Y = FixedAxis * CellSize
 			float WallY = static_cast<float>(Seg.FixedAxis) * CellSize;
 			float WallXCenter = (static_cast<float>(Seg.RunStart) + static_cast<float>(Seg.RunEnd)) * 0.5f * CellSize;
 
-			FTransform WallXf(FRotator::ZeroRotator,
-				FVector(WallXCenter, WallY, FloorZ),
-				FVector::OneVector);
+			// Emit exterior wall geometry UNLESS omit flag is set
+			if (!(bOmitExteriorWalls && Seg.bExterior))
+			{
+				FTransform WallXf(FRotator::ZeroRotator,
+					FVector(WallXCenter, WallY, FloorZ),
+					FVector::OneVector);
 
-			// For horizontal wall: long in X (RunLen), thin in Y (WallT), tall in Z (FloorHeight)
-			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
-				Mesh, Opts, WallXf,
-				RunLen, WallT, FloorHeight,
-				0, 0, 0,
-				EGeometryScriptPrimitiveOriginMode::Base);
+				UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+					Mesh, Opts, WallXf,
+					RunLen, WallT, FloorHeight,
+					0, 0, 0,
+					EGeometryScriptPrimitiveOriginMode::Base);
+			}
 
+			// ALWAYS record exterior face
 			if (Seg.bExterior)
 			{
 				FExteriorFaceDef Face;
@@ -702,18 +707,21 @@ void FMonolithMeshBuildingActions::CutDoorOpenings(UDynamicMesh* Mesh, const TAr
 		// Cutter box: slightly wider than the wall thickness to clean-cut, door width from param
 		float CutterOvershoot = WallT + 10.0f;
 
+		// Clamp cutter bottom Z to FloorZ — on upper floors, never punch through the ceiling slab below
+		float CutterBaseZ = FloorZ;
+
 		FVector CutPos;
 		float CutW, CutD;
 
 		if (bVerticalWall)
 		{
-			CutPos = FVector(WallPos, DoorCenter, FloorZ);
+			CutPos = FVector(WallPos, DoorCenter, CutterBaseZ);
 			CutW = CutterOvershoot; // Wide enough to cut through wall
 			CutD = Door.Width;
 		}
 		else
 		{
-			CutPos = FVector(DoorCenter, WallPos, FloorZ);
+			CutPos = FVector(DoorCenter, WallPos, CutterBaseZ);
 			CutW = Door.Width;
 			CutD = CutterOvershoot;
 		}
@@ -863,47 +871,155 @@ void FMonolithMeshBuildingActions::GenerateStairGeometry(UDynamicMesh* Mesh,
 	Opts.PolygroupMode = EGeometryScriptPrimitivePolygroupMode::PerFace;
 	Opts.MaterialID = 2; // Floor material
 
+	// IBC standard tread dimensions — gives ~32.7 degree angle
+	const float TargetTreadDepth = 28.0f;  // 11 inches (IBC standard)
+	const float TargetRiserHeight = 18.0f; // ~7 inches
+	const float MinFlightWidth = 80.0f;    // Minimum stair width per flight
+	const float LandingSlabThick = 3.0f;   // Landing platform thickness
+	const float FlightGap = 10.0f;         // Gap between switchback flights
+
 	for (const FStairwellDef& Stair : Stairwells)
 	{
 		if (Stair.GridCells.Num() == 0) continue;
 
 		// Compute stairwell bounding box in grid coords
-		int32 MinX = INT32_MAX, MaxX = INT32_MIN;
-		int32 MinY = INT32_MAX, MaxY = INT32_MIN;
+		int32 MinGX = INT32_MAX, MaxGX = INT32_MIN;
+		int32 MinGY = INT32_MAX, MaxGY = INT32_MIN;
 		for (const FIntPoint& C : Stair.GridCells)
 		{
-			MinX = FMath::Min(MinX, C.X);
-			MaxX = FMath::Max(MaxX, C.X);
-			MinY = FMath::Min(MinY, C.Y);
-			MaxY = FMath::Max(MaxY, C.Y);
+			MinGX = FMath::Min(MinGX, C.X);
+			MaxGX = FMath::Max(MaxGX, C.X);
+			MinGY = FMath::Min(MinGY, C.Y);
+			MaxGY = FMath::Max(MaxGY, C.Y);
 		}
 
-		float WorldMinX = static_cast<float>(MinX) * CellSize;
-		float WorldMaxX = static_cast<float>(MaxX + 1) * CellSize;
-		float WorldMinY = static_cast<float>(MinY) * CellSize;
-		float WorldMaxY = static_cast<float>(MaxY + 1) * CellSize;
+		float WorldMinX = static_cast<float>(MinGX) * CellSize;
+		float WorldMaxX = static_cast<float>(MaxGX + 1) * CellSize;
+		float WorldMinY = static_cast<float>(MinGY) * CellSize;
+		float WorldMaxY = static_cast<float>(MaxGY + 1) * CellSize;
 
-		float StairDepth = WorldMaxY - WorldMinY; // Stairs run along Y
-		float ActualWidth = FMath::Min(StairWidth, WorldMaxX - WorldMinX);
+		float AvailableDepth = WorldMaxY - WorldMinY;  // Stairs run along Y
+		float AvailableWidth = WorldMaxX - WorldMinX;
 
-		// Calculate steps: standard step height ~18cm
-		const float StepHeight = 18.0f;
-		int32 StepCount = FMath::Max(1, FMath::RoundToInt32(FloorHeight / StepHeight));
-		float ActualStepHeight = FloorHeight / static_cast<float>(StepCount);
-		float StepDepth = StairDepth / static_cast<float>(StepCount);
+		// Compute step count and actual riser from floor height
+		int32 StepCount = FMath::Max(2, FMath::CeilToInt32(FloorHeight / TargetRiserHeight));
+		float ActualRiser = FloorHeight / static_cast<float>(StepCount);
+		float RequiredRun = static_cast<float>(StepCount) * TargetTreadDepth;
 
-		// Position stairs at center of stairwell
-		float CenterX = (WorldMinX + WorldMaxX) * 0.5f;
-		float StartY = WorldMinY;
+		if (AvailableDepth >= RequiredRun)
+		{
+			// ---- STRAIGHT STAIR: stairwell is long enough for a single flight ----
+			float ActualWidth = FMath::Min(StairWidth, AvailableWidth);
+			float CenterX = (WorldMinX + WorldMaxX) * 0.5f;
 
-		FTransform StairXf(FRotator::ZeroRotator,
-			FVector(CenterX - ActualWidth * 0.5f, StartY, FloorZ),
-			FVector::OneVector);
+			FTransform StairXf(FRotator::ZeroRotator,
+				FVector(CenterX - ActualWidth * 0.5f, WorldMinY, FloorZ),
+				FVector::OneVector);
 
-		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendLinearStairs(
-			Mesh, Opts, StairXf,
-			ActualWidth, ActualStepHeight, StepDepth, StepCount,
-			/*bFloating=*/false);
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendLinearStairs(
+				Mesh, Opts, StairXf,
+				ActualWidth, ActualRiser, TargetTreadDepth, StepCount,
+				/*bFloating=*/false);
+		}
+		else if (AvailableWidth >= MinFlightWidth * 2.0f + FlightGap)
+		{
+			// ---- SWITCHBACK STAIR: two half-flights running in opposite Y directions ----
+			int32 HalfSteps = StepCount / 2;
+			int32 SecondHalfSteps = StepCount - HalfSteps;
+			float HalfRun = static_cast<float>(HalfSteps) * TargetTreadDepth;
+			float FlightWidth = FMath::Min(
+				(AvailableWidth - FlightGap) * 0.5f,
+				StairWidth);
+			float LandingDepth = FMath::Min(FlightWidth, AvailableDepth - HalfRun);
+
+			if (LandingDepth < 60.0f)
+			{
+				// Not enough room for landing — fall back to steep capped stair
+				UE_LOG(LogTemp, Warning,
+					TEXT("Stairwell '%s' too small for switchback (%.0fx%.0fcm). "
+						"Minimum for 270cm floor: 200x300cm (4x6 cells at 50cm). "
+						"Falling back to steepest walkable angle."),
+					*Stair.StairwellId, AvailableWidth, AvailableDepth);
+
+				float CappedTread = ActualRiser / FMath::Tan(FMath::DegreesToRadians(44.0f));
+				float UseTread = FMath::Max(AvailableDepth / static_cast<float>(StepCount), CappedTread);
+				float ActualWidth = FMath::Min(StairWidth, AvailableWidth);
+				float CenterX = (WorldMinX + WorldMaxX) * 0.5f;
+
+				FTransform StairXf(FRotator::ZeroRotator,
+					FVector(CenterX - ActualWidth * 0.5f, WorldMinY, FloorZ),
+					FVector::OneVector);
+
+				UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendLinearStairs(
+					Mesh, Opts, StairXf,
+					ActualWidth, ActualRiser, UseTread, StepCount,
+					/*bFloating=*/false);
+				continue;
+			}
+
+			float MidZ = FloorZ + static_cast<float>(HalfSteps) * ActualRiser;
+
+			// Flight 1: left side, going +Y
+			float Flight1X = WorldMinX;
+			FTransform Flight1Xf(FRotator::ZeroRotator,
+				FVector(Flight1X, WorldMinY, FloorZ),
+				FVector::OneVector);
+
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendLinearStairs(
+				Mesh, Opts, Flight1Xf,
+				FlightWidth, ActualRiser, TargetTreadDepth, HalfSteps,
+				/*bFloating=*/false);
+
+			// Landing platform at the far end, spanning full stairwell width
+			float LandingY = WorldMinY + HalfRun;
+			FTransform LandingXf(FRotator::ZeroRotator,
+				FVector(WorldMinX + AvailableWidth * 0.5f, LandingY + LandingDepth * 0.5f, MidZ),
+				FVector::OneVector);
+
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+				Mesh, Opts, LandingXf,
+				AvailableWidth, LandingDepth, LandingSlabThick,
+				0, 0, 0,
+				EGeometryScriptPrimitiveOriginMode::Center);
+
+			// Flight 2: right side, going -Y (rotated 180 about Z)
+			float Flight2X = WorldMinX + FlightWidth + FlightGap;
+			float Flight2StartY = LandingY + LandingDepth;
+
+			FTransform Flight2Xf(FRotator(0.0f, 180.0f, 0.0f),
+				FVector(Flight2X + FlightWidth, Flight2StartY, MidZ),
+				FVector::OneVector);
+
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendLinearStairs(
+				Mesh, Opts, Flight2Xf,
+				FlightWidth, ActualRiser, TargetTreadDepth, SecondHalfSteps,
+				/*bFloating=*/false);
+		}
+		else
+		{
+			// ---- FALLBACK: stairwell too small for switchback, cap at 44 degrees ----
+			float CappedTread = ActualRiser / FMath::Tan(FMath::DegreesToRadians(44.0f));
+			float MaxTread = AvailableDepth / static_cast<float>(StepCount);
+			float UseTread = FMath::Max(MaxTread, CappedTread);
+			float ActualAngle = FMath::RadiansToDegrees(FMath::Atan2(ActualRiser, UseTread));
+
+			UE_LOG(LogTemp, Warning,
+				TEXT("Stairwell '%s' too small for comfortable stairs (%.0fx%.0fcm, angle=%.1f deg). "
+					"Minimum footprint for 270cm floor: 200x300cm (4x6 cells at 50cm)."),
+				*Stair.StairwellId, AvailableWidth, AvailableDepth, ActualAngle);
+
+			float ActualWidth = FMath::Min(StairWidth, AvailableWidth);
+			float CenterX = (WorldMinX + WorldMaxX) * 0.5f;
+
+			FTransform StairXf(FRotator::ZeroRotator,
+				FVector(CenterX - ActualWidth * 0.5f, WorldMinY, FloorZ),
+				FVector::OneVector);
+
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendLinearStairs(
+				Mesh, Opts, StairXf,
+				ActualWidth, ActualRiser, UseTread, StepCount,
+				/*bFloating=*/false);
+		}
 	}
 }
 
@@ -1113,6 +1229,10 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 		}
 	}
 
+	// ---- Parse optional flags ----
+	bool bOmitExteriorWalls = Params->HasField(TEXT("omit_exterior_walls"))
+		? Params->GetBoolField(TEXT("omit_exterior_walls")) : false;
+
 	// ---- Build geometry ----
 	UDynamicMesh* Mesh = NewObject<UDynamicMesh>(Pool);
 	if (!Mesh)
@@ -1129,8 +1249,6 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 	Descriptor.ExteriorWallThickness = ExteriorT;
 	Descriptor.InteriorWallThickness = InteriorT;
 
-	// For now: single floor (multi-floor support via floors array is a straightforward extension)
-	// TODO: Parse floors array for multi-story support
 	int32 NumFloors = 1;
 	const TArray<TSharedPtr<FJsonValue>>* FloorsArr = nullptr;
 	if (Params->TryGetArrayField(TEXT("floors"), FloorsArr) && FloorsArr && FloorsArr->Num() > 0)
@@ -1138,50 +1256,99 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 		NumFloors = FloorsArr->Num();
 	}
 
+	// ---- Build per-floor grids with stairwell propagation ----
+	// Each floor gets its own copy of the grid so stairwell cells can be
+	// propagated to destination floors (suppressing floor slabs above stairs).
+	TArray<TArray<TArray<int32>>> PerFloorGrids;
+	PerFloorGrids.SetNum(NumFloors);
+	for (int32 F = 0; F < NumFloors; ++F)
+	{
+		PerFloorGrids[F] = Grid; // Deep copy base grid
+	}
+
+	// Propagate stairwell cells to ALL floors they affect
+	for (const FStairwellDef& Stair : Stairwells)
+	{
+		// Mark cells on the originating floor (ensure -2 even if caller set them)
+		if (Stair.ConnectsFloorA >= 0 && Stair.ConnectsFloorA < NumFloors)
+		{
+			auto& GridA = PerFloorGrids[Stair.ConnectsFloorA];
+			for (const FIntPoint& Cell : Stair.GridCells)
+			{
+				if (Cell.X >= 0 && Cell.X < GridW && Cell.Y >= 0 && Cell.Y < GridH)
+					GridA[Cell.Y][Cell.X] = -2;
+			}
+		}
+
+		// Mark cells on the destination floor — THE CRITICAL FIX:
+		// Without this, the upper floor generates a solid slab above the stairs.
+		if (Stair.ConnectsFloorB >= 0 && Stair.ConnectsFloorB < NumFloors)
+		{
+			auto& GridB = PerFloorGrids[Stair.ConnectsFloorB];
+			for (const FIntPoint& Cell : Stair.GridCells)
+			{
+				if (Cell.X >= 0 && Cell.X < GridW && Cell.Y >= 0 && Cell.Y < GridH)
+					GridB[Cell.Y][Cell.X] = -2;
+			}
+		}
+
+		// For multi-floor stairwells (atriums), mark intermediate floors too
+		for (int32 F = Stair.ConnectsFloorA + 1; F < Stair.ConnectsFloorB; ++F)
+		{
+			if (F >= 0 && F < NumFloors)
+			{
+				auto& GridMid = PerFloorGrids[F];
+				for (const FIntPoint& Cell : Stair.GridCells)
+				{
+					if (Cell.X >= 0 && Cell.X < GridW && Cell.Y >= 0 && Cell.Y < GridH)
+						GridMid[Cell.Y][Cell.X] = -2;
+				}
+			}
+		}
+	}
+
 	for (int32 FloorIdx = 0; FloorIdx < NumFloors; ++FloorIdx)
 	{
 		float FloorZ = static_cast<float>(FloorIdx) * (FloorHeight + FloorThick);
 
-		// Use per-floor grid/rooms/doors if provided, else reuse the base ones
-		TArray<TArray<int32>>* FloorGrid = &Grid;
+		// Use per-floor grid (with stairwell propagation applied)
+		TArray<TArray<int32>>& FloorGrid = PerFloorGrids[FloorIdx];
 		TArray<FRoomDef>* FloorRooms = &Rooms;
 		TArray<FDoorDef>* FloorDoors = &Doors;
 		TArray<FStairwellDef>* FloorStairwells = &Stairwells;
 
-		// Per-floor overrides could be parsed here from FloorsArr if needed
+		// 1. Build wall segments from per-floor grid (stairwell cells produce enclosure walls)
+		TArray<FWallSegment> WallSegments = BuildWallSegments(FloorGrid, GridW, GridH, *FloorDoors);
 
-		// 1. Build wall segments from grid edges
-		TArray<FWallSegment> WallSegments = BuildWallSegments(*FloorGrid, GridW, GridH, *FloorDoors);
-
-		// 2. Generate wall geometry
+		// 2. Generate wall geometry (respects omit_exterior_walls flag)
 		TArray<FExteriorFaceDef> ExteriorFaces;
 		GenerateWallGeometry(Mesh, WallSegments, CellSize, FloorHeight, FloorZ + FloorThick,
-			ExteriorT, InteriorT, ExteriorFaces, FloorIdx);
+			ExteriorT, InteriorT, ExteriorFaces, FloorIdx, bOmitExteriorWalls);
 
-		// 3. Generate floor slab (at bottom of floor, skip stairwell cells)
-		GenerateSlabs(Mesh, *FloorGrid, GridW, GridH, CellSize, FloorThick, FloorZ, 2, true);
+		// 3. Generate floor slab (skip stairwell cells — now properly propagated to upper floors)
+		GenerateSlabs(Mesh, FloorGrid, GridW, GridH, CellSize, FloorThick, FloorZ, 2, true);
 
-		// 4. Generate ceiling slab (at top of floor, skip stairwell cells)
-		GenerateSlabs(Mesh, *FloorGrid, GridW, GridH, CellSize, FloorThick,
+		// 4. Generate ceiling slab (skip stairwell cells)
+		GenerateSlabs(Mesh, FloorGrid, GridW, GridH, CellSize, FloorThick,
 			FloorZ + FloorThick + FloorHeight, 2, true);
 
 		// 5. Boolean-subtract door openings
 		CutDoorOpenings(Mesh, *FloorDoors, CellSize, FloorZ + FloorThick,
-			ExteriorT, InteriorT, *FloorGrid, GridW, GridH, bHadBooleans);
+			ExteriorT, InteriorT, FloorGrid, GridW, GridH, bHadBooleans);
 
 		// 6. Add trim around door openings
 		AddDoorTrim(Mesh, *FloorDoors, CellSize, FloorZ + FloorThick,
-			ExteriorT, InteriorT, *FloorGrid, GridW, GridH);
+			ExteriorT, InteriorT, FloorGrid, GridW, GridH);
 
-		// 7. Generate stair geometry for stairwells
-		float StairWidth = CellSize; // Default stair width = one cell
+		// 7. Generate stair geometry for stairwells (only on the originating floor)
+		float ActualStairWidth = CellSize;
 		GenerateStairGeometry(Mesh, *FloorStairwells, CellSize, FloorHeight + FloorThick,
-			FloorZ + FloorThick, StairWidth);
+			FloorZ + FloorThick, ActualStairWidth);
 
 		// 8. Compute room bounds and door positions for descriptor
 		ComputeRoomBounds(*FloorRooms, CellSize, FloorHeight, FloorZ + FloorThick, Location);
 		ComputeDoorPositions(*FloorDoors, CellSize, FloorZ + FloorThick, Location,
-			*FloorGrid, GridW, GridH);
+			FloorGrid, GridW, GridH);
 
 		// Compute stairwell world positions
 		for (FStairwellDef& S : *FloorStairwells)
@@ -1205,7 +1372,7 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 		FloorPlan.FloorIndex = FloorIdx;
 		FloorPlan.ZOffset = FloorZ;
 		FloorPlan.Height = FloorHeight;
-		FloorPlan.Grid = *FloorGrid;
+		FloorPlan.Grid = FloorGrid;
 		FloorPlan.Rooms = *FloorRooms;
 		FloorPlan.Doors = *FloorDoors;
 		FloorPlan.Stairwells = *FloorStairwells;

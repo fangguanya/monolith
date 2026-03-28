@@ -1010,36 +1010,47 @@ bool FMonolithMeshTerrainActions::BuildADARamp(UDynamicMesh* Mesh, float Rise, f
 
 	FVector Dir = Direction.GetSafeNormal2D();
 	if (Dir.IsNearlyZero()) Dir = FVector(1, 0, 0);
-	FVector Right = FVector::CrossProduct(FVector::UpVector, Dir);
+	FVector RightVec = FVector::CrossProduct(FVector::UpVector, Dir).GetSafeNormal();
+
+	// Lateral gap between parallel runs: ramp width + 30cm for inner handrails (ADA 505.3)
+	const float LateralGap = Width + 30.0f;
+	constexpr float RAMP_THICKNESS = 10.0f;
+	const float RampAngle = FMath::RadiansToDegrees(FMath::Atan(ADA_SLOPE));
+	const float RampLength = FMath::Sqrt(SegmentRun * SegmentRun + SegmentRise * SegmentRise);
 
 	FGeometryScriptPrimitiveOptions Opts;
-	float CurrentZ = StartPos.Z;
-	FVector CurrentPos = StartPos;
-	FVector CurrentDir = Dir;
+
+	// Switchback layout: runs are SIDE BY SIDE in plan view (offset perpendicular),
+	// NOT stacked vertically. Each segment alternates direction along the run axis,
+	// and each is offset laterally by LateralGap.
 
 	for (int32 Seg = 0; Seg < Segments; ++Seg)
 	{
-		// Ramp segment: a tilted box
-		float RampThickness = 10.0f;
+		float SegStartZ = StartPos.Z + SegmentRise * Seg;
+		float SegEndZ = SegStartZ + SegmentRise;
 
-		// Build ramp as an extruded polygon (trapezoidal side profile)
-		// For simplicity, use a box and rotate it to the ramp angle
-		float RampAngle = FMath::RadiansToDegrees(FMath::Atan(ADA_SLOPE));
+		// Alternate direction: even segments go forward, odd go backward
+		FVector SegDir = (Seg % 2 == 0) ? Dir : -Dir;
+
+		// Perpendicular offset: each segment shifts laterally
+		FVector LateralOffset = RightVec * (Seg * LateralGap);
+
+		// Segment start position (at the beginning of this run)
+		FVector SegStart = StartPos + LateralOffset;
+		SegStart.Z = SegStartZ;
 
 		// Ramp slab: box at angle
-		FVector RampCenter = CurrentPos + CurrentDir * (SegmentRun * 0.5f) + FVector(0, 0, SegmentRise * 0.5f);
-		FRotator RampRot = CurrentDir.Rotation();
-		// Tilt the ramp along its length axis
-		RampRot.Pitch = -RampAngle; // Tilt upward
+		FVector RampCenter = SegStart + SegDir * (SegmentRun * 0.5f) + FVector(0, 0, SegmentRise * 0.5f);
+		FRotator RampRot = SegDir.Rotation();
+		RampRot.Pitch = -RampAngle; // Tilt upward along run direction
 
 		FTransform RampXf(RampRot, RampCenter, FVector::OneVector);
-		float RampLength = FMath::Sqrt(SegmentRun * SegmentRun + SegmentRise * SegmentRise);
 		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
-			Mesh, Opts, RampXf, RampLength, Width, RampThickness,
+			Mesh, Opts, RampXf, RampLength, Width, RAMP_THICKNESS,
 			0, 0, 0, EGeometryScriptPrimitiveOriginMode::Center);
 
 		// Handrail posts on both sides
-		FVector RampRight = FVector::CrossProduct(FVector::UpVector, CurrentDir).GetSafeNormal();
+		FVector RampRight = FVector::CrossProduct(FVector::UpVector, SegDir).GetSafeNormal();
 		float NumPosts = FMath::Max(2.0f, FMath::CeilToFloat(SegmentRun / HANDRAIL_POST_SPACING) + 1.0f);
 
 		for (int32 Side = 0; Side < 2; ++Side)
@@ -1050,7 +1061,7 @@ bool FMonolithMeshTerrainActions::BuildADARamp(UDynamicMesh* Mesh, float Rise, f
 			for (int32 P = 0; P < static_cast<int32>(NumPosts); ++P)
 			{
 				float T = (NumPosts > 1) ? (float)P / (NumPosts - 1) : 0.5f;
-				FVector PostBase = CurrentPos + CurrentDir * (T * SegmentRun) +
+				FVector PostBase = SegStart + SegDir * (T * SegmentRun) +
 					FVector(0, 0, T * SegmentRise) + SideOffset;
 
 				FTransform PostXf(FRotator::ZeroRotator, PostBase, FVector::OneVector);
@@ -1061,45 +1072,58 @@ bool FMonolithMeshTerrainActions::BuildADARamp(UDynamicMesh* Mesh, float Rise, f
 			}
 
 			// Top rail
-			FVector RailStart = CurrentPos + SideOffset + FVector(0, 0, HANDRAIL_HEIGHT);
-			FVector RailEnd = CurrentPos + CurrentDir * SegmentRun + SideOffset + FVector(0, 0, SegmentRise + HANDRAIL_HEIGHT);
+			FVector RailStart = SegStart + SideOffset + FVector(0, 0, HANDRAIL_HEIGHT);
+			FVector RailEnd = SegStart + SegDir * SegmentRun + SideOffset + FVector(0, 0, SegmentRise + HANDRAIL_HEIGHT);
 			FVector RailCenter = (RailStart + RailEnd) * 0.5f;
-			float RailLength = (RailEnd - RailStart).Size();
-			FVector RailDir = (RailEnd - RailStart).GetSafeNormal();
-			FRotator RailRot = RailDir.Rotation();
+			float RailLen = (RailEnd - RailStart).Size();
+			FVector RailDir2 = (RailEnd - RailStart).GetSafeNormal();
+			FRotator RailRot = RailDir2.Rotation();
 
 			FTransform RailXf(RailRot, RailCenter, FVector::OneVector);
 			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
 				Mesh, Opts, RailXf,
-				RailLength, HANDRAIL_POST_WIDTH, HANDRAIL_RAIL_HEIGHT,
+				RailLen, HANDRAIL_POST_WIDTH, HANDRAIL_RAIL_HEIGHT,
 				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Center);
 		}
 
-		// Advance position
-		CurrentPos += CurrentDir * SegmentRun + FVector(0, 0, SegmentRise);
-		CurrentZ += SegmentRise;
-
-		// Landing between segments (if not last segment)
+		// 180-degree landing connecting this segment's end to the next segment's start
 		if (Seg < Segments - 1)
 		{
-			// Switchback: landing pad + turn 180 degrees
-			FTransform LandingXf(FRotator::ZeroRotator, CurrentPos, FVector::OneVector);
+			// Landing spans laterally from this run's end to next run's start
+			FVector ThisEnd = SegStart + SegDir * SegmentRun + FVector(0, 0, SegmentRise);
+			FVector NextLateral = RightVec * ((Seg + 1) * LateralGap);
+			FVector NextStart = StartPos + NextLateral;
+			NextStart.Z = SegEndZ;
+
+			FVector LandingCenter = (ThisEnd + NextStart) * 0.5f;
+			// Landing width spans from this run to next run (perpendicular to run direction)
+			float LandingSpanPerp = LateralGap + Width;
+
+			// Rotate landing to align perpendicular span with the right vector
+			FRotator LandingRot = RightVec.Rotation();
+			FTransform LandingXf(LandingRot, LandingCenter, FVector::OneVector);
 			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
 				Mesh, Opts, LandingXf,
-				ADA_LANDING_LENGTH, Width, 10.0f,
-				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
-
-			CurrentPos += CurrentDir * ADA_LANDING_LENGTH;
-			CurrentDir = -CurrentDir; // Switchback
+				LandingSpanPerp, ADA_LANDING_LENGTH, RAMP_THICKNESS,
+				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Center);
 		}
 	}
 
-	// Top landing pad
-	FTransform TopLandingXf(FRotator::ZeroRotator, CurrentPos, FVector::OneVector);
-	UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
-		Mesh, Opts, TopLandingXf,
-		ADA_LANDING_LENGTH, Width, 10.0f,
-		0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+	// Top landing pad at the end of the last segment
+	{
+		int32 LastSeg = Segments - 1;
+		FVector LastSegDir = (LastSeg % 2 == 0) ? Dir : -Dir;
+		FVector LastLateral = RightVec * (LastSeg * LateralGap);
+		FVector LastSegStart = StartPos + LastLateral;
+		LastSegStart.Z = StartPos.Z + SegmentRise * LastSeg;
+		FVector TopPos = LastSegStart + LastSegDir * SegmentRun + FVector(0, 0, SegmentRise);
+
+		FTransform TopLandingXf(FRotator::ZeroRotator, TopPos, FVector::OneVector);
+		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+			Mesh, Opts, TopLandingXf,
+			ADA_LANDING_LENGTH, Width, RAMP_THICKNESS,
+			0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+	}
 
 	return true;
 }
