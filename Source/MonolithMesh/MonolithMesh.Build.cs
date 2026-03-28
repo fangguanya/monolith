@@ -35,7 +35,8 @@ public class MonolithMesh : ModuleRules
 			"SlateCore",
 			"AssetRegistry",
 			"AssetTools",
-			"MeshReductionInterface"
+			"MeshReductionInterface",
+			"LevelInstanceEditor"
 		});
 
 		// Optional: GeometryScripting (Tier 5 mesh operations only)
