@@ -1339,6 +1339,7 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 			BuildingGridParams->SetArrayField(TEXT("location"), BuildingLoc);
 			BuildingGridParams->SetStringField(TEXT("folder"), Folder + TEXT("/Buildings"));
 			BuildingGridParams->SetBoolField(TEXT("overwrite"), true);
+			BuildingGridParams->SetBoolField(TEXT("omit_exterior_walls"), true); // Facade replaces exterior walls
 		}
 		else
 		{
@@ -1429,6 +1430,7 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 			BuildingGridParams->SetArrayField(TEXT("location"), BuildingLoc);
 			BuildingGridParams->SetStringField(TEXT("folder"), Folder + TEXT("/Buildings"));
 			BuildingGridParams->SetBoolField(TEXT("overwrite"), true);
+			BuildingGridParams->SetBoolField(TEXT("omit_exterior_walls"), true); // Facade replaces exterior walls
 		}
 
 		// Execute SP1: create_building_from_grid
@@ -1455,9 +1457,10 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 			auto FacadeParams = MakeShared<FJsonObject>();
 
 			// Pass the building descriptor to the facade generator
-			if (BuildingResult.IsValid() && BuildingResult->HasField(TEXT("building_descriptor")))
+			// BuildingResult IS the descriptor (it contains exterior_faces, floors, etc. at top level)
+			if (BuildingResult.IsValid())
 			{
-				FacadeParams->SetObjectField(TEXT("building_descriptor"), BuildingResult->GetObjectField(TEXT("building_descriptor")));
+				FacadeParams->SetObjectField(TEXT("building_descriptor"), BuildingResult);
 			}
 
 			FacadeParams->SetStringField(TEXT("save_path"), FString::Printf(TEXT("%s/Facade_%02d"), *SavePathPrefix, i));
@@ -1496,9 +1499,34 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 		{
 			auto RoofParams = MakeShared<FJsonObject>();
 
-			if (BuildingResult.IsValid() && BuildingResult->HasField(TEXT("building_descriptor")))
+			// BuildingResult IS the descriptor — pass footprint_polygon and height info
+			if (BuildingResult.IsValid())
 			{
-				RoofParams->SetObjectField(TEXT("building_descriptor"), BuildingResult->GetObjectField(TEXT("building_descriptor")));
+				if (BuildingResult->HasField(TEXT("footprint_polygon")))
+				{
+					RoofParams->SetArrayField(TEXT("footprint_polygon"), BuildingResult->GetArrayField(TEXT("footprint_polygon")));
+				}
+				// Compute roof height from top floor
+				const TArray<TSharedPtr<FJsonValue>>* FloorsArr = nullptr;
+				if (BuildingResult->TryGetArrayField(TEXT("floors"), FloorsArr) && FloorsArr && FloorsArr->Num() > 0)
+				{
+					const TSharedPtr<FJsonObject>* TopFloor = nullptr;
+					if ((*FloorsArr).Last()->TryGetObject(TopFloor) && TopFloor && (*TopFloor).IsValid())
+					{
+						float ZOff = static_cast<float>((*TopFloor)->GetNumberField(TEXT("z_offset")));
+						float FH = static_cast<float>((*TopFloor)->GetNumberField(TEXT("height")));
+						RoofParams->SetNumberField(TEXT("height_offset"), ZOff + FH);
+					}
+				}
+				// Pass building location for roof placement
+				if (BuildingResult->HasField(TEXT("world_origin")))
+				{
+					RoofParams->SetArrayField(TEXT("location"), BuildingResult->GetArrayField(TEXT("world_origin")));
+				}
+				if (BuildingResult->HasField(TEXT("building_id")))
+				{
+					RoofParams->SetStringField(TEXT("building_id"), BuildingResult->GetStringField(TEXT("building_id")));
+				}
 			}
 
 			RoofParams->SetStringField(TEXT("save_path"), FString::Printf(TEXT("%s/Roof_%02d"), *SavePathPrefix, i));
@@ -1534,9 +1562,7 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 
 			if (BuildingResult.IsValid())
 			{
-				RegParams->SetObjectField(TEXT("building_descriptor"), BuildingResult.IsValid() && BuildingResult->HasField(TEXT("building_descriptor"))
-					? BuildingResult->GetObjectField(TEXT("building_descriptor"))
-					: BuildingResult);
+				RegParams->SetObjectField(TEXT("building_descriptor"), BuildingResult);
 			}
 
 			TSharedPtr<FJsonObject> RegResult;
