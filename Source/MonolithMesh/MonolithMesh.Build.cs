@@ -36,6 +36,7 @@ public class MonolithMesh : ModuleRules
 			"AssetRegistry",
 			"AssetTools",
 			"MeshReductionInterface",
+			"MeshMergeUtilities",
 			"LevelInstanceEditor"
 		});
 

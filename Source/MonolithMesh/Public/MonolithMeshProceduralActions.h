@@ -9,9 +9,13 @@ class UMonolithMeshHandlePool;
 class UDynamicMesh;
 
 /**
- * Phase 19A: Procedural Geometry Actions (GeometryScript)
- * Parametric furniture + horror prop generation via boolean ops on primitives.
- * 2 actions: create_parametric_mesh, create_horror_prop
+ * Phases 19A-D: Procedural Geometry Actions (GeometryScript)
+ * 19A: Parametric furniture + horror prop generation via boolean ops on primitives.
+ * 19B: Structures (rooms/corridors/junctions) + building shells + maze generation.
+ * 19C: Pipe networks (swept polygon) + mesh fragmentation (plane slice).
+ * 19D: Terrain patches (Perlin noise heightmap).
+ * 8 actions total: create_parametric_mesh, create_horror_prop, create_structure,
+ *   create_building_shell, create_maze, create_pipe_network, create_fragments, create_terrain_patch
  */
 class FMonolithMeshProceduralActions
 {
@@ -25,9 +29,21 @@ public:
 private:
 	static UMonolithMeshHandlePool* Pool;
 
-	// Action handlers
+	// Action handlers — Phase 19A
 	static FMonolithActionResult CreateParametricMesh(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult CreateHorrorProp(const TSharedPtr<FJsonObject>& Params);
+
+	// Action handlers — Phase 19B (Structures + Mazes)
+	static FMonolithActionResult CreateStructure(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult CreateBuildingShell(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult CreateMaze(const TSharedPtr<FJsonObject>& Params);
+
+	// Action handlers — Phase 19C (Pipes + Fragments)
+	static FMonolithActionResult CreatePipeNetwork(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult CreateFragments(const TSharedPtr<FJsonObject>& Params);
+
+	// Action handlers — Phase 19D (Terrain)
+	static FMonolithActionResult CreateTerrainPatch(const TSharedPtr<FJsonObject>& Params);
 
 	// ---- Parametric furniture builders ----
 	// Each returns triangle count. Mesh is built in-place on TargetMesh.
@@ -72,6 +88,28 @@ private:
 
 	/** Parse a "params" sub-object, returning it (or empty object if absent) */
 	static TSharedPtr<FJsonObject> ParseSubParams(const TSharedPtr<FJsonObject>& Params);
+
+	/** Parse an array of [x,y,z] arrays from a JSON field */
+	static bool ParseVectorArray(const TSharedPtr<FJsonObject>& Params, const FString& Key, TArray<FVector>& Out);
+
+	/** Parse an array of [x,y] arrays from a JSON field (2D polygon points) */
+	static bool ParseVector2DArray(const TSharedPtr<FJsonObject>& Params, const FString& Key, TArray<FVector2D>& Out);
+
+	/** Generate a circle polygon (2D) for sweep profiles */
+	static TArray<FVector2D> MakeCirclePolygon(float Radius, int32 Segments);
+
+	/** Inset a 2D polygon by a fixed distance (simple per-edge inward offset) */
+	static TArray<FVector2D> InsetPolygon2D(const TArray<FVector2D>& Polygon, float InsetDist);
+
+	/** Common save/place/handle logic used by all procedural actions. Mutates Result JSON. Returns error or empty. */
+	static FString FinalizeProceduralMesh(UDynamicMesh* Mesh, const TSharedPtr<FJsonObject>& Params,
+		const TSharedPtr<FJsonObject>& Result, const FString& HandleCategory);
+
+	// ---- Maze algorithms (pure logic, return wall segment list) ----
+	struct FMazeWall { int32 X0, Y0, X1, Y1; }; // Grid coords of cells on either side
+	static TArray<FMazeWall> GenerateMaze_RecursiveBacktracker(int32 GridW, int32 GridH, int32 Seed);
+	static TArray<FMazeWall> GenerateMaze_Prims(int32 GridW, int32 GridH, int32 Seed);
+	static TArray<FMazeWall> GenerateMaze_BinaryTree(int32 GridW, int32 GridH, int32 Seed);
 };
 
 #endif // WITH_GEOMETRYSCRIPT
