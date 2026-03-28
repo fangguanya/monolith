@@ -1195,6 +1195,10 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 		? Params->GetBoolField(TEXT("hospice_mode")) : false;
 	const bool bSkipFacades = Params->HasField(TEXT("skip_facades"))
 		? Params->GetBoolField(TEXT("skip_facades")) : false;
+
+	// Facade style for integrated generation (v3)
+	FString BlockFacadeStyle;
+	Params->TryGetStringField(TEXT("facade_style"), BlockFacadeStyle);
 	const bool bSkipRoofs = Params->HasField(TEXT("skip_roofs"))
 		? Params->GetBoolField(TEXT("skip_roofs")) : false;
 	const bool bSkipStreets = Params->HasField(TEXT("skip_streets"))
@@ -1339,8 +1343,7 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 			BuildingGridParams->SetArrayField(TEXT("location"), BuildingLoc);
 			BuildingGridParams->SetStringField(TEXT("folder"), Folder + TEXT("/Buildings"));
 			BuildingGridParams->SetBoolField(TEXT("overwrite"), true);
-			// NOTE: omit_exterior_walls disabled until facade alignment is fixed
-			// BuildingGridParams->SetBoolField(TEXT("omit_exterior_walls"), true);
+			// omit_exterior_walls is now set automatically by facade_style in create_building_from_grid
 		}
 		else
 		{
@@ -1431,8 +1434,14 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 			BuildingGridParams->SetArrayField(TEXT("location"), BuildingLoc);
 			BuildingGridParams->SetStringField(TEXT("folder"), Folder + TEXT("/Buildings"));
 			BuildingGridParams->SetBoolField(TEXT("overwrite"), true);
-			// NOTE: omit_exterior_walls disabled until facade alignment is fixed
-			// BuildingGridParams->SetBoolField(TEXT("omit_exterior_walls"), true);
+			// omit_exterior_walls is now set automatically by facade_style in create_building_from_grid
+		}
+
+		// Pass facade_style through to building generation (v3 integrated facade)
+		if (!bSkipFacades && !BlockFacadeStyle.IsEmpty())
+		{
+			BuildingGridParams->SetStringField(TEXT("facade_style"), BlockFacadeStyle);
+			BuildingGridParams->SetNumberField(TEXT("facade_seed"), Seed + i * 31);
 		}
 
 		// Execute SP1: create_building_from_grid
@@ -1453,49 +1462,24 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 
 		UE_LOG(LogMonolithCityBlock, Log, TEXT("    Building %d geometry: OK"), i);
 
-		// Step 4: Generate facade via SP3 (if not skipped)
-		// TODO: Facade alignment needs rework — facade mesh is a separate actor whose wall geometry
-		// doesn't align with the building mesh. Needs either: (a) facade operates on building mesh directly,
-		// or (b) facade shares exact transform with building. Disabled until fixed.
-		if (false && !bSkipFacades)
+		// Step 4: Facade — now integrated into create_building_from_grid (v3 single-pass)
+		// When facade_style is passed to the building generator, it builds exterior walls
+		// with window/door openings, frames, trim, and cornices in one mesh. No separate
+		// facade actor needed. The old generate_facade action still works standalone.
+		if (bSkipFacades || BlockFacadeStyle.IsEmpty())
 		{
-			auto FacadeParams = MakeShared<FJsonObject>();
-
-			// Pass the building descriptor to the facade generator
-			// BuildingResult IS the descriptor (it contains exterior_faces, floors, etc. at top level)
-			if (BuildingResult.IsValid())
-			{
-				FacadeParams->SetObjectField(TEXT("building_descriptor"), BuildingResult);
-			}
-
-			FacadeParams->SetStringField(TEXT("save_path"), FString::Printf(TEXT("%s/Facade_%02d"), *SavePathPrefix, i));
-			FacadeParams->SetStringField(TEXT("folder"), Folder + TEXT("/Facades"));
-			FacadeParams->SetNumberField(TEXT("seed"), Seed + i + 1000);
-			FacadeParams->SetBoolField(TEXT("overwrite"), true);
-
-			if (Decay > 0.0f)
-			{
-				FacadeParams->SetNumberField(TEXT("damage_level"), Decay);
-			}
-
-			TSharedPtr<FJsonObject> FacadeResult;
-			FString FacadeError;
-			if (TryExecuteAction(TEXT("generate_facade"), FacadeParams, FacadeResult, FacadeError))
-			{
-				UE_LOG(LogMonolithCityBlock, Log, TEXT("    Facade %d: OK"), i);
-				if (BuildingResult.IsValid() && FacadeResult.IsValid())
-				{
-					BuildingResult->SetObjectField(TEXT("facade"), FacadeResult);
-				}
-			}
-			else
-			{
-				UE_LOG(LogMonolithCityBlock, Warning, TEXT("    Facade %d skipped: %s"), i, *FacadeError);
-				SkippedSteps.AddUnique(TEXT("facades"));
-			}
+			SkippedSteps.AddUnique(TEXT("facades"));
+		}
+		else if (BuildingResult.IsValid() && BuildingResult->HasField(TEXT("integrated_facade")))
+		{
+			UE_LOG(LogMonolithCityBlock, Log, TEXT("    Facade %d: integrated (%d windows, %d doors)"),
+				i,
+				BuildingResult->HasField(TEXT("window_count")) ? static_cast<int32>(BuildingResult->GetNumberField(TEXT("window_count"))) : 0,
+				BuildingResult->HasField(TEXT("entrance_door_count")) ? static_cast<int32>(BuildingResult->GetNumberField(TEXT("entrance_door_count"))) : 0);
 		}
 		else
 		{
+			UE_LOG(LogMonolithCityBlock, Warning, TEXT("    Facade %d: integration failed, no facade generated"), i);
 			SkippedSteps.AddUnique(TEXT("facades"));
 		}
 

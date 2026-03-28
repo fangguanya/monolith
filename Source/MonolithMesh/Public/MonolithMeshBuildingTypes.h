@@ -226,6 +226,66 @@ struct FFloorPlan
 	}
 };
 
+/** Window placement data — shared between facade and building generators */
+struct FFacadeWindowPlacement
+{
+	float CenterX;      // Center X position along wall face (local to face)
+	float SillZ;        // Z of window sill (local to face)
+	float Width;
+	float Height;
+	int32 FloorIndex;
+	bool bIsGroundFloor;
+	FString Wall;        // "north", "south", "east", "west"
+	FVector WorldCenter = FVector::ZeroVector; // Computed world position of window center
+
+	TSharedPtr<FJsonObject> ToJson() const
+	{
+		auto J = MakeShared<FJsonObject>();
+		J->SetStringField(TEXT("wall"), Wall);
+		J->SetNumberField(TEXT("floor_index"), FloorIndex);
+		J->SetNumberField(TEXT("center_x"), CenterX);
+		J->SetNumberField(TEXT("sill_z"), SillZ);
+		J->SetNumberField(TEXT("width"), Width);
+		J->SetNumberField(TEXT("height"), Height);
+		J->SetBoolField(TEXT("is_ground_floor"), bIsGroundFloor);
+
+		TArray<TSharedPtr<FJsonValue>> PosArr;
+		PosArr.Add(MakeShared<FJsonValueNumber>(WorldCenter.X));
+		PosArr.Add(MakeShared<FJsonValueNumber>(WorldCenter.Y));
+		PosArr.Add(MakeShared<FJsonValueNumber>(WorldCenter.Z));
+		J->SetArrayField(TEXT("world_center"), PosArr);
+		return J;
+	}
+};
+
+/** Door placement data — shared between facade and building generators */
+struct FFacadeDoorPlacement
+{
+	float CenterX;
+	float Width;
+	float Height;
+	bool bStorefront;
+	FString Wall;
+	FVector WorldCenter = FVector::ZeroVector;
+
+	TSharedPtr<FJsonObject> ToJson() const
+	{
+		auto J = MakeShared<FJsonObject>();
+		J->SetStringField(TEXT("wall"), Wall);
+		J->SetNumberField(TEXT("center_x"), CenterX);
+		J->SetNumberField(TEXT("width"), Width);
+		J->SetNumberField(TEXT("height"), Height);
+		J->SetBoolField(TEXT("storefront"), bStorefront);
+
+		TArray<TSharedPtr<FJsonValue>> PosArr;
+		PosArr.Add(MakeShared<FJsonValueNumber>(WorldCenter.X));
+		PosArr.Add(MakeShared<FJsonValueNumber>(WorldCenter.Y));
+		PosArr.Add(MakeShared<FJsonValueNumber>(WorldCenter.Z));
+		J->SetArrayField(TEXT("world_center"), PosArr);
+		return J;
+	}
+};
+
 /** The Building Descriptor — output of create_building_from_grid, consumed by all downstream SPs */
 struct FBuildingDescriptor
 {
@@ -240,6 +300,11 @@ struct FBuildingDescriptor
 	TArray<FExteriorFaceDef> ExteriorFaces;
 	TArray<FString> ActorNames;
 	TArray<FString> TagsApplied;
+
+	// Facade data (populated when facade_style is provided to create_building_from_grid)
+	FString FacadeStyle;
+	TArray<FFacadeWindowPlacement> Windows;
+	TArray<FFacadeDoorPlacement> EntranceDoors;
 
 	TSharedPtr<FJsonObject> ToJson() const
 	{
@@ -304,6 +369,26 @@ struct FBuildingDescriptor
 		WallThick->SetNumberField(TEXT("exterior"), ExteriorWallThickness);
 		WallThick->SetNumberField(TEXT("interior"), InteriorWallThickness);
 		J->SetObjectField(TEXT("wall_thickness"), WallThick);
+
+		// Facade data
+		if (!FacadeStyle.IsEmpty())
+		{
+			J->SetStringField(TEXT("facade_style"), FacadeStyle);
+
+			TArray<TSharedPtr<FJsonValue>> WinArr;
+			for (const FFacadeWindowPlacement& W : Windows)
+			{
+				WinArr.Add(MakeShared<FJsonValueObject>(W.ToJson()));
+			}
+			J->SetArrayField(TEXT("windows"), WinArr);
+
+			TArray<TSharedPtr<FJsonValue>> DoorArr2;
+			for (const FFacadeDoorPlacement& D : EntranceDoors)
+			{
+				DoorArr2.Add(MakeShared<FJsonValueObject>(D.ToJson()));
+			}
+			J->SetArrayField(TEXT("entrance_doors"), DoorArr2);
+		}
 
 		return J;
 	}
