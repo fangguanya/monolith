@@ -2370,7 +2370,77 @@ static void EnsureExteriorEntrance(const TArray<TArray<int32>>& Grid, int32 Grid
 		{
 			SameWallCells.Sort([](const FIntPoint& A, const FIntPoint& B) { return A.Y < B.Y; });
 		}
-		BestCell = SameWallCells[SameWallCells.Num() / 2];
+		// Pick midpoint, but avoid cells where an interior wall crosses perpendicular
+		// (a room boundary at this cell would block the entrance)
+		int32 MidIdx = SameWallCells.Num() / 2;
+		BestCell = SameWallCells[MidIdx];
+
+		// Check for interior wall: does a different room ID exist on the perpendicular neighbor?
+		auto HasPerpendicularWall = [&](const FIntPoint& Cell) -> bool
+		{
+			if (BestWall == TEXT("south") || BestWall == TEXT("north"))
+			{
+				// Wall runs along X. Check if cell above/below (inward) has a different room on left/right
+				int32 InY = (BestWall == TEXT("south")) ? Cell.Y + 1 : Cell.Y - 1;
+				if (InY >= 0 && InY < GridH && Cell.X > 0 && Cell.X < GridW)
+				{
+					int32 Left = Grid[InY][Cell.X - 1];
+					int32 Right = Grid[InY][Cell.X];
+					if (Left != Right && Left >= 0 && Right >= 0) return true;
+				}
+				if (InY >= 0 && InY < GridH && Cell.X + 1 < GridW)
+				{
+					int32 Left = Grid[InY][Cell.X];
+					int32 Right = Grid[InY][Cell.X + 1];
+					if (Left != Right && Left >= 0 && Right >= 0) return true;
+				}
+			}
+			else
+			{
+				// Wall runs along Y. Check if cell left/right (inward) has different room above/below
+				int32 InX = (BestWall == TEXT("west")) ? Cell.X + 1 : Cell.X - 1;
+				if (InX >= 0 && InX < GridW && Cell.Y > 0 && Cell.Y < GridH)
+				{
+					int32 Top = Grid[Cell.Y - 1][InX];
+					int32 Bot = Grid[Cell.Y][InX];
+					if (Top != Bot && Top >= 0 && Bot >= 0) return true;
+				}
+				if (InX >= 0 && InX < GridW && Cell.Y + 1 < GridH)
+				{
+					int32 Top = Grid[Cell.Y][InX];
+					int32 Bot = Grid[Cell.Y + 1][InX];
+					if (Top != Bot && Top >= 0 && Bot >= 0) return true;
+				}
+			}
+			return false;
+		};
+
+		// If midpoint has a perpendicular wall, search outward for a clear cell
+		if (HasPerpendicularWall(BestCell))
+		{
+			bool bFound = false;
+			for (int32 Offset = 1; Offset < SameWallCells.Num(); ++Offset)
+			{
+				int32 LeftIdx = MidIdx - Offset;
+				int32 RightIdx = MidIdx + Offset;
+				if (LeftIdx >= 0 && !HasPerpendicularWall(SameWallCells[LeftIdx]))
+				{
+					BestCell = SameWallCells[LeftIdx];
+					bFound = true;
+					break;
+				}
+				if (RightIdx < SameWallCells.Num() && !HasPerpendicularWall(SameWallCells[RightIdx]))
+				{
+					BestCell = SameWallCells[RightIdx];
+					bFound = true;
+					break;
+				}
+			}
+			if (!bFound)
+			{
+				UE_LOG(LogMonolithFloorPlan, Warning, TEXT("EnsureExteriorEntrance: all perimeter cells have perpendicular walls -- using midpoint anyway"));
+			}
+		}
 	}
 
 	// 7. Create exterior entrance door
