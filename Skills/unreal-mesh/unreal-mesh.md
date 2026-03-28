@@ -5,7 +5,7 @@ description: Use when working with Unreal Engine meshes, scene spatial queries, 
 
 # Unreal Mesh & Spatial Workflows
 
-You have access to **Monolith** with **73+ Mesh actions** (Phases 1-6 compiled, 7-10 in progress) via `mesh_query()`.
+You have access to **Monolith** with **101 Mesh actions** (Phases 1-10 compiled, 11-12 remaining) via `mesh_query()`.
 
 ## Discovery
 
@@ -238,10 +238,6 @@ get_region_performance → get_triangle_budget → analyze_shadow_cost → find_
 ### Environmental Storytelling
 ```
 place_storytelling_scene → place_along_path → scatter_props → analyze_prop_density
-```
-
-### Understand a Scene
-generate_accessibility_report (or individual validate_ actions)
 ```
 
 ### Understand a Scene
