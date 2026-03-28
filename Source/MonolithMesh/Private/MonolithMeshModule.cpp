@@ -19,6 +19,11 @@
 #include "MonolithMeshPresetActions.h"
 #include "MonolithMeshEncounterActions.h"
 #include "MonolithMeshQualityActions.h"
+#include "MonolithMeshFloorPlanGenerator.h"
+#include "MonolithMeshSpatialRegistry.h"
+#include "MonolithMeshAutoVolumeActions.h"
+#include "MonolithMeshFurnishingActions.h"
+#include "MonolithMeshDebugViewActions.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
@@ -28,6 +33,11 @@
 #include "MonolithMeshOperationActions.h"
 #include "MonolithMeshProceduralActions.h"
 #include "MonolithMeshBuildingActions.h"
+#include "MonolithMeshFacadeActions.h"
+#include "MonolithMeshRoofActions.h"
+#include "MonolithMeshCityBlockActions.h"
+#include "MonolithMeshTerrainActions.h"
+#include "MonolithMeshArchFeatureActions.h"
 #include "MonolithMeshHandlePool.h"
 #endif
 
@@ -61,6 +71,11 @@ void FMonolithMeshModule::StartupModule()
 	FMonolithMeshPresetActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshEncounterActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshQualityActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshFloorPlanGenerator::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshSpatialRegistry::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshAutoVolumeActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshFurnishingActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshDebugViewActions::RegisterActions(FMonolithToolRegistry::Get());
 
 #if WITH_GEOMETRYSCRIPT
 	HandlePool = NewObject<UMonolithMeshHandlePool>();
@@ -72,6 +87,16 @@ void FMonolithMeshModule::StartupModule()
 	FMonolithMeshProceduralActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshBuildingActions::SetHandlePool(HandlePool);
 	FMonolithMeshBuildingActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshFacadeActions::SetHandlePool(HandlePool);
+	FMonolithMeshFacadeActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshRoofActions::SetHandlePool(HandlePool);
+	FMonolithMeshRoofActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshCityBlockActions::SetHandlePool(HandlePool);
+	FMonolithMeshCityBlockActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshTerrainActions::SetHandlePool(HandlePool);
+	FMonolithMeshTerrainActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshArchFeatureActions::SetHandlePool(HandlePool);
+	FMonolithMeshArchFeatureActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshTechArtActions::SetHandlePool(HandlePool);
 
 	// Clean up handle pool on PreExit — before GC destroys UObjects.
@@ -85,6 +110,11 @@ void FMonolithMeshModule::StartupModule()
 			FMonolithMeshOperationActions::SetHandlePool(nullptr);
 			FMonolithMeshProceduralActions::SetHandlePool(nullptr);
 			FMonolithMeshBuildingActions::SetHandlePool(nullptr);
+			FMonolithMeshFacadeActions::SetHandlePool(nullptr);
+			FMonolithMeshRoofActions::SetHandlePool(nullptr);
+			FMonolithMeshCityBlockActions::SetHandlePool(nullptr);
+			FMonolithMeshTerrainActions::SetHandlePool(nullptr);
+			FMonolithMeshArchFeatureActions::SetHandlePool(nullptr);
 			FMonolithMeshTechArtActions::SetHandlePool(nullptr);
 			HandlePool = nullptr;
 		}
