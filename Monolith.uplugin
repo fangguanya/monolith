@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "0.10.0",
 	"FriendlyName": "Monolith",
-	"Description": "Unified Unreal Engine MCP server — 544 actions across 11 domains (Blueprint 86, Material 57, Animation 115, Niagara 96, Mesh 101, Editor 19, Config 6, Source 11, Project 7, UI 42, Core 4). AI-powered asset creation, inspection, and modification.",
+	"Description": "Unified Unreal Engine MCP server — 630 actions across 11 domains (Blueprint 86, Material 57, Animation 115, Niagara 96, Mesh 187, Editor 19, Config 6, Source 11, Project 7, UI 42, Core 4). AI-powered asset creation, inspection, and modification.",
 	"Category": "Editor",
 	"CreatedBy": "tumourlove",
 	"CreatedByURL": "https://github.com/tumourlove/monolith",

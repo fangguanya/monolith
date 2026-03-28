@@ -1,11 +1,11 @@
 ---
 name: unreal-mesh
-description: Use when working with Unreal Engine meshes, scene spatial queries, level blockout, actor manipulation, 3D awareness, horror spatial analysis, accessibility validation, GeometryScript mesh operations, lighting analysis, audio/acoustics, performance budgeting, or decal/detail placement via Monolith MCP. Triggers on mesh, StaticMesh, SkeletalMesh, blockout, spatial, raycast, overlap, scene, actor, spawn, LOD, collision, UV, triangle, bounds, scan volume, scatter, navmesh, sightline, hiding, horror, tension, accessibility, wheelchair, lighting, dark, audio, acoustic, surface, footstep, reverb, performance, budget, draw call, decal, blood trail.
+description: Use when working with Unreal Engine meshes, scene spatial queries, level blockout, actor manipulation, 3D awareness, horror spatial analysis, accessibility validation, GeometryScript mesh operations, lighting analysis, audio/acoustics, performance budgeting, decal/detail placement, level design (lights, volumes, sublevels, prefabs), tech art (import, LOD, texel density, collision), context-aware prop placement (surface scatter, disturbance, physics sleep), procedural geometry (furniture, structures, mazes, pipes, terrain), genre presets, encounter design, or hospice accessibility reports via Monolith MCP. Triggers on mesh, StaticMesh, SkeletalMesh, blockout, spatial, raycast, overlap, scene, actor, spawn, LOD, collision, UV, triangle, bounds, scan volume, scatter, navmesh, sightline, hiding, horror, tension, accessibility, wheelchair, lighting, dark, audio, acoustic, surface, footstep, reverb, performance, budget, draw call, decal, blood trail, light, volume, trigger, sublevel, prefab, spline, import, texel, instancing, HISM, material swap, parametric, structure, maze, pipe, terrain, fragment, preset, encounter, patrol, safe room, hospice report, prop kit, disturbance.
 ---
 
 # Unreal Mesh & Spatial Workflows
 
-You have access to **Monolith** with **101 Mesh actions** (Phases 1-10 compiled, 11-12 remaining) via `mesh_query()`.
+You have access to **Monolith** with **187 Mesh actions** (Phases 0-22 ALL COMPLETE) via `mesh_query()`.
 
 ## Discovery
 
@@ -177,6 +177,127 @@ monolith_discover({ namespace: "mesh" })
 | `place_along_path` | `path_points`, `pattern`? | Blood trails, footprints, drag marks (Catmull-Rom) |
 | `analyze_prop_density` | `volume_name`, `target_density`? | Grid-cell density vs target |
 | `place_storytelling_scene` | `location`, `pattern`, `intensity`? | 5 horror presets (violence/abandoned/dragged/medical/corruption) |
+
+### Level Design (9 actions) — Lights, materials, mesh swap, instancing
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `place_light` | `type`, `location`, `intensity`?, `color`? | Spawn point/spot/rect/directional lights |
+| `set_light_properties` | `actor_name`, properties... | Modify existing light |
+| `set_actor_material` | `actor_name`, `material`, `slot`? | Assign material to placed actor |
+| `swap_material_in_level` | `source_material`, `target_material` | Bulk replace material X with Y |
+| `find_replace_mesh` | `source_mesh`, `target_mesh` | Swap all instances of mesh X with Y |
+| `set_lod_screen_sizes` | `asset_path`, `screen_sizes` | Set LOD transition thresholds |
+| `find_instancing_candidates` | `min_count`? | Find repeated meshes for HISM conversion |
+| `convert_to_hism` | `mesh`, `actors` | Convert StaticMeshActors to HISM |
+| `get_actor_component_properties` | `actor_name`, `component_class`? | Read arbitrary UPROPERTYs |
+
+### Volumes & Properties (7 actions) — Trigger, kill, navmesh, selection
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `spawn_volume` | `type`, `location`, `extent` | Trigger/kill/pain/blocking/audio/post_process volumes |
+| `get_actor_properties` | `actor_name`, `properties`? | Read properties via reflection |
+| `copy_actor_properties` | `source_actor`, `target_actors` | Copy settings between actors |
+| `build_navmesh` | — | Trigger navmesh rebuild (one call) |
+| `select_actors` | `actor_names`, `mode`? | Control editor selection + camera focus |
+| `snap_to_surface` | `actor_names`, `direction`? | Trace + normal alignment |
+| `set_collision_preset` | `actor_name`, `preset` | Set collision profile |
+
+### Horror Intelligence (4 actions) — Player path prediction, encounter scoring
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `predict_player_paths` | `start`, `end`, `strategies`? | 4 strategies: shortest/safest/curious/cautious |
+| `evaluate_spawn_point` | `location`, `player_paths`? | Composite spawn quality score (S-F grade) |
+| `suggest_scare_positions` | `path_points` | Optimal scripted event positions along path |
+| `evaluate_encounter_pacing` | `encounters`, `path_points` | Spacing/intensity/rest period analysis |
+
+### Tech Art Pipeline (7 actions) — Import, LOD gen, texel density, collision
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `import_mesh` | `file_path`, `save_path` | FBX/glTF import with settings |
+| `fix_mesh_quality` | `asset_path`, `ops`? | GeometryScript repair (degenerate/weld/holes/normals) |
+| `auto_generate_lods` | `asset_path`, `lod_count`? | One-shot LOD chain generation |
+| `analyze_texel_density` | `asset_path` or `region` | UV area × texture res = texels/cm |
+| `analyze_material_cost_in_region` | `region` or `actors` | Shader complexity per placed mesh |
+| `set_mesh_collision` | `asset_path`, `type`?, `auto_convex`? | Write collision to mesh asset |
+| `analyze_lightmap_density` | `region` or `actors` | Lightmap resolution + UV density |
+
+### Advanced Level Design (8 actions) — Sublevels, prefabs, splines
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `manage_sublevel` | `action`, `sublevel`? | Create/add/remove/move_actors_to |
+| `place_blueprint_actor` | `blueprint`, `location`, `properties`? | Spawn BP with exposed property values |
+| `place_spline` | `points`, `mesh`? | Spawn spline actor with mesh segments |
+| `create_prefab` / `spawn_prefab` | `actors` / `prefab`, `location` | Level Instance creation + placement |
+| `randomize_transforms` | `actor_names`, ranges... | Batch random offset/rotation/scale |
+| `get_level_actors` | filters... | Filtered actor enumeration |
+| `measure_distance` | `from`, `to`, `mode`? | Euclidean/horizontal/navmesh distance |
+
+### Context-Aware Props (8 actions) — Surface scatter, disturbance, physics
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `scatter_on_surface` | `surface_actor`, `assets`, `count` | Props ON shelves/tables (not just floors) |
+| `set_room_disturbance` | `volume_name`, `level` | Orderly/slightly_messy/ransacked/abandoned |
+| `configure_physics_props` | `actor_names`, `sleep`? | SimulatePhysics + sleep state |
+| `settle_props` | `actor_names`, `seed`? | Trace-snap with random tilt |
+| `create_prop_kit` / `place_prop_kit` | kit JSON | Themed prop group authoring + placement |
+| `scatter_on_walls` | `volume_name`, `assets`, `count` | Horizontal trace wall placement |
+| `scatter_on_ceiling` | `volume_name`, `assets`, `count` | Upward trace ceiling placement |
+
+### Procedural Geometry (8 actions) — GeometryScript, requires handle pool
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `create_parametric_mesh` | `type`, `params` | 15 furniture types (chair→bathtub) |
+| `create_horror_prop` | `type`, `params`, `seed`? | 7 horror types (barricade→vent_grate) |
+| `create_structure` | `type`, `params` | Room/corridor/L/T-junction with openings |
+| `create_building_shell` | `floors`, `footprint` | Multi-story from 2D polygon |
+| `create_maze` | `algorithm`, `grid_size`, `seed`? | 3 algorithms + layout JSON |
+| `create_pipe_network` | `path_points`, `radius`? | Swept polygon with ball joints |
+| `create_fragments` | `source_handle`, `count`?, `seed`? | Plane-slice mesh fragmentation |
+| `create_terrain_patch` | `size`, `noise`? | Perlin noise heightmap mesh |
+
+### Genre Presets (8 actions) — Extensible preset system
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `list/create_storytelling_patterns` | `name`, `elements` | Author horror/fantasy/sci-fi storytelling |
+| `list/create_acoustic_profiles` | `name`, `surfaces` | Genre-specific surface acoustics |
+| `create_tension_profile` | `name`, `weights` | Genre-specific tension factor weights |
+| `list_genre_presets` | — | Browse available preset packs |
+| `export/import_genre_preset` | `path`, `merge_mode`? | Bundle/load full preset packs |
+
+### Encounter Design (8 actions) — Horror advanced + hospice
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `design_encounter` | `region`, `archetype`? | Capstone: spawn+patrol+exits+sightlines composed |
+| `suggest_patrol_route` | `path_points`, `archetype` | Stalker/patrol/ambusher navmesh routes |
+| `analyze_ai_territory` | `region` | Hiding/patrol/ambush heatmap |
+| `evaluate_safe_room` | `volume_name` | Defensibility + hospice amenity scoring |
+| `analyze_level_pacing_structure` | `path_points` | Macro tension→release mapping |
+| `generate_scare_sequence` | `path_points`, `style`? | 4 styles: slow_burn/escalating/relentless/single_peak |
+| `validate_horror_intensity` | `path_points` | Hospice intensity cap audit |
+| `generate_hospice_report` | `start`, `end`, `profile`? | 5-section accessibility audit, A-F grade |
+
+### Quality & Polish (9 actions)
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `validate_naming_conventions` | `path`? | Flag assets missing SM_/M_/T_ prefixes |
+| `batch_rename_assets` | `pattern`, `replacement` | Find/replace with reference fixup |
+| `generate_proxy_mesh` | `actors` | Merge meshes into simplified proxy |
+| `setup_hlod` | `layer_type`, `cell_size`? | Configure HLOD layers |
+| `analyze_texture_budget` | — | Streaming pool usage + top textures |
+| `analyze_framing` | `viewpoint` | Rule-of-thirds composition scoring |
+| `evaluate_monster_reveal` | `monster_location`, `player_location` | Silhouette/distance/backlight scoring |
+| `analyze_co_op_balance` | `player_positions` | Coverage blind spots (P3 placeholder) |
+| `integration_hooks_stub` | `hook_type` | AI Director/GAS/telemetry stubs |
 
 ## Blockout Tag Convention
 
