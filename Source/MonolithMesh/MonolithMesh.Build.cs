@@ -37,7 +37,8 @@ public class MonolithMesh : ModuleRules
 			"AssetTools",
 			"MeshReductionInterface",
 			"MeshMergeUtilities",
-			"LevelInstanceEditor"
+			"LevelInstanceEditor",
+			"ImageCore"
 		});
 
 		// Optional: GeometryScripting (Tier 5 mesh operations only)
