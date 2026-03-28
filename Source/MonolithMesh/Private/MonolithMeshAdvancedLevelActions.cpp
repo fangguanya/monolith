@@ -465,9 +465,15 @@ FMonolithActionResult FMonolithMeshAdvancedLevelActions::PlaceBlueprintActor(con
 	FString Folder;
 	Params->TryGetStringField(TEXT("folder"), Folder);
 
-	// Append _C suffix if not already present for BP class loading
+	// Normalize Blueprint path for class loading:
+	// "/Game/Foo/BP_Bar" → "/Game/Foo/BP_Bar.BP_Bar_C"
 	FString ClassPath = BlueprintPath;
-	if (!ClassPath.EndsWith(TEXT("_C")))
+	if (!ClassPath.Contains(TEXT(".")))
+	{
+		FString BaseName = FPaths::GetBaseFilename(ClassPath);
+		ClassPath = ClassPath + TEXT(".") + BaseName + TEXT("_C");
+	}
+	else if (!ClassPath.EndsWith(TEXT("_C")))
 	{
 		ClassPath += TEXT("_C");
 	}
@@ -845,6 +851,8 @@ FMonolithActionResult FMonolithMeshAdvancedLevelActions::CreatePrefab(const TSha
 	FNewLevelInstanceParams CreationParams;
 	CreationParams.Type = CreationType;
 	CreationParams.LevelPackageName = SavePath;
+	CreationParams.bAlwaysShowDialog = false;
+	CreationParams.bPromptForSave = false;
 
 	// Use pivot center of all actors
 	FVector PivotCenter = FVector::ZeroVector;
@@ -860,10 +868,15 @@ FMonolithActionResult FMonolithMeshAdvancedLevelActions::CreatePrefab(const TSha
 	if (!LevelInstance)
 	{
 		Transaction.Cancel();
-		return FMonolithActionResult::Error(TEXT("Failed to create Level Instance. Check that actors are valid and save_path is writable."));
+		return FMonolithActionResult::Error(TEXT("Failed to create Level Instance. The engine's CreateLevelInstanceFrom triggers a Save As dialog (bUseSaveAs=true) which blocks MCP calls. Use spawn_prefab with an existing prefab instead, or create Level Instances manually in the editor."));
 	}
 
-	AActor* LIActor = CastChecked<AActor>(LevelInstance);
+	AActor* LIActor = Cast<AActor>(LevelInstance);
+	if (!LIActor)
+	{
+		Transaction.Cancel();
+		return FMonolithActionResult::Error(TEXT("Level Instance created but could not be cast to AActor"));
+	}
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("actor_name"), LIActor->GetFName().ToString());

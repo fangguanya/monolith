@@ -316,6 +316,19 @@ TArray<FString> FMonolithMeshLevelDesignActions::ApplyLightProperties(ULightComp
 {
 	TArray<FString> PropsSet;
 
+	// Mobility MUST be applied first — SetAttenuationRadius, SetInnerConeAngle, etc.
+	// silently no-op on non-Movable lights via AreDynamicDataChangesAllowed()
+	FString MobilityStr;
+	if (Params->TryGetStringField(TEXT("mobility"), MobilityStr))
+	{
+		EComponentMobility::Type Mobility;
+		if (LevelDesignHelpers::ParseMobility(MobilityStr, Mobility))
+		{
+			LightComp->SetMobility(Mobility);
+			PropsSet.Add(TEXT("mobility"));
+		}
+	}
+
 	double Intensity;
 	if (Params->TryGetNumberField(TEXT("intensity"), Intensity))
 	{
@@ -340,7 +353,12 @@ TArray<FString> FMonolithMeshLevelDesignActions::ApplyLightProperties(ULightComp
 	{
 		if (ULocalLightComponent* LocalLight = Cast<ULocalLightComponent>(LightComp))
 		{
-			LocalLight->SetAttenuationRadius(static_cast<float>(AttenuationRadius));
+			// Direct UPROPERTY write — SetAttenuationRadius() silently no-ops on
+			// non-Movable lights via AreDynamicDataChangesAllowed(). We bypass
+			// that check since this is an editor tool, not runtime code.
+			LocalLight->Modify();
+			LocalLight->AttenuationRadius = static_cast<float>(AttenuationRadius);
+			LocalLight->MarkRenderStateDirty();
 		}
 		PropsSet.Add(TEXT("attenuation_radius"));
 	}
@@ -414,18 +432,6 @@ TArray<FString> FMonolithMeshLevelDesignActions::ApplyLightProperties(ULightComp
 		{
 			SLC->SetOuterConeAngle(static_cast<float>(OuterConeAngle));
 			PropsSet.Add(TEXT("outer_cone_angle"));
-		}
-	}
-
-	// Mobility
-	FString MobilityStr;
-	if (Params->TryGetStringField(TEXT("mobility"), MobilityStr))
-	{
-		EComponentMobility::Type Mobility;
-		if (LevelDesignHelpers::ParseMobility(MobilityStr, Mobility))
-		{
-			LightComp->SetMobility(Mobility);
-			PropsSet.Add(TEXT("mobility"));
 		}
 	}
 
@@ -1089,7 +1095,7 @@ FMonolithActionResult FMonolithMeshLevelDesignActions::FindInstancingCandidates(
 	}
 
 	// Optional region filter
-	FVector RegionMin, RegionMax;
+	FVector RegionMin(ForceInit), RegionMax(ForceInit);
 	bool bHasRegion = MonolithMeshUtils::ParseVector(Params, TEXT("region_min"), RegionMin)
 	                && MonolithMeshUtils::ParseVector(Params, TEXT("region_max"), RegionMax);
 

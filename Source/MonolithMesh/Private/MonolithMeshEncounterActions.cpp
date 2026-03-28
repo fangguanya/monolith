@@ -662,10 +662,12 @@ FMonolithActionResult FMonolithMeshEncounterActions::DesignEncounter(const TShar
 		{
 			PatrolWaypoints.Add(Sp.Location);
 		}
-		// Add a return to first for loop
+		// Add a return to first for loop — copy first to avoid
+		// self-referencing Add() crash (TArray may realloc)
 		if (PatrolWaypoints.Num() > 1)
 		{
-			PatrolWaypoints.Add(PatrolWaypoints[0]);
+			FVector FirstWP = PatrolWaypoints[0];
+			PatrolWaypoints.Add(FirstWP);
 		}
 
 		for (const FVector& WP : PatrolWaypoints)

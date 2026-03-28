@@ -2495,6 +2495,12 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateFragments(const TSha
 	Result->SetStringField(TEXT("source_handle"), SourceHandle);
 	Result->SetNumberField(TEXT("fragment_count"), HandleNames.Num());
 	Result->SetNumberField(TEXT("requested_fragments"), FragCount);
+	if (HandleNames.Num() != FragCount)
+	{
+		Result->SetStringField(TEXT("note"), FString::Printf(
+			TEXT("Requested %d fragments but got %d — planar slicing produces variable counts depending on geometry. Each slice can create 0-2 new pieces."),
+			FragCount, HandleNames.Num()));
+	}
 	Result->SetNumberField(TEXT("slices_applied"), NumSlices);
 	Result->SetNumberField(TEXT("seed"), Seed);
 	Result->SetArrayField(TEXT("fragment_handles"), HandleNames);
