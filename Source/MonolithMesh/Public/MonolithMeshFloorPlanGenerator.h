@@ -19,6 +19,12 @@
  *   - Wet wall clustering (plumbing chase scoring)
  *   - Circulation patterns: double_loaded, hub_spoke, racetrack, enfilade
  *
+ * WP-6 additions:
+ *   - Horror modifier post-processing (door locking, dead-end control, loop breaking, wrong-room injection)
+ *   - Space Syntax scoring (integration, connectivity, depth)
+ *   - Tension curve metadata per room
+ *   - Hospice safety caps on horror features
+ *
  * 3 actions:
  *   - generate_floor_plan: Full pipeline from archetype to grid/rooms/doors
  *   - list_building_archetypes: List available archetype JSON files
@@ -30,6 +36,9 @@ class FMonolithMeshFloorPlanGenerator
 {
 public:
 	static void RegisterActions(FMonolithToolRegistry& Registry);
+
+	/** Get the roof type for an archetype (public accessor for orchestrator) */
+	static FString GetArchetypeRoofType(const FString& ArchetypeName);
 
 private:
 	// ---- Action handlers ----
@@ -119,7 +128,8 @@ private:
 		FString FloorMaterial;   // "Floor" conflicts with floor index
 	};
 
-	/** A complete loaded archetype */
+public:
+	/** A complete loaded archetype (public for CityBlock orchestrator) */
 	struct FBuildingArchetype
 	{
 		FString Name;
@@ -165,9 +175,10 @@ private:
 	/** Get the archetype directory path */
 	static FString GetArchetypeDirectory();
 
-	/** Load an archetype from a JSON file */
+	/** Load an archetype from a JSON file (public for CityBlock orchestrator) */
 	static bool LoadArchetype(const FString& ArchetypeName, FBuildingArchetype& OutArchetype, FString& OutError);
 
+private:
 	/** Parse a JSON object into an archetype struct */
 	static bool ParseArchetypeJson(const TSharedPtr<FJsonObject>& Json, FBuildingArchetype& OutArchetype, FString& OutError);
 
@@ -310,4 +321,111 @@ private:
 		const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
 		const FString& ArchetypeName, float FootprintWidth, float FootprintHeight,
 		bool bHospiceMode, float CellSize);
+
+	// ============================================================================
+	// WP-6: Horror Subversion + Space Syntax
+	// ============================================================================
+
+	// ---- Horror modifier types ----
+
+	/** Per-room Space Syntax metrics and tension data */
+	struct FRoomSpaceSyntax
+	{
+		float Integration = 0.0f;     // 1 / mean_shortest_path (higher = more connected)
+		int32 Connectivity = 0;       // Direct neighbor count (door count)
+		int32 Depth = 0;              // BFS depth from entry room
+		bool bDeadEnd = false;        // Only 1 traversable exit
+		float Tension = 0.0f;         // Composite tension value 0-1
+	};
+
+	/** Aggregate Space Syntax scores for the whole floor plan */
+	struct FSpaceSyntaxScores
+	{
+		float MeanIntegration = 0.0f;
+		float MaxIntegration = 0.0f;
+		float MinIntegration = 0.0f;
+		int32 MaxDepth = 0;
+		float MeanDepth = 0.0f;
+		float DeadEndRatio = 0.0f;
+		int32 HubCount = 0;          // Rooms with connectivity >= 3
+		float HorrorScore = 0.0f;    // Composite horror fitness 0-1
+		float LockedDoorRatio = 0.0f;
+		int32 LockedDoorCount = 0;
+	};
+
+	// ---- Room adjacency graph helpers ----
+
+	/** Build adjacency list from doors: RoomIndex -> set of connected RoomIndices.
+	 *  If LockedDoors is provided, doors at those indices are excluded from the graph. */
+	static TArray<TSet<int32>> BuildRoomAdjacencyFromDoors(
+		const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+		const TSet<int32>* LockedDoors = nullptr);
+
+	/** Map room ID string to room index */
+	static int32 FindRoomIndexById(const TArray<FRoomDef>& Rooms, const FString& RoomId);
+
+	/** BFS shortest path length between two rooms in adjacency graph. Returns -1 if unreachable. */
+	static int32 BFSShortestPath(const TArray<TSet<int32>>& Adj, int32 From, int32 To);
+
+	/** Check if the room graph is fully connected (all rooms reachable from room 0) */
+	static bool IsGraphConnected(const TArray<TSet<int32>>& Adj, int32 NumRooms);
+
+	/** Find bridge edges using Tarjan's algorithm.
+	 *  Returns set of door indices where removing that door would disconnect the graph. */
+	static TSet<int32> FindBridgeDoors(
+		const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+		const TSet<int32>& AlreadyLocked);
+
+	// ---- Horror modifiers ----
+
+	/** Apply horror door locking. Returns set of locked door indices.
+	 *  Never locks bridge doors (Tarjan check). Prefers locking private room doors. */
+	static TSet<int32> ApplyDoorLocking(
+		const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+		float LockRatio, FRandomStream& Rng);
+
+	/** Adjust dead-end ratio by locking additional non-bridge doors.
+	 *  Returns updated set of locked door indices. */
+	static TSet<int32> AdjustDeadEndRatio(
+		const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+		TSet<int32> LockedDoors, float TargetRatio, FRandomStream& Rng);
+
+	/** Break loops by locking one non-bridge door per cycle to force longer traversal.
+	 *  Returns updated set of locked door indices. */
+	static TSet<int32> ApplyLoopBreaking(
+		const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+		TSet<int32> LockedDoors, FRandomStream& Rng);
+
+	/** Inject wrong-room types: change 1-2 room types to unexpected types.
+	 *  Modifies Rooms in place. Returns count of rooms changed. */
+	static int32 ApplyWrongRoomInjection(
+		TArray<FRoomDef>& Rooms, FRandomStream& Rng);
+
+	/** Top-level horror post-processing pass. Applies all horror modifiers based on horror_level.
+	 *  Returns the set of locked door indices and fills SpaceSyntax per-room data. */
+	static TSet<int32> ApplyHorrorModifiers(
+		TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+		float HorrorLevel, bool bHospiceMode, FRandomStream& Rng,
+		TArray<FRoomSpaceSyntax>& OutPerRoom, FSpaceSyntaxScores& OutScores);
+
+	// ---- Space Syntax computation ----
+
+	/** Compute Space Syntax metrics for all rooms.
+	 *  LockedDoors: doors excluded from traversal graph. */
+	static void ComputeSpaceSyntax(
+		const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+		const TSet<int32>& LockedDoors,
+		TArray<FRoomSpaceSyntax>& OutPerRoom, FSpaceSyntaxScores& OutScores);
+
+	/** Compute tension value for a single room based on its Space Syntax metrics */
+	static float ComputeRoomTension(const FRoomSpaceSyntax& RoomSS, float MeanDepth, int32 Depth);
+
+	/** Emit Space Syntax and horror data into the output JSON */
+	static void EmitHorrorAndSpaceSyntaxJson(
+		TSharedPtr<FJsonObject>& ResultJson,
+		const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+		const TSet<int32>& LockedDoors,
+		const TArray<FRoomSpaceSyntax>& PerRoom,
+		const FSpaceSyntaxScores& Scores,
+		float HorrorLevel, int32 WrongRoomCount);
 };

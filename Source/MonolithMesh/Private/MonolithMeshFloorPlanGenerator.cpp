@@ -24,9 +24,13 @@ void FMonolithMeshFloorPlanGenerator::RegisterActions(FMonolithToolRegistry& Reg
 		TEXT("Generate a complete floor plan from a building archetype. Returns grid, rooms, and doors "
 			"in the exact format consumed by create_building_from_grid. "
 			"Algorithm: archetype loading -> room resolution -> squarified treemap layout -> "
-			"adjacency validation -> privacy gradient -> corridor insertion -> door placement. "
+			"adjacency validation -> privacy gradient -> corridor insertion -> door placement -> "
+			"horror post-processing -> Space Syntax scoring. "
 			"WP-2: Supports adjacency_matrix (MUST/MUST_NOT), privacy gradient, wet wall clustering, "
-			"and circulation patterns (double_loaded, hub_spoke, racetrack, enfilade)."),
+			"and circulation patterns (double_loaded, hub_spoke, racetrack, enfilade). "
+			"WP-6: Horror subversion (door locking, dead-end control, loop breaking, wrong-room injection), "
+			"Space Syntax metrics (integration, connectivity, depth), tension curve metadata per room, "
+			"and hospice safety caps."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshFloorPlanGenerator::GenerateFloorPlan),
 		FParamSchemaBuilder()
 			.Required(TEXT("archetype"), TEXT("string"), TEXT("Archetype name (e.g. 'residential_house') or full path to archetype JSON file"))
@@ -37,6 +41,7 @@ void FMonolithMeshFloorPlanGenerator::RegisterActions(FMonolithToolRegistry& Reg
 			.Optional(TEXT("hospice_mode"), TEXT("boolean"), TEXT("Enforce wheelchair accessibility: min 100cm doors, 180cm corridors, rest alcoves"), TEXT("false"))
 			.Optional(TEXT("min_room_aspect"), TEXT("number"), TEXT("Minimum acceptable room aspect ratio (width/height). Rooms worse than this get rebalanced"), TEXT("3.0"))
 			.Optional(TEXT("floor_index"), TEXT("number"), TEXT("Floor index for per-floor room filtering: 0=ground, 1+=upper, -1=all floors (default)"), TEXT("-1"))
+			.Optional(TEXT("horror_level"), TEXT("number"), TEXT("Horror intensity 0.0-1.0. Controls door locking, dead-end ratio, loop breaking, wrong-room injection. 0=normal, 1=maximum horror. Hospice mode caps at 0.3."), TEXT("0.0"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("mesh"), TEXT("list_building_archetypes"),
@@ -944,6 +949,17 @@ void FMonolithMeshFloorPlanGenerator::InsertCorridorsEnfilade(
 // ============================================================================
 // File I/O
 // ============================================================================
+
+FString FMonolithMeshFloorPlanGenerator::GetArchetypeRoofType(const FString& ArchetypeName)
+{
+	FBuildingArchetype Arch;
+	FString Err;
+	if (LoadArchetype(ArchetypeName, Arch, Err))
+	{
+		return Arch.RoofType;
+	}
+	return TEXT("gable");
+}
 
 FString FMonolithMeshFloorPlanGenerator::GetArchetypeDirectory()
 {
@@ -2621,6 +2637,18 @@ FMonolithActionResult FMonolithMeshFloorPlanGenerator::GenerateFloorPlan(const T
 	double MinAspectDbl = 3.0;
 	Params->TryGetNumberField(TEXT("min_room_aspect"), MinAspectDbl);
 
+	// ---- WP-6: Parse horror_level ----
+	double HorrorLevelDbl = 0.0;
+	Params->TryGetNumberField(TEXT("horror_level"), HorrorLevelDbl);
+	float HorrorLevel = FMath::Clamp(static_cast<float>(HorrorLevelDbl), 0.0f, 1.0f);
+
+	// Hospice safety: cap horror_level
+	if (bHospiceMode && HorrorLevel > 0.3f)
+	{
+		UE_LOG(LogMonolithFloorPlan, Log, TEXT("Hospice mode: capping horror_level from %.2f to 0.3"), HorrorLevel);
+		HorrorLevel = 0.3f;
+	}
+
 	FRandomStream Rng(Seed);
 
 	// ---- Parse optional floor_index for per-floor generation ----
@@ -2721,6 +2749,29 @@ FMonolithActionResult FMonolithMeshFloorPlanGenerator::GenerateFloorPlan(const T
 	// ---- Validate door clearances ----
 	ValidateDoorClearances(Grid, GridW, GridH, Rooms, Doors, CellSize);
 
+	// ---- WP-6: Horror post-processing + Space Syntax ----
+	TArray<FRoomSpaceSyntax> PerRoomSS;
+	FSpaceSyntaxScores SSScores;
+	TSet<int32> LockedDoors;
+	int32 WrongRoomCount = 0;
+
+	// Always compute Space Syntax (even at horror_level 0 -- scores are informational)
+	if (HorrorLevel > 0.0f)
+	{
+		LockedDoors = ApplyHorrorModifiers(Rooms, Doors, HorrorLevel, bHospiceMode, Rng, PerRoomSS, SSScores);
+		// Wrong room injection only at high horror
+		if (HorrorLevel > 0.7f && !bHospiceMode)
+		{
+			WrongRoomCount = ApplyWrongRoomInjection(Rooms, Rng);
+		}
+	}
+	else
+	{
+		// No horror, but still compute Space Syntax for informational output
+		TSet<int32> NoLocked;
+		ComputeSpaceSyntax(Rooms, Doors, NoLocked, PerRoomSS, SSScores);
+	}
+
 	// ---- WP-2: Wet wall clustering stats ----
 	TSet<FIntPoint> PlumbingCells = BuildPlumbingChaseSet(Grid, GridW, GridH, Rooms);
 	int32 WetRoomCount = 0;
@@ -2820,8 +2871,12 @@ FMonolithActionResult FMonolithMeshFloorPlanGenerator::GenerateFloorPlan(const T
 		ResultJson->SetObjectField(TEXT("material_hints"), MatHints);
 	}
 
-	UE_LOG(LogMonolithFloorPlan, Log, TEXT("Floor plan generated: %d rooms, %d doors, seed=%d, floor=%d, adj_violations=%d, privacy_violations=%d, wet_clustered=%d/%d"),
-		Rooms.Num(), Doors.Num(), Seed, FloorIndex, AdjacencyViolations, PrivacyViolationCount, ClusteredWetRooms, WetRoomCount);
+	// ---- WP-6: Emit horror + Space Syntax data ----
+	EmitHorrorAndSpaceSyntaxJson(ResultJson, Rooms, Doors, LockedDoors, PerRoomSS, SSScores, HorrorLevel, WrongRoomCount);
+
+	UE_LOG(LogMonolithFloorPlan, Log, TEXT("Floor plan generated: %d rooms, %d doors, seed=%d, floor=%d, adj_violations=%d, privacy_violations=%d, wet_clustered=%d/%d, horror=%.2f, locked=%d, horror_score=%.3f"),
+		Rooms.Num(), Doors.Num(), Seed, FloorIndex, AdjacencyViolations, PrivacyViolationCount, ClusteredWetRooms, WetRoomCount,
+		HorrorLevel, LockedDoors.Num(), SSScores.HorrorScore);
 
 	return FMonolithActionResult::Success(ResultJson);
 }
@@ -2910,4 +2965,855 @@ FMonolithActionResult FMonolithMeshFloorPlanGenerator::GetBuildingArchetype(cons
 	Result->SetStringField(TEXT("file"), FilePath);
 
 	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// WP-6: Room Adjacency Graph Helpers
+// ============================================================================
+
+int32 FMonolithMeshFloorPlanGenerator::FindRoomIndexById(const TArray<FRoomDef>& Rooms, const FString& RoomId)
+{
+	for (int32 i = 0; i < Rooms.Num(); ++i)
+	{
+		if (Rooms[i].RoomId == RoomId)
+			return i;
+	}
+	return INDEX_NONE;
+}
+
+TArray<TSet<int32>> FMonolithMeshFloorPlanGenerator::BuildRoomAdjacencyFromDoors(
+	const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+	const TSet<int32>* LockedDoors)
+{
+	TArray<TSet<int32>> Adj;
+	Adj.SetNum(Rooms.Num());
+
+	for (int32 DoorIdx = 0; DoorIdx < Doors.Num(); ++DoorIdx)
+	{
+		// Skip locked doors if specified
+		if (LockedDoors && LockedDoors->Contains(DoorIdx))
+			continue;
+
+		const FDoorDef& D = Doors[DoorIdx];
+
+		// Skip exterior doors
+		if (D.RoomA == TEXT("exterior") || D.RoomB == TEXT("exterior"))
+			continue;
+
+		int32 IdxA = FindRoomIndexById(Rooms, D.RoomA);
+		int32 IdxB = FindRoomIndexById(Rooms, D.RoomB);
+
+		// Handle "corridor" as a room ID -- find the corridor room
+		if (IdxA == INDEX_NONE && D.RoomA == TEXT("corridor"))
+		{
+			for (int32 i = 0; i < Rooms.Num(); ++i)
+			{
+				if (Rooms[i].RoomType == TEXT("corridor"))
+				{
+					// Check if this corridor shares the door edge
+					IdxA = i;
+					break;
+				}
+			}
+		}
+		if (IdxB == INDEX_NONE && D.RoomB == TEXT("corridor"))
+		{
+			for (int32 i = 0; i < Rooms.Num(); ++i)
+			{
+				if (Rooms[i].RoomType == TEXT("corridor"))
+				{
+					IdxB = i;
+					break;
+				}
+			}
+		}
+
+		if (IdxA != INDEX_NONE && IdxB != INDEX_NONE && IdxA != IdxB)
+		{
+			Adj[IdxA].Add(IdxB);
+			Adj[IdxB].Add(IdxA);
+		}
+	}
+
+	return Adj;
+}
+
+int32 FMonolithMeshFloorPlanGenerator::BFSShortestPath(const TArray<TSet<int32>>& Adj, int32 From, int32 To)
+{
+	if (From == To) return 0;
+	if (From < 0 || To < 0 || From >= Adj.Num() || To >= Adj.Num()) return -1;
+
+	TArray<int32> Dist;
+	Dist.SetNumZeroed(Adj.Num());
+	for (int32& D : Dist) D = -1;
+
+	TQueue<int32> Queue;
+	Queue.Enqueue(From);
+	Dist[From] = 0;
+
+	while (!Queue.IsEmpty())
+	{
+		int32 Curr;
+		Queue.Dequeue(Curr);
+
+		for (int32 Neighbor : Adj[Curr])
+		{
+			if (Dist[Neighbor] == -1)
+			{
+				Dist[Neighbor] = Dist[Curr] + 1;
+				if (Neighbor == To) return Dist[Neighbor];
+				Queue.Enqueue(Neighbor);
+			}
+		}
+	}
+
+	return -1; // Unreachable
+}
+
+bool FMonolithMeshFloorPlanGenerator::IsGraphConnected(const TArray<TSet<int32>>& Adj, int32 NumRooms)
+{
+	if (NumRooms <= 1) return true;
+
+	TSet<int32> Visited;
+	TQueue<int32> Queue;
+
+	// Start BFS from room 0
+	Queue.Enqueue(0);
+	Visited.Add(0);
+
+	while (!Queue.IsEmpty())
+	{
+		int32 Curr;
+		Queue.Dequeue(Curr);
+
+		for (int32 Neighbor : Adj[Curr])
+		{
+			if (!Visited.Contains(Neighbor))
+			{
+				Visited.Add(Neighbor);
+				Queue.Enqueue(Neighbor);
+			}
+		}
+	}
+
+	return Visited.Num() == NumRooms;
+}
+
+// ============================================================================
+// WP-6: Tarjan's Bridge-Finding Algorithm
+// ============================================================================
+
+TSet<int32> FMonolithMeshFloorPlanGenerator::FindBridgeDoors(
+	const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+	const TSet<int32>& AlreadyLocked)
+{
+	TSet<int32> BridgeDoors;
+
+	// Build the unlocked adjacency graph
+	TArray<TSet<int32>> Adj = BuildRoomAdjacencyFromDoors(Rooms, Doors, &AlreadyLocked);
+	const int32 N = Rooms.Num();
+
+	// Tarjan's bridge algorithm using DFS
+	TArray<int32> Disc, Low, Parent;
+	Disc.SetNumZeroed(N);
+	Low.SetNumZeroed(N);
+	Parent.SetNumZeroed(N);
+	for (int32 i = 0; i < N; ++i)
+	{
+		Disc[i] = -1;
+		Low[i] = -1;
+		Parent[i] = -1;
+	}
+
+	// Bridge edges as (RoomA, RoomB) pairs
+	TSet<uint64> BridgeEdges;
+
+	int32 Timer = 0;
+
+	// Iterative DFS to avoid stack overflow on large graphs
+	struct FStackFrame
+	{
+		int32 Node;
+		int32 NeighborIdx;
+	};
+
+	for (int32 Start = 0; Start < N; ++Start)
+	{
+		if (Disc[Start] != -1) continue;
+
+		TArray<FStackFrame> Stack;
+		Stack.Push({Start, 0});
+		Disc[Start] = Low[Start] = Timer++;
+
+		while (Stack.Num() > 0)
+		{
+			FStackFrame& Frame = Stack.Last();
+			int32 U = Frame.Node;
+
+			TArray<int32> Neighbors = Adj[U].Array();
+
+			if (Frame.NeighborIdx < Neighbors.Num())
+			{
+				int32 V = Neighbors[Frame.NeighborIdx];
+				Frame.NeighborIdx++;
+
+				if (Disc[V] == -1)
+				{
+					Parent[V] = U;
+					Disc[V] = Low[V] = Timer++;
+					Stack.Push({V, 0});
+				}
+				else if (V != Parent[U])
+				{
+					Low[U] = FMath::Min(Low[U], Disc[V]);
+				}
+			}
+			else
+			{
+				// All neighbors processed, pop
+				Stack.Pop();
+				if (Stack.Num() > 0)
+				{
+					int32 ParentNode = Stack.Last().Node;
+					Low[ParentNode] = FMath::Min(Low[ParentNode], Low[U]);
+
+					// If Low[U] > Disc[ParentNode], edge (ParentNode, U) is a bridge
+					if (Low[U] > Disc[ParentNode])
+					{
+						uint64 Key = (uint64)FMath::Min(ParentNode, U) << 32 | (uint64)FMath::Max(ParentNode, U);
+						BridgeEdges.Add(Key);
+					}
+				}
+			}
+		}
+	}
+
+	// Map bridge edges back to door indices
+	for (int32 DoorIdx = 0; DoorIdx < Doors.Num(); ++DoorIdx)
+	{
+		if (AlreadyLocked.Contains(DoorIdx)) continue;
+
+		const FDoorDef& D = Doors[DoorIdx];
+		if (D.RoomA == TEXT("exterior") || D.RoomB == TEXT("exterior")) continue;
+
+		int32 IdxA = FindRoomIndexById(Rooms, D.RoomA);
+		int32 IdxB = FindRoomIndexById(Rooms, D.RoomB);
+
+		// Handle "corridor" lookup
+		if (IdxA == INDEX_NONE && D.RoomA == TEXT("corridor"))
+		{
+			for (int32 i = 0; i < Rooms.Num(); ++i)
+			{
+				if (Rooms[i].RoomType == TEXT("corridor")) { IdxA = i; break; }
+			}
+		}
+		if (IdxB == INDEX_NONE && D.RoomB == TEXT("corridor"))
+		{
+			for (int32 i = 0; i < Rooms.Num(); ++i)
+			{
+				if (Rooms[i].RoomType == TEXT("corridor")) { IdxB = i; break; }
+			}
+		}
+
+		if (IdxA == INDEX_NONE || IdxB == INDEX_NONE) continue;
+
+		uint64 Key = (uint64)FMath::Min(IdxA, IdxB) << 32 | (uint64)FMath::Max(IdxA, IdxB);
+		if (BridgeEdges.Contains(Key))
+		{
+			BridgeDoors.Add(DoorIdx);
+		}
+	}
+
+	return BridgeDoors;
+}
+
+// ============================================================================
+// WP-6: Horror Door Locking
+// ============================================================================
+
+TSet<int32> FMonolithMeshFloorPlanGenerator::ApplyDoorLocking(
+	const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+	float LockRatio, FRandomStream& Rng)
+{
+	TSet<int32> LockedDoors;
+
+	if (LockRatio <= 0.0f || Doors.Num() == 0)
+		return LockedDoors;
+
+	// Count lockable doors (interior only)
+	TArray<int32> LockableDoorIndices;
+	for (int32 i = 0; i < Doors.Num(); ++i)
+	{
+		if (Doors[i].RoomA != TEXT("exterior") && Doors[i].RoomB != TEXT("exterior"))
+			LockableDoorIndices.Add(i);
+	}
+
+	if (LockableDoorIndices.Num() == 0)
+		return LockedDoors;
+
+	int32 TargetLocked = FMath::RoundToInt32(LockableDoorIndices.Num() * LockRatio);
+	TargetLocked = FMath::Clamp(TargetLocked, 0, LockableDoorIndices.Num() - 1); // Always leave at least 1 unlocked
+
+	// Helper: get room type from room ID (looks up in Rooms array, falls back to ID itself)
+	auto GetRoomType = [&](const FString& RoomId) -> FString
+	{
+		int32 Idx = FindRoomIndexById(Rooms, RoomId);
+		if (Idx != INDEX_NONE)
+			return Rooms[Idx].RoomType;
+		// Fallback: "corridor" is used as literal in some door defs
+		return RoomId;
+	};
+
+	// Sort: prefer locking doors to private rooms first, with random tiebreaker
+	TArray<TPair<float, int32>> Scored;
+	for (int32 Idx : LockableDoorIndices)
+	{
+		const FDoorDef& D = Doors[Idx];
+		int32 PA = static_cast<int32>(GetPrivacyZone(GetRoomType(D.RoomA)));
+		int32 PB = static_cast<int32>(GetPrivacyZone(GetRoomType(D.RoomB)));
+		int32 MaxPrivacy = FMath::Max(PA, PB);
+		float Score = static_cast<float>(MaxPrivacy) + Rng.FRand() * 0.5f;
+		Scored.Add({Score, Idx});
+	}
+	Scored.Sort([](const TPair<float, int32>& A, const TPair<float, int32>& B)
+	{
+		return A.Key > B.Key;
+	});
+
+	// Lock doors, checking bridges after each lock
+	for (const auto& Pair : Scored)
+	{
+		if (LockedDoors.Num() >= TargetLocked)
+			break;
+
+		int32 DoorIdx = Pair.Value;
+
+		// Check if this door is a bridge (would disconnect graph)
+		TSet<int32> BridgeDoors = FindBridgeDoors(Rooms, Doors, LockedDoors);
+		if (BridgeDoors.Contains(DoorIdx))
+			continue; // Skip -- locking this would disconnect rooms
+
+		LockedDoors.Add(DoorIdx);
+	}
+
+	UE_LOG(LogMonolithFloorPlan, Log, TEXT("Horror: locked %d/%d doors (target ratio %.0f%%)"),
+		LockedDoors.Num(), LockableDoorIndices.Num(), LockRatio * 100.0f);
+
+	return LockedDoors;
+}
+
+// ============================================================================
+// WP-6: Dead-End Ratio Adjustment
+// ============================================================================
+
+TSet<int32> FMonolithMeshFloorPlanGenerator::AdjustDeadEndRatio(
+	const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+	TSet<int32> LockedDoors, float TargetRatio, FRandomStream& Rng)
+{
+	if (Rooms.Num() <= 2)
+		return LockedDoors;
+
+	auto CountDeadEnds = [&]() -> float
+	{
+		TArray<TSet<int32>> Adj = BuildRoomAdjacencyFromDoors(Rooms, Doors, &LockedDoors);
+		int32 DeadEnds = 0;
+		for (int32 i = 0; i < Rooms.Num(); ++i)
+		{
+			if (Adj[i].Num() == 1)
+				++DeadEnds;
+		}
+		return static_cast<float>(DeadEnds) / Rooms.Num();
+	};
+
+	float CurrentRatio = CountDeadEnds();
+	int32 MaxIterations = Doors.Num(); // Safety cap
+
+	while (CurrentRatio < TargetRatio && MaxIterations-- > 0)
+	{
+		// Find a room with 2+ connections and lock one of its non-bridge doors
+		TArray<TSet<int32>> Adj = BuildRoomAdjacencyFromDoors(Rooms, Doors, &LockedDoors);
+
+		// Find candidate doors to lock (connect rooms with 2+ neighbors)
+		TArray<int32> Candidates;
+		for (int32 DoorIdx = 0; DoorIdx < Doors.Num(); ++DoorIdx)
+		{
+			if (LockedDoors.Contains(DoorIdx)) continue;
+
+			const FDoorDef& D = Doors[DoorIdx];
+			if (D.RoomA == TEXT("exterior") || D.RoomB == TEXT("exterior")) continue;
+
+			int32 IdxA = FindRoomIndexById(Rooms, D.RoomA);
+			int32 IdxB = FindRoomIndexById(Rooms, D.RoomB);
+
+			if (IdxA == INDEX_NONE && D.RoomA == TEXT("corridor"))
+			{
+				for (int32 i = 0; i < Rooms.Num(); ++i)
+					if (Rooms[i].RoomType == TEXT("corridor")) { IdxA = i; break; }
+			}
+			if (IdxB == INDEX_NONE && D.RoomB == TEXT("corridor"))
+			{
+				for (int32 i = 0; i < Rooms.Num(); ++i)
+					if (Rooms[i].RoomType == TEXT("corridor")) { IdxB = i; break; }
+			}
+
+			if (IdxA == INDEX_NONE || IdxB == INDEX_NONE) continue;
+
+			// Both sides must have 2+ connections (so locking creates a dead end, not disconnection)
+			if (Adj[IdxA].Num() >= 2 && Adj[IdxB].Num() >= 2)
+				Candidates.Add(DoorIdx);
+		}
+
+		if (Candidates.Num() == 0)
+			break;
+
+		// Pick a random candidate
+		int32 PickIdx = Rng.RandHelper(Candidates.Num());
+		int32 DoorIdx = Candidates[PickIdx];
+
+		// Bridge check
+		TSet<int32> Bridges = FindBridgeDoors(Rooms, Doors, LockedDoors);
+		if (Bridges.Contains(DoorIdx))
+		{
+			// Remove this candidate and try again
+			Candidates.RemoveAt(PickIdx);
+			continue;
+		}
+
+		LockedDoors.Add(DoorIdx);
+		CurrentRatio = CountDeadEnds();
+	}
+
+	UE_LOG(LogMonolithFloorPlan, Log, TEXT("Horror: dead-end ratio adjusted to %.1f%% (target %.1f%%)"),
+		CurrentRatio * 100.0f, TargetRatio * 100.0f);
+
+	return LockedDoors;
+}
+
+// ============================================================================
+// WP-6: Loop Breaking
+// ============================================================================
+
+TSet<int32> FMonolithMeshFloorPlanGenerator::ApplyLoopBreaking(
+	const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+	TSet<int32> LockedDoors, FRandomStream& Rng)
+{
+	// Find loops: any edge that is NOT a bridge is part of a cycle.
+	// Lock one such non-bridge door per cycle to force longer traversal.
+	TSet<int32> Bridges = FindBridgeDoors(Rooms, Doors, LockedDoors);
+
+	// Collect non-bridge, unlocked, interior doors
+	TArray<int32> LoopDoors;
+	for (int32 DoorIdx = 0; DoorIdx < Doors.Num(); ++DoorIdx)
+	{
+		if (LockedDoors.Contains(DoorIdx)) continue;
+		if (Bridges.Contains(DoorIdx)) continue;
+		if (Doors[DoorIdx].RoomA == TEXT("exterior") || Doors[DoorIdx].RoomB == TEXT("exterior")) continue;
+		LoopDoors.Add(DoorIdx);
+	}
+
+	// Lock loop doors one at a time, re-checking bridges each time
+	for (int32 i = 0; i < LoopDoors.Num(); ++i)
+	{
+		int32 DoorIdx = LoopDoors[i];
+		if (LockedDoors.Contains(DoorIdx)) continue;
+
+		// Verify still not a bridge after previous locks
+		TSet<int32> CurrentBridges = FindBridgeDoors(Rooms, Doors, LockedDoors);
+		if (CurrentBridges.Contains(DoorIdx))
+			continue;
+
+		LockedDoors.Add(DoorIdx);
+
+		UE_LOG(LogMonolithFloorPlan, Verbose, TEXT("Horror: loop-break locked %s"), *Doors[DoorIdx].DoorId);
+
+		// Only break one loop per call for controlled degradation
+		break;
+	}
+
+	return LockedDoors;
+}
+
+// ============================================================================
+// WP-6: Wrong Room Injection
+// ============================================================================
+
+int32 FMonolithMeshFloorPlanGenerator::ApplyWrongRoomInjection(
+	TArray<FRoomDef>& Rooms, FRandomStream& Rng)
+{
+	static const TArray<FString> WrongTypes = {
+		TEXT("exam_room"), TEXT("laboratory"), TEXT("operating_theater"),
+		TEXT("shrine"), TEXT("server_room"), TEXT("holding_cell"),
+		TEXT("observation"), TEXT("morgue")
+	};
+
+	// Find rooms that are NOT corridors, entries, or stairwells
+	TArray<int32> CandidateRooms;
+	for (int32 i = 0; i < Rooms.Num(); ++i)
+	{
+		const FString& Type = Rooms[i].RoomType;
+		if (Type == TEXT("corridor") || Type == TEXT("entry") || Type == TEXT("entryway") ||
+			Type == TEXT("foyer") || Type == TEXT("stairwell") || Type == TEXT("elevator") ||
+			Type == TEXT("rest_alcove"))
+			continue;
+		CandidateRooms.Add(i);
+	}
+
+	if (CandidateRooms.Num() == 0)
+		return 0;
+
+	// Change 1-2 rooms
+	int32 Count = FMath::Min(1 + (Rng.RandHelper(2) > 0 ? 1 : 0), CandidateRooms.Num());
+	int32 Changed = 0;
+
+	for (int32 c = 0; c < Count && CandidateRooms.Num() > 0; ++c)
+	{
+		int32 PickIdx = Rng.RandHelper(CandidateRooms.Num());
+		int32 RoomIdx = CandidateRooms[PickIdx];
+
+		// Pick a wrong type that differs from the current type
+		FString NewType = WrongTypes[Rng.RandHelper(WrongTypes.Num())];
+		if (NewType == Rooms[RoomIdx].RoomType && WrongTypes.Num() > 1)
+		{
+			NewType = WrongTypes[(Rng.RandHelper(WrongTypes.Num() - 1) + 1) % WrongTypes.Num()];
+		}
+
+		UE_LOG(LogMonolithFloorPlan, Log, TEXT("Horror: wrong-room injection '%s' -> '%s' (room %s)"),
+			*Rooms[RoomIdx].RoomType, *NewType, *Rooms[RoomIdx].RoomId);
+
+		Rooms[RoomIdx].RoomType = NewType;
+		CandidateRooms.RemoveAt(PickIdx);
+		++Changed;
+	}
+
+	return Changed;
+}
+
+// ============================================================================
+// WP-6: Top-Level Horror Modifier Application
+// ============================================================================
+
+TSet<int32> FMonolithMeshFloorPlanGenerator::ApplyHorrorModifiers(
+	TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+	float HorrorLevel, bool bHospiceMode, FRandomStream& Rng,
+	TArray<FRoomSpaceSyntax>& OutPerRoom, FSpaceSyntaxScores& OutScores)
+{
+	TSet<int32> LockedDoors;
+
+	// Door locking (horror_level > 0.3, disabled in hospice)
+	if (HorrorLevel > 0.3f && !bHospiceMode)
+	{
+		// Lock 60-80% of doors, scaled by horror_level
+		float LockRatio = 0.6f + (HorrorLevel - 0.3f) * 0.286f; // 0.6 at 0.3, 0.8 at 1.0
+		LockRatio = FMath::Clamp(LockRatio, 0.6f, 0.8f);
+		LockedDoors = ApplyDoorLocking(Rooms, Doors, LockRatio, Rng);
+	}
+
+	// Dead-end ratio control (horror_level > 0.2)
+	if (HorrorLevel > 0.2f)
+	{
+		float TargetDeadEnd = 0.15f + HorrorLevel * 0.15f; // 15-30%
+		// Hospice: cap at 15%
+		if (bHospiceMode)
+			TargetDeadEnd = FMath::Min(TargetDeadEnd, 0.15f);
+
+		LockedDoors = AdjustDeadEndRatio(Rooms, Doors, LockedDoors, TargetDeadEnd, Rng);
+	}
+
+	// Loop breaking (horror_level > 0.5, not in hospice)
+	if (HorrorLevel > 0.5f && !bHospiceMode)
+	{
+		LockedDoors = ApplyLoopBreaking(Rooms, Doors, LockedDoors, Rng);
+	}
+
+	// Compute Space Syntax with the final locked door set
+	ComputeSpaceSyntax(Rooms, Doors, LockedDoors, OutPerRoom, OutScores);
+
+	return LockedDoors;
+}
+
+// ============================================================================
+// WP-6: Space Syntax Computation
+// ============================================================================
+
+void FMonolithMeshFloorPlanGenerator::ComputeSpaceSyntax(
+	const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+	const TSet<int32>& LockedDoors,
+	TArray<FRoomSpaceSyntax>& OutPerRoom, FSpaceSyntaxScores& OutScores)
+{
+	const int32 N = Rooms.Num();
+	OutPerRoom.SetNum(N);
+	OutScores = FSpaceSyntaxScores();
+
+	if (N == 0) return;
+
+	// Build adjacency graph (excluding locked doors)
+	TArray<TSet<int32>> Adj = BuildRoomAdjacencyFromDoors(Rooms, Doors, &LockedDoors);
+
+	// Find entry room (room with an exterior door, or first public room, or room 0)
+	int32 EntryRoom = 0;
+	for (int32 DoorIdx = 0; DoorIdx < Doors.Num(); ++DoorIdx)
+	{
+		const FDoorDef& D = Doors[DoorIdx];
+		if (D.RoomA == TEXT("exterior"))
+		{
+			int32 Idx = FindRoomIndexById(Rooms, D.RoomB);
+			if (Idx != INDEX_NONE) { EntryRoom = Idx; break; }
+		}
+		else if (D.RoomB == TEXT("exterior"))
+		{
+			int32 Idx = FindRoomIndexById(Rooms, D.RoomA);
+			if (Idx != INDEX_NONE) { EntryRoom = Idx; break; }
+		}
+	}
+
+	// BFS depth from entry
+	{
+		TArray<int32> Dist;
+		Dist.SetNum(N);
+		for (int32& D : Dist) D = -1;
+
+		TQueue<int32> Queue;
+		Queue.Enqueue(EntryRoom);
+		Dist[EntryRoom] = 0;
+
+		while (!Queue.IsEmpty())
+		{
+			int32 Curr;
+			Queue.Dequeue(Curr);
+			for (int32 Neighbor : Adj[Curr])
+			{
+				if (Dist[Neighbor] == -1)
+				{
+					Dist[Neighbor] = Dist[Curr] + 1;
+					Queue.Enqueue(Neighbor);
+				}
+			}
+		}
+
+		for (int32 i = 0; i < N; ++i)
+		{
+			OutPerRoom[i].Depth = FMath::Max(0, Dist[i]); // -1 means unreachable, clamp to 0
+		}
+	}
+
+	// Connectivity (number of direct neighbors via unlocked doors)
+	for (int32 i = 0; i < N; ++i)
+	{
+		OutPerRoom[i].Connectivity = Adj[i].Num();
+		OutPerRoom[i].bDeadEnd = (Adj[i].Num() <= 1);
+	}
+
+	// Integration (1 / mean shortest path to all other rooms)
+	for (int32 i = 0; i < N; ++i)
+	{
+		float TotalDist = 0.0f;
+		int32 ReachableCount = 0;
+
+		for (int32 j = 0; j < N; ++j)
+		{
+			if (i == j) continue;
+			int32 PathLen = BFSShortestPath(Adj, i, j);
+			if (PathLen > 0)
+			{
+				TotalDist += static_cast<float>(PathLen);
+				++ReachableCount;
+			}
+		}
+
+		if (ReachableCount > 0)
+		{
+			float MeanPath = TotalDist / ReachableCount;
+			OutPerRoom[i].Integration = 1.0f / MeanPath;
+		}
+		else
+		{
+			OutPerRoom[i].Integration = 0.0f;
+		}
+	}
+
+	// Aggregate scores
+	float SumIntegration = 0.0f;
+	float SumDepth = 0.0f;
+	int32 DeadEndCount = 0;
+	OutScores.MaxIntegration = 0.0f;
+	OutScores.MinIntegration = TNumericLimits<float>::Max();
+	OutScores.MaxDepth = 0;
+
+	for (int32 i = 0; i < N; ++i)
+	{
+		SumIntegration += OutPerRoom[i].Integration;
+		SumDepth += OutPerRoom[i].Depth;
+
+		OutScores.MaxIntegration = FMath::Max(OutScores.MaxIntegration, OutPerRoom[i].Integration);
+		OutScores.MinIntegration = FMath::Min(OutScores.MinIntegration, OutPerRoom[i].Integration);
+		OutScores.MaxDepth = FMath::Max(OutScores.MaxDepth, OutPerRoom[i].Depth);
+
+		if (OutPerRoom[i].bDeadEnd)
+			++DeadEndCount;
+
+		if (OutPerRoom[i].Connectivity >= 3)
+			++OutScores.HubCount;
+	}
+
+	OutScores.MeanIntegration = (N > 0) ? SumIntegration / N : 0.0f;
+	OutScores.MeanDepth = (N > 0) ? SumDepth / N : 0.0f;
+	OutScores.DeadEndRatio = (N > 0) ? static_cast<float>(DeadEndCount) / N : 0.0f;
+
+	// Locked door ratio
+	int32 InteriorDoors = 0;
+	for (const FDoorDef& D : Doors)
+	{
+		if (D.RoomA != TEXT("exterior") && D.RoomB != TEXT("exterior"))
+			++InteriorDoors;
+	}
+	OutScores.LockedDoorCount = LockedDoors.Num();
+	OutScores.LockedDoorRatio = (InteriorDoors > 0) ? static_cast<float>(LockedDoors.Num()) / InteriorDoors : 0.0f;
+
+	// Build per-room locked door adjacency set for tension calculation
+	TSet<int32> RoomsAdjacentToLockedDoors;
+	for (int32 DoorIdx : LockedDoors)
+	{
+		if (DoorIdx < 0 || DoorIdx >= Doors.Num()) continue;
+		const FDoorDef& D = Doors[DoorIdx];
+		int32 IdxA = FindRoomIndexById(Rooms, D.RoomA);
+		int32 IdxB = FindRoomIndexById(Rooms, D.RoomB);
+		if (IdxA == INDEX_NONE && D.RoomA == TEXT("corridor"))
+			for (int32 k = 0; k < N; ++k) if (Rooms[k].RoomType == TEXT("corridor")) { IdxA = k; break; }
+		if (IdxB == INDEX_NONE && D.RoomB == TEXT("corridor"))
+			for (int32 k = 0; k < N; ++k) if (Rooms[k].RoomType == TEXT("corridor")) { IdxB = k; break; }
+		if (IdxA != INDEX_NONE) RoomsAdjacentToLockedDoors.Add(IdxA);
+		if (IdxB != INDEX_NONE) RoomsAdjacentToLockedDoors.Add(IdxB);
+	}
+
+	// Compute tension per room
+	for (int32 i = 0; i < N; ++i)
+	{
+		OutPerRoom[i].Tension = ComputeRoomTension(OutPerRoom[i], OutScores.MeanDepth, OutPerRoom[i].Depth);
+
+		// Adjacent to locked doors: +0.1
+		if (RoomsAdjacentToLockedDoors.Contains(i))
+			OutPerRoom[i].Tension = FMath::Min(OutPerRoom[i].Tension + 0.1f, 1.0f);
+
+		// Entry room and depth 0-1: safe zone
+		if (i == EntryRoom || OutPerRoom[i].Depth <= 1)
+			OutPerRoom[i].Tension = 0.0f;
+	}
+
+	// Horror score: composite metric
+	// horror_score = 0.3 * dead_end_ratio + 0.2 * (max_depth / room_count) + 0.3 * (1 - mean_integration) + 0.2 * locked_door_ratio
+	float NormDepth = (N > 0) ? static_cast<float>(OutScores.MaxDepth) / N : 0.0f;
+	float InvIntegration = 1.0f - FMath::Clamp(OutScores.MeanIntegration, 0.0f, 1.0f);
+
+	OutScores.HorrorScore = FMath::Clamp(
+		0.3f * OutScores.DeadEndRatio +
+		0.2f * FMath::Clamp(NormDepth, 0.0f, 1.0f) +
+		0.3f * InvIntegration +
+		0.2f * OutScores.LockedDoorRatio,
+		0.0f, 1.0f);
+}
+
+float FMonolithMeshFloorPlanGenerator::ComputeRoomTension(
+	const FRoomSpaceSyntax& RoomSS, float MeanDepth, int32 Depth)
+{
+	float Tension = 0.0f;
+
+	// Dead-end rooms: +0.3
+	if (RoomSS.bDeadEnd)
+		Tension += 0.3f;
+
+	// Rooms deeper than mean: +0.2
+	if (static_cast<float>(Depth) > MeanDepth)
+		Tension += 0.2f;
+
+	// Low connectivity (1 door): +0.2
+	if (RoomSS.Connectivity <= 1)
+		Tension += 0.2f;
+
+	// Note: locked door adjacency bonus (+0.1) is applied in ComputeSpaceSyntax
+	// where we have access to the actual locked door set
+
+	return FMath::Clamp(Tension, 0.0f, 1.0f);
+}
+
+// ============================================================================
+// WP-6: JSON Emission for Horror + Space Syntax
+// ============================================================================
+
+void FMonolithMeshFloorPlanGenerator::EmitHorrorAndSpaceSyntaxJson(
+	TSharedPtr<FJsonObject>& ResultJson,
+	const TArray<FRoomDef>& Rooms, const TArray<FDoorDef>& Doors,
+	const TSet<int32>& LockedDoors,
+	const TArray<FRoomSpaceSyntax>& PerRoom,
+	const FSpaceSyntaxScores& Scores,
+	float HorrorLevel, int32 WrongRoomCount)
+{
+	// Add locked status to each door in the doors array
+	if (LockedDoors.Num() > 0)
+	{
+		const TArray<TSharedPtr<FJsonValue>>* DoorsArr = nullptr;
+		if (ResultJson->TryGetArrayField(TEXT("doors"), DoorsArr) && DoorsArr)
+		{
+			for (int32 i = 0; i < DoorsArr->Num() && i < Doors.Num(); ++i)
+			{
+				auto DoorObj = (*DoorsArr)[i]->AsObject();
+				if (DoorObj.IsValid())
+				{
+					DoorObj->SetBoolField(TEXT("locked"), LockedDoors.Contains(i));
+				}
+			}
+		}
+	}
+
+	// Per-room Space Syntax data
+	TArray<TSharedPtr<FJsonValue>> RoomSSArr;
+	for (int32 i = 0; i < Rooms.Num() && i < PerRoom.Num(); ++i)
+	{
+		auto RoomSSObj = MakeShared<FJsonObject>();
+		RoomSSObj->SetStringField(TEXT("room_id"), Rooms[i].RoomId);
+		RoomSSObj->SetStringField(TEXT("room_type"), Rooms[i].RoomType);
+		RoomSSObj->SetNumberField(TEXT("integration"), PerRoom[i].Integration);
+		RoomSSObj->SetNumberField(TEXT("connectivity"), PerRoom[i].Connectivity);
+		RoomSSObj->SetNumberField(TEXT("depth"), PerRoom[i].Depth);
+		RoomSSObj->SetBoolField(TEXT("dead_end"), PerRoom[i].bDeadEnd);
+		RoomSSObj->SetNumberField(TEXT("tension"), PerRoom[i].Tension);
+
+		// Privacy zone string
+		FString PrivacyStr;
+		EPrivacyZone PZ = GetPrivacyZone(Rooms[i].RoomType);
+		switch (PZ)
+		{
+		case EPrivacyZone::PUBLIC: PrivacyStr = TEXT("public"); break;
+		case EPrivacyZone::SEMI_PUBLIC: PrivacyStr = TEXT("semi_public"); break;
+		case EPrivacyZone::SEMI_PRIVATE: PrivacyStr = TEXT("semi_private"); break;
+		case EPrivacyZone::PRIVATE: PrivacyStr = TEXT("private"); break;
+		case EPrivacyZone::SERVICE: PrivacyStr = TEXT("service"); break;
+		}
+		RoomSSObj->SetStringField(TEXT("privacy_zone"), PrivacyStr);
+
+		RoomSSArr.Add(MakeShared<FJsonValueObject>(RoomSSObj));
+	}
+	ResultJson->SetArrayField(TEXT("room_analysis"), RoomSSArr);
+
+	// Aggregate Space Syntax scores
+	auto SSObj = MakeShared<FJsonObject>();
+	SSObj->SetNumberField(TEXT("mean_integration"), Scores.MeanIntegration);
+	SSObj->SetNumberField(TEXT("max_integration"), Scores.MaxIntegration);
+	SSObj->SetNumberField(TEXT("min_integration"), Scores.MinIntegration);
+	SSObj->SetNumberField(TEXT("max_depth"), Scores.MaxDepth);
+	SSObj->SetNumberField(TEXT("mean_depth"), Scores.MeanDepth);
+	SSObj->SetNumberField(TEXT("dead_end_ratio"), Scores.DeadEndRatio);
+	SSObj->SetNumberField(TEXT("hub_count"), Scores.HubCount);
+	ResultJson->SetObjectField(TEXT("space_syntax"), SSObj);
+
+	// Horror stats (in the existing stats object)
+	auto StatsObj = ResultJson->GetObjectField(TEXT("stats"));
+	if (StatsObj.IsValid())
+	{
+		StatsObj->SetNumberField(TEXT("horror_level"), HorrorLevel);
+		StatsObj->SetNumberField(TEXT("horror_score"), Scores.HorrorScore);
+		StatsObj->SetNumberField(TEXT("locked_doors"), Scores.LockedDoorCount);
+		StatsObj->SetNumberField(TEXT("locked_door_ratio"), Scores.LockedDoorRatio);
+		StatsObj->SetNumberField(TEXT("dead_end_ratio"), Scores.DeadEndRatio);
+		StatsObj->SetNumberField(TEXT("wrong_room_count"), WrongRoomCount);
+	}
 }

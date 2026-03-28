@@ -80,9 +80,14 @@ private:
 		float CellSize, float FloorZ, float ExteriorT, float InteriorT,
 		const TArray<TArray<int32>>& Grid, int32 GridW, int32 GridH);
 
-	/** Generate stair geometry for stairwells */
+	/** Generate stair geometry for stairwells (skips elevator-type shafts) */
 	static void GenerateStairGeometry(UDynamicMesh* Mesh, const TArray<FStairwellDef>& Stairwells,
 		float CellSize, float FloorHeight, float FloorZ, float StairWidth);
+
+	/** Generate entrance door frame geometry for exterior doors (WP-3) */
+	static void GenerateEntranceDoorFrames(UDynamicMesh* Mesh, const TArray<FDoorDef>& Doors,
+		float CellSize, float FloorZ, float ExteriorT,
+		const TArray<TArray<int32>>& Grid, int32 GridW, int32 GridH);
 
 	/** Compute world bounds for all rooms based on grid cell positions */
 	static void ComputeRoomBounds(TArray<FRoomDef>& Rooms, float CellSize, float FloorHeight, float FloorZ, const FVector& WorldOrigin);

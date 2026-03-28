@@ -1,6 +1,7 @@
 #if WITH_GEOMETRYSCRIPT
 
 #include "MonolithMeshCityBlockActions.h"
+#include "MonolithMeshFloorPlanGenerator.h"
 #include "MonolithMeshProceduralActions.h"
 #include "MonolithMeshHandlePool.h"
 #include "MonolithMeshUtils.h"
@@ -1495,7 +1496,10 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 				{
 					RoofParams->SetArrayField(TEXT("footprint_polygon"), BuildingResult->GetArrayField(TEXT("footprint_polygon")));
 				}
-				// Compute roof height from top floor
+
+				// Compute roof height from top floor — MUST account for ceiling slab thickness
+				// Building structure per floor: [floor_slab=FT] [walls=FH] [ceiling_slab=FT]
+				// Roof sits on TOP of the ceiling slab of the top floor
 				const TArray<TSharedPtr<FJsonValue>>* FloorsArr = nullptr;
 				if (BuildingResult->TryGetArrayField(TEXT("floors"), FloorsArr) && FloorsArr && FloorsArr->Num() > 0)
 				{
@@ -1504,9 +1508,19 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 					{
 						float ZOff = static_cast<float>((*TopFloor)->GetNumberField(TEXT("z_offset")));
 						float FH = static_cast<float>((*TopFloor)->GetNumberField(TEXT("height")));
-						RoofParams->SetNumberField(TEXT("height_offset"), ZOff + FH);
+
+						// Get slab thickness from building result (WP-3 fix)
+						// Each floor has: floor_slab(FT) + walls(FH) + ceiling_slab(FT)
+						// ZOff is the base of the floor slab. Top of ceiling = ZOff + FT + FH + FT = ZOff + FH + 2*FT
+						float FT = 3.0f; // default
+						if (BuildingResult->HasField(TEXT("floor_thickness")))
+							FT = static_cast<float>(BuildingResult->GetNumberField(TEXT("floor_thickness")));
+
+						float RoofZ = ZOff + FH + 2.0f * FT;
+						RoofParams->SetNumberField(TEXT("height_offset"), RoofZ);
 					}
 				}
+
 				// Pass building location for roof placement
 				if (BuildingResult->HasField(TEXT("world_origin")))
 				{
@@ -1516,6 +1530,23 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 				{
 					RoofParams->SetStringField(TEXT("building_id"), BuildingResult->GetStringField(TEXT("building_id")));
 				}
+			}
+
+			// Pass roof_type from floor plan result or load directly from archetype
+			bool bHasRoofType = false;
+			if (FloorPlanResult.IsValid() && FloorPlanResult->HasField(TEXT("roof_type")))
+			{
+				FString RT = FloorPlanResult->GetStringField(TEXT("roof_type"));
+				if (!RT.IsEmpty())
+				{
+					RoofParams->SetStringField(TEXT("roof_type"), RT);
+					bHasRoofType = true;
+				}
+			}
+			if (!bHasRoofType && i < Archetypes.Num())
+			{
+				FString RoofType = FMonolithMeshFloorPlanGenerator::GetArchetypeRoofType(Archetypes[i]);
+				RoofParams->SetStringField(TEXT("roof_type"), RoofType);
 			}
 
 			RoofParams->SetStringField(TEXT("save_path"), FString::Printf(TEXT("%s/Roof_%02d"), *SavePathPrefix, i));

@@ -110,6 +110,14 @@ struct FDoorDef
 	}
 };
 
+/** Vertical access type for stairwells/elevator shafts (R2-C2) */
+enum class EVerticalAccessType : uint8
+{
+	Stairs,     // Default: generate stair geometry
+	Elevator,   // Shaft only: suppress floor/ceiling slabs, no stair geometry
+	Both        // Stairs + adjacent elevator shaft (future)
+};
+
 /** Stairwell connecting floors */
 struct FStairwellDef
 {
@@ -118,6 +126,7 @@ struct FStairwellDef
 	int32 ConnectsFloorA = 0;
 	int32 ConnectsFloorB = 1;
 	FVector WorldPosition = FVector::ZeroVector;
+	EVerticalAccessType VerticalAccess = EVerticalAccessType::Stairs;  // R2-C2: stairs, elevator, or both
 
 	TSharedPtr<FJsonObject> ToJson() const
 	{
@@ -144,6 +153,16 @@ struct FStairwellDef
 		WPos.Add(MakeShared<FJsonValueNumber>(WorldPosition.Y));
 		WPos.Add(MakeShared<FJsonValueNumber>(WorldPosition.Z));
 		J->SetArrayField(TEXT("world_position"), WPos);
+
+		// Serialize vertical_access type
+		FString AccessStr;
+		switch (VerticalAccess)
+		{
+		case EVerticalAccessType::Elevator: AccessStr = TEXT("elevator"); break;
+		case EVerticalAccessType::Both:     AccessStr = TEXT("both"); break;
+		default:                            AccessStr = TEXT("stairs"); break;
+		}
+		J->SetStringField(TEXT("vertical_access"), AccessStr);
 
 		return J;
 	}

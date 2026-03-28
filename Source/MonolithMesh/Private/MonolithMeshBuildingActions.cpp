@@ -274,6 +274,18 @@ bool FMonolithMeshBuildingActions::ParseStairwells(const TArray<TSharedPtr<FJson
 			}
 		}
 
+		// Parse vertical_access type (R2-C2: stairs/elevator/both)
+		FString AccessStr;
+		if ((*StairObj)->TryGetStringField(TEXT("vertical_access"), AccessStr))
+		{
+			if (AccessStr == TEXT("elevator"))
+				Stair.VerticalAccess = EVerticalAccessType::Elevator;
+			else if (AccessStr == TEXT("both"))
+				Stair.VerticalAccess = EVerticalAccessType::Both;
+			else
+				Stair.VerticalAccess = EVerticalAccessType::Stairs;
+		}
+
 		OutStairwells.Add(MoveTemp(Stair));
 	}
 	return true;
@@ -869,6 +881,187 @@ void FMonolithMeshBuildingActions::AddDoorTrim(UDynamicMesh* Mesh, const TArray<
 	}
 }
 
+// ============================================================================
+// Entrance Door Frame Geometry (WP-3)
+// ============================================================================
+
+void FMonolithMeshBuildingActions::GenerateEntranceDoorFrames(UDynamicMesh* Mesh,
+	const TArray<FDoorDef>& Doors, float CellSize, float FloorZ, float ExteriorT,
+	const TArray<TArray<int32>>& Grid, int32 GridW, int32 GridH)
+{
+	auto GetCell = [&](int32 X, int32 Y) -> int32
+	{
+		if (X < 0 || X >= GridW || Y < 0 || Y >= GridH) return -1;
+		return Grid[Y][X];
+	};
+
+	FGeometryScriptPrimitiveOptions FrameOpts;
+	FrameOpts.PolygroupMode = EGeometryScriptPrimitivePolygroupMode::PerFace;
+	FrameOpts.MaterialID = 5; // Door frame material slot
+
+	const float FrameWidth = 8.0f;      // Frame profile width per side
+	const float FrameDepth = ExteriorT + 6.0f;  // Extends 3cm past wall on each face
+	const float ThresholdHeight = 3.0f;  // Small threshold step
+	const float ThresholdDepth = 30.0f;  // Threshold extends outward
+
+	for (const FDoorDef& Door : Doors)
+	{
+		// Only process exterior doors (connecting to "exterior")
+		bool bIsExterior = (Door.RoomB == TEXT("exterior") || Door.RoomA == TEXT("exterior"));
+		if (!bIsExterior)
+		{
+			// Also check by grid cell — if either side of the door edge is -1 (empty/exterior)
+			int32 SideA, SideB;
+			bool bVerticalWall = (Door.EdgeStart.X == Door.EdgeEnd.X);
+			if (bVerticalWall)
+			{
+				SideA = GetCell(Door.EdgeStart.X - 1, Door.EdgeStart.Y);
+				SideB = GetCell(Door.EdgeStart.X, Door.EdgeStart.Y);
+			}
+			else
+			{
+				SideA = GetCell(Door.EdgeStart.X, Door.EdgeStart.Y - 1);
+				SideB = GetCell(Door.EdgeStart.X, Door.EdgeStart.Y);
+			}
+			bIsExterior = (SideA == -1 || SideB == -1);
+		}
+
+		if (!bIsExterior) continue;
+
+		bool bVerticalWall = (Door.EdgeStart.X == Door.EdgeEnd.X);
+
+		float WallPos;
+		float DoorCenter;
+
+		if (bVerticalWall)
+		{
+			WallPos = static_cast<float>(Door.EdgeStart.X) * CellSize;
+			float MinY = static_cast<float>(FMath::Min(Door.EdgeStart.Y, Door.EdgeEnd.Y));
+			float MaxY = static_cast<float>(FMath::Max(Door.EdgeStart.Y, Door.EdgeEnd.Y)) + 1.0f;
+			DoorCenter = (MinY + MaxY) * 0.5f * CellSize;
+		}
+		else
+		{
+			WallPos = static_cast<float>(Door.EdgeStart.Y) * CellSize;
+			float MinX = static_cast<float>(FMath::Min(Door.EdgeStart.X, Door.EdgeEnd.X));
+			float MaxX = static_cast<float>(FMath::Max(Door.EdgeStart.X, Door.EdgeEnd.X)) + 1.0f;
+			DoorCenter = (MinX + MaxX) * 0.5f * CellSize;
+		}
+
+		// Determine which side is exterior to orient the frame correctly
+		int32 SideA, SideB;
+		if (bVerticalWall)
+		{
+			SideA = GetCell(Door.EdgeStart.X - 1, Door.EdgeStart.Y);
+			SideB = GetCell(Door.EdgeStart.X, Door.EdgeStart.Y);
+		}
+		else
+		{
+			SideA = GetCell(Door.EdgeStart.X, Door.EdgeStart.Y - 1);
+			SideB = GetCell(Door.EdgeStart.X, Door.EdgeStart.Y);
+		}
+
+		// Normal points outward toward exterior
+		FVector OutwardNormal;
+		if (bVerticalWall)
+		{
+			OutwardNormal = (SideA == -1) ? FVector(-1.0f, 0.0f, 0.0f) : FVector(1.0f, 0.0f, 0.0f);
+		}
+		else
+		{
+			OutwardNormal = (SideA == -1) ? FVector(0.0f, -1.0f, 0.0f) : FVector(0.0f, 1.0f, 0.0f);
+		}
+
+		UDynamicMesh* FrameMesh = NewObject<UDynamicMesh>(Pool);
+
+		if (bVerticalWall)
+		{
+			// Left post (jamb)
+			FTransform LeftPostXf(FRotator::ZeroRotator,
+				FVector(WallPos, DoorCenter - Door.Width * 0.5f - FrameWidth * 0.5f, FloorZ),
+				FVector::OneVector);
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+				FrameMesh, FrameOpts, LeftPostXf,
+				FrameDepth, FrameWidth, Door.Height,
+				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+
+			// Right post (jamb)
+			FTransform RightPostXf(FRotator::ZeroRotator,
+				FVector(WallPos, DoorCenter + Door.Width * 0.5f + FrameWidth * 0.5f, FloorZ),
+				FVector::OneVector);
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+				FrameMesh, FrameOpts, RightPostXf,
+				FrameDepth, FrameWidth, Door.Height,
+				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+
+			// Lintel (header)
+			FTransform LintelXf(FRotator::ZeroRotator,
+				FVector(WallPos, DoorCenter, FloorZ + Door.Height),
+				FVector::OneVector);
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+				FrameMesh, FrameOpts, LintelXf,
+				FrameDepth, Door.Width + FrameWidth * 2.0f, FrameWidth,
+				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+
+			// Threshold step on exterior side
+			float ThresholdX = WallPos + OutwardNormal.X * (ExteriorT * 0.5f + ThresholdDepth * 0.5f);
+			FTransform ThresholdXf(FRotator::ZeroRotator,
+				FVector(ThresholdX, DoorCenter, FloorZ),
+				FVector::OneVector);
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+				FrameMesh, FrameOpts, ThresholdXf,
+				ThresholdDepth, Door.Width + FrameWidth * 2.0f, ThresholdHeight,
+				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+		}
+		else
+		{
+			// Left post (jamb)
+			FTransform LeftPostXf(FRotator::ZeroRotator,
+				FVector(DoorCenter - Door.Width * 0.5f - FrameWidth * 0.5f, WallPos, FloorZ),
+				FVector::OneVector);
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+				FrameMesh, FrameOpts, LeftPostXf,
+				FrameWidth, FrameDepth, Door.Height,
+				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+
+			// Right post (jamb)
+			FTransform RightPostXf(FRotator::ZeroRotator,
+				FVector(DoorCenter + Door.Width * 0.5f + FrameWidth * 0.5f, WallPos, FloorZ),
+				FVector::OneVector);
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+				FrameMesh, FrameOpts, RightPostXf,
+				FrameWidth, FrameDepth, Door.Height,
+				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+
+			// Lintel (header)
+			FTransform LintelXf(FRotator::ZeroRotator,
+				FVector(DoorCenter, WallPos, FloorZ + Door.Height),
+				FVector::OneVector);
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+				FrameMesh, FrameOpts, LintelXf,
+				Door.Width + FrameWidth * 2.0f, FrameDepth, FrameWidth,
+				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+
+			// Threshold step on exterior side
+			float ThresholdY = WallPos + OutwardNormal.Y * (ExteriorT * 0.5f + ThresholdDepth * 0.5f);
+			FTransform ThresholdXf(FRotator::ZeroRotator,
+				FVector(DoorCenter, ThresholdY, FloorZ),
+				FVector::OneVector);
+			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+				FrameMesh, FrameOpts, ThresholdXf,
+				Door.Width + FrameWidth * 2.0f, ThresholdDepth, ThresholdHeight,
+				0, 0, 0, EGeometryScriptPrimitiveOriginMode::Base);
+		}
+
+		UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(
+			Mesh, FrameMesh, FTransform::Identity);
+
+		UE_LOG(LogTemp, Log, TEXT("Generated entrance door frame for '%s' (%.0f x %.0f cm) at wall %s"),
+			*Door.DoorId, Door.Width, Door.Height,
+			bVerticalWall ? TEXT("vertical") : TEXT("horizontal"));
+	}
+}
+
 void FMonolithMeshBuildingActions::GenerateStairGeometry(UDynamicMesh* Mesh,
 	const TArray<FStairwellDef>& Stairwells, float CellSize, float FloorHeight, float FloorZ, float StairWidth)
 {
@@ -888,6 +1081,14 @@ void FMonolithMeshBuildingActions::GenerateStairGeometry(UDynamicMesh* Mesh,
 	for (const FStairwellDef& Stair : Stairwells)
 	{
 		if (Stair.GridCells.Num() == 0) continue;
+
+		// R2-C2: Elevator shafts suppress floor/ceiling slabs but get NO stair geometry
+		if (Stair.VerticalAccess == EVerticalAccessType::Elevator)
+		{
+			UE_LOG(LogTemp, Log, TEXT("Stairwell '%s' is elevator shaft — skipping stair geometry (slab suppression still active)"),
+				*Stair.StairwellId);
+			continue;
+		}
 
 		// Compute stairwell bounding box in grid coords
 		int32 MinGX = INT32_MAX, MaxGX = INT32_MIN;
@@ -1519,6 +1720,14 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 		AddDoorTrim(Mesh, *FloorDoors, CellSize, FloorZ + FloorThick,
 			ExteriorT, InteriorT, FloorGrid, GridW, GridH);
 
+		// 6.5 Generate entrance door frames for exterior doors (WP-3)
+		// Only on ground floor — exterior entrances don't exist on upper floors
+		if (FloorIdx == 0)
+		{
+			GenerateEntranceDoorFrames(Mesh, *FloorDoors, CellSize, FloorZ + FloorThick,
+				ExteriorT, FloorGrid, GridW, GridH);
+		}
+
 		// 7. Generate stair geometry for stairwells (only on the originating floor)
 		float ActualStairWidth = CellSize;
 		GenerateStairGeometry(Mesh, *FloorStairwells, CellSize, FloorHeight + FloorThick,
@@ -1634,6 +1843,8 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 	Result->SetNumberField(TEXT("grid_height"), GridH);
 	Result->SetBoolField(TEXT("had_booleans"), bHadBooleans);
 	Result->SetStringField(TEXT("save_path"), SavePath);
+	Result->SetNumberField(TEXT("floor_thickness"), FloorThick);
+	Result->SetNumberField(TEXT("floor_height"), FloorHeight);
 
 	if (bHasFacadeStyle)
 	{
