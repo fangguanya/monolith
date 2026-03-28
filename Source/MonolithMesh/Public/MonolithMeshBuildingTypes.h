@@ -79,7 +79,7 @@ struct FDoorDef
 	FIntPoint EdgeStart;       // Grid edge start cell
 	FIntPoint EdgeEnd;         // Grid edge end cell (for multi-cell doors)
 	FString Wall;              // "north", "south", "east", "west" (auto-computed)
-	float Width = 90.0f;
+	float Width = 110.0f;
 	float Height = 220.0f;
 	bool bTraversable = true;
 

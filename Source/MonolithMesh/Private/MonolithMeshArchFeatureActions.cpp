@@ -641,156 +641,78 @@ FMonolithActionResult FMonolithMeshArchFeatureActions::CreateFireEscape(const TS
 	const float TreadThick = 3.0f;
 	const float StringerW = 4.0f;
 
-	// Stair geometry constants
-	const float StairStepH = 20.0f;
-	const int32 StepsPerFlight = FMath::Max(2, FMath::RoundToInt32(FloorHeight / StairStepH));
+	// Stair geometry constants — IBC fire escape: 20cm tread / 20cm riser = 45 deg max
+	const float StepDepth   = GetFloat(Params, TEXT("step_depth"), 20.0f);  // IBC fire escape minimum 8"
+	const float TargetRiser = GetFloat(Params, TEXT("step_rise"), 20.0f);   // IBC fire escape maximum 8"
+	const int32 StepsPerFlight = FMath::Max(2, FMath::RoundToInt32(FloorHeight / TargetRiser));
 	const float ActualStepH = FloorHeight / static_cast<float>(StepsPerFlight);
-	const float StepDepth = LandingD / static_cast<float>(StepsPerFlight); // fit stairs within landing depth
 
-	// Fire escape layout: landings at each floor, stairs zigzag between them.
-	// Landings are stacked vertically. Stairs alternate offset in X.
-	// Landing 0 = bottom floor at Z = FloorHeight (first floor level).
-	// Landing N-1 = top floor.
+	// Stair run extends BEYOND the landing — this is the correct fire escape layout
+	const float StairRunLength = StepDepth * StepsPerFlight;
 
-	for (int32 Fi = 0; Fi < FloorCount; ++Fi)
+	// Validate angle
+	const float StairAngleDeg = FMath::RadiansToDegrees(FMath::Atan2(ActualStepH, StepDepth));
+	if (StairAngleDeg > 50.0f)
 	{
-		float LandingZ = static_cast<float>(Fi + 1) * FloorHeight;
-
-		// ---- Landing platform ----
-		{
-			FTransform PlatXf(FRotator::ZeroRotator,
-				FVector(0.0f, LandingD * 0.5f, LandingZ),
-				FVector::OneVector);
-			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
-				Mesh, Opts, PlatXf, LandingW, LandingD, PlatformThick, 0, 0, 0,
-				EGeometryScriptPrimitiveOriginMode::Center);
-		}
-
-		// ---- Landing railing (three sides: left, front, right) ----
-		if (RailHeight > 0.0f)
-		{
-			const float HalfW = LandingW * 0.5f;
-			const float RailZ = LandingZ + PlatformThick * 0.5f;
-
-			TArray<FVector> RailPath;
-			RailPath.Add(FVector(-HalfW, 0.0f, RailZ));
-			RailPath.Add(FVector(-HalfW, LandingD, RailZ));
-			RailPath.Add(FVector(HalfW, LandingD, RailZ));
-			RailPath.Add(FVector(HalfW, 0.0f, RailZ));
-
-			BuildRailingGeometry(Mesh, RailPath, RailHeight, TEXT("bars"),
-				/*PostSpacing=*/100.0f, /*PostWidth=*/3.0f, /*RailWidth=*/4.0f,
-				/*BarSpacing=*/12.0f, /*BarWidth=*/2.0f, /*PanelThick=*/3.0f,
-				/*bClosedLoop=*/false);
-		}
-
-		// ---- Stairs down to the floor below (skip for bottom floor — that one has stairs to ground) ----
-		if (Fi > 0)
-		{
-			// Zigzag: even floors have stairs on the left side (-X), odd on the right (+X)
-			float StairOffsetX = (Fi % 2 == 0) ? -(LandingW * 0.5f + StairW * 0.5f) : (LandingW * 0.5f + StairW * 0.5f);
-
-			float BottomZ = static_cast<float>(Fi) * FloorHeight + PlatformThick * 0.5f;
-			float TopZ = LandingZ - PlatformThick * 0.5f;
-
-			// Stair treads between this landing and the one below
-			for (int32 Si = 0; Si < StepsPerFlight; ++Si)
-			{
-				float T = static_cast<float>(Si) / static_cast<float>(StepsPerFlight);
-				float TreadZ = FMath::Lerp(BottomZ, TopZ, T);
-				float TreadY = LandingD * T;
-
-				FTransform TreadXf(FRotator::ZeroRotator,
-					FVector(StairOffsetX, TreadY, TreadZ),
-					FVector::OneVector);
-				UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
-					Mesh, Opts, TreadXf, StairW, StepDepth, TreadThick, 0, 0, 0,
-					EGeometryScriptPrimitiveOriginMode::Center);
-			}
-
-			// Stringer (left and right side beams of the staircase)
-			{
-				float StringerLen = FMath::Sqrt(FMath::Square(LandingD) + FMath::Square(TopZ - BottomZ));
-				FVector StringerDir = FVector(0.0f, LandingD, TopZ - BottomZ);
-				StringerDir.Normalize();
-				FRotator StringerRot = StringerDir.Rotation();
-				FVector StringerMid(StairOffsetX, LandingD * 0.5f, (BottomZ + TopZ) * 0.5f);
-
-				for (int32 Side = 0; Side < 2; ++Side)
-				{
-					float SX = StairOffsetX + (Side == 0 ? -StairW * 0.5f : StairW * 0.5f);
-					FTransform StrXf(StringerRot, FVector(SX, LandingD * 0.5f, (BottomZ + TopZ) * 0.5f), FVector::OneVector);
-					UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
-						Mesh, Opts, StrXf, StringerLen, StringerW, StringerW, 0, 0, 0,
-						EGeometryScriptPrimitiveOriginMode::Center);
-				}
-			}
-
-			// Stair railing
-			if (RailHeight > 0.0f)
-			{
-				for (int32 Side = 0; Side < 2; ++Side)
-				{
-					float SX = StairOffsetX + (Side == 0 ? -StairW * 0.5f : StairW * 0.5f);
-					TArray<FVector> StairRailPath;
-					StairRailPath.Add(FVector(SX, 0.0f, BottomZ));
-					StairRailPath.Add(FVector(SX, LandingD, TopZ));
-
-					BuildRailingGeometry(Mesh, StairRailPath, RailHeight, TEXT("bars"),
-						/*PostSpacing=*/80.0f, /*PostWidth=*/3.0f, /*RailWidth=*/4.0f,
-						/*BarSpacing=*/12.0f, /*BarWidth=*/2.0f, /*PanelThick=*/3.0f,
-						/*bClosedLoop=*/false);
-				}
-			}
-		}
+		UE_LOG(LogTemp, Warning, TEXT("Fire escape stair angle %.1f deg exceeds 45 deg IBC max. "
+			"Consider increasing step_depth or decreasing step_rise."), StairAngleDeg);
 	}
 
-	// ---- Ground-level stairs (from first landing down to ground) ----
-	{
-		float TopZ = FloorHeight - PlatformThick * 0.5f;
-		float BottomZ = 0.0f;
-		float StairOffsetX = -(LandingW * 0.5f + StairW * 0.5f); // always left for ground stairs
+	// Fire escape layout: landings at each floor level, attached to the building wall (Y=0 side).
+	// Stairs extend outward from landings in +Y. Flights zigzag: even floors descend to the left (-X),
+	// odd floors descend to the right (+X). Mid-level landings at half-floor height connect flights.
 
-		for (int32 Si = 0; Si < StepsPerFlight; ++Si)
+	// Helper lambda: build a single flight of treads + stringers + railings
+	auto BuildFlight = [&](float FlightBottomZ, float FlightTopZ, float FlightStartY,
+		float FlightEndY, float FlightX, int32 NumSteps)
+	{
+		float FlightRun = FMath::Abs(FlightEndY - FlightStartY);
+		float FlightRise = FlightTopZ - FlightBottomZ;
+		float YDir = (FlightEndY > FlightStartY) ? 1.0f : -1.0f;
+
+		// Treads
+		for (int32 Si = 0; Si < NumSteps; ++Si)
 		{
-			float T = static_cast<float>(Si) / static_cast<float>(StepsPerFlight);
-			float TreadZ = FMath::Lerp(BottomZ, TopZ, T);
-			float TreadY = LandingD * T;
+			float T = static_cast<float>(Si) / static_cast<float>(NumSteps);
+			float TreadZ = FMath::Lerp(FlightBottomZ, FlightTopZ, T);
+			float TreadY = FlightStartY + YDir * StepDepth * Si;
 
 			FTransform TreadXf(FRotator::ZeroRotator,
-				FVector(StairOffsetX, TreadY, TreadZ),
+				FVector(FlightX, TreadY, TreadZ),
 				FVector::OneVector);
 			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
 				Mesh, Opts, TreadXf, StairW, StepDepth, TreadThick, 0, 0, 0,
 				EGeometryScriptPrimitiveOriginMode::Center);
 		}
 
-		// Stringers
+		// Stringers (left and right side beams)
 		{
-			float StringerLen = FMath::Sqrt(FMath::Square(LandingD) + FMath::Square(TopZ - BottomZ));
-			FVector StringerDir = FVector(0.0f, LandingD, TopZ - BottomZ);
+			float StringerLen = FMath::Sqrt(FMath::Square(FlightRun) + FMath::Square(FlightRise));
+			FVector StringerDir = FVector(0.0f, YDir * FlightRun, FlightRise);
 			StringerDir.Normalize();
 			FRotator StringerRot = StringerDir.Rotation();
 
 			for (int32 Side = 0; Side < 2; ++Side)
 			{
-				float SX = StairOffsetX + (Side == 0 ? -StairW * 0.5f : StairW * 0.5f);
-				FTransform StrXf(StringerRot, FVector(SX, LandingD * 0.5f, (BottomZ + TopZ) * 0.5f), FVector::OneVector);
+				float SX = FlightX + (Side == 0 ? -StairW * 0.5f : StairW * 0.5f);
+				FTransform StrXf(StringerRot,
+					FVector(SX, (FlightStartY + FlightEndY) * 0.5f, (FlightBottomZ + FlightTopZ) * 0.5f),
+					FVector::OneVector);
 				UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
 					Mesh, Opts, StrXf, StringerLen, StringerW, StringerW, 0, 0, 0,
 					EGeometryScriptPrimitiveOriginMode::Center);
 			}
 		}
 
-		// Ground stair railing
+		// Railings
 		if (RailHeight > 0.0f)
 		{
 			for (int32 Side = 0; Side < 2; ++Side)
 			{
-				float SX = StairOffsetX + (Side == 0 ? -StairW * 0.5f : StairW * 0.5f);
+				float SX = FlightX + (Side == 0 ? -StairW * 0.5f : StairW * 0.5f);
 				TArray<FVector> StairRailPath;
-				StairRailPath.Add(FVector(SX, 0.0f, BottomZ));
-				StairRailPath.Add(FVector(SX, LandingD, TopZ));
+				StairRailPath.Add(FVector(SX, FlightStartY, FlightBottomZ + TreadThick * 0.5f));
+				StairRailPath.Add(FVector(SX, FlightEndY, FlightTopZ + TreadThick * 0.5f));
 
 				BuildRailingGeometry(Mesh, StairRailPath, RailHeight, TEXT("bars"),
 					/*PostSpacing=*/80.0f, /*PostWidth=*/3.0f, /*RailWidth=*/4.0f,
@@ -798,6 +720,107 @@ FMonolithActionResult FMonolithMeshArchFeatureActions::CreateFireEscape(const TS
 					/*bClosedLoop=*/false);
 			}
 		}
+	};
+
+	// Helper lambda: build a landing platform with three-sided railing
+	auto BuildLanding = [&](FVector LandingCenter, float LandW, float LandD)
+	{
+		FTransform PlatXf(FRotator::ZeroRotator, LandingCenter, FVector::OneVector);
+		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
+			Mesh, Opts, PlatXf, LandW, LandD, PlatformThick, 0, 0, 0,
+			EGeometryScriptPrimitiveOriginMode::Center);
+
+		if (RailHeight > 0.0f)
+		{
+			const float HalfW = LandW * 0.5f;
+			const float HalfD = LandD * 0.5f;
+			const float RailZ = LandingCenter.Z + PlatformThick * 0.5f;
+
+			TArray<FVector> RailPath;
+			RailPath.Add(FVector(LandingCenter.X - HalfW, LandingCenter.Y - HalfD, RailZ));
+			RailPath.Add(FVector(LandingCenter.X - HalfW, LandingCenter.Y + HalfD, RailZ));
+			RailPath.Add(FVector(LandingCenter.X + HalfW, LandingCenter.Y + HalfD, RailZ));
+			RailPath.Add(FVector(LandingCenter.X + HalfW, LandingCenter.Y - HalfD, RailZ));
+
+			BuildRailingGeometry(Mesh, RailPath, RailHeight, TEXT("bars"),
+				/*PostSpacing=*/100.0f, /*PostWidth=*/3.0f, /*RailWidth=*/4.0f,
+				/*BarSpacing=*/12.0f, /*BarWidth=*/2.0f, /*PanelThick=*/3.0f,
+				/*bClosedLoop=*/false);
+		}
+	};
+
+	// Build floor-level landings and inter-floor flights.
+	// For each floor gap (Fi to Fi+1), we use two half-flights with a mid-level landing.
+	// Half-flight steps
+	const int32 HalfSteps = StepsPerFlight / 2;
+	const int32 RemainderSteps = StepsPerFlight - HalfSteps;
+	const float HalfRise = ActualStepH * HalfSteps;
+
+	for (int32 Fi = 0; Fi < FloorCount; ++Fi)
+	{
+		float FloorZ = static_cast<float>(Fi + 1) * FloorHeight;
+
+		// Floor-level landing at Y=0 (against the building wall)
+		BuildLanding(FVector(0.0f, LandingD * 0.5f, FloorZ), LandingW, LandingD);
+	}
+
+	// Now build stair flights between floors. Each floor gap gets two half-flights + a mid-landing.
+	// Flight 1: from lower floor landing, extends in +Y
+	// Mid-landing: at half-floor height, offset in X from floor landings
+	// Flight 2: from mid-landing back toward the building in -Y, arriving at upper floor landing
+
+	// Ground-to-first-floor flight
+	{
+		float BottomZ = PlatformThick * 0.5f; // ground level
+		float TopZ = FloorHeight;              // first floor landing
+
+		// Flight direction alternation: ground flight always goes left
+		float MidLandingX = -(LandingW * 0.5f + StairW * 0.5f);
+
+		// Flight 1 (lower half): from ground at Y=0, extending outward in +Y
+		float Flight1StartY = LandingD * 0.5f;
+		float Flight1EndY = Flight1StartY + StepDepth * HalfSteps;
+		float Flight1TopZ = BottomZ + HalfRise;
+
+		BuildFlight(BottomZ, Flight1TopZ, Flight1StartY, Flight1EndY, MidLandingX, HalfSteps);
+
+		// Mid-level landing
+		float MidZ = Flight1TopZ;
+		BuildLanding(FVector(MidLandingX, Flight1EndY + LandingD * 0.5f, MidZ), StairW, LandingD);
+
+		// Flight 2 (upper half): from mid-landing back toward building in -Y
+		float Flight2StartY = Flight1EndY + LandingD;
+		float Flight2EndY = Flight2StartY - StepDepth * RemainderSteps;
+		float Flight2TopZ = TopZ - PlatformThick * 0.5f;
+
+		BuildFlight(MidZ, Flight2TopZ, Flight2StartY, Flight2EndY, MidLandingX, RemainderSteps);
+	}
+
+	// Inter-floor flights (floor 1→2, 2→3, etc.)
+	for (int32 Fi = 1; Fi < FloorCount; ++Fi)
+	{
+		float BottomZ = static_cast<float>(Fi) * FloorHeight + PlatformThick * 0.5f;
+		float TopZ = static_cast<float>(Fi + 1) * FloorHeight - PlatformThick * 0.5f;
+
+		// Zigzag: even floor indices go left (-X), odd go right (+X)
+		float StairOffsetX = (Fi % 2 == 0) ? -(LandingW * 0.5f + StairW * 0.5f) : (LandingW * 0.5f + StairW * 0.5f);
+
+		// Flight 1: from floor landing outward in +Y
+		float Flight1StartY = LandingD * 0.5f;
+		float Flight1EndY = Flight1StartY + StepDepth * HalfSteps;
+		float Flight1TopZ = BottomZ + HalfRise;
+
+		BuildFlight(BottomZ, Flight1TopZ, Flight1StartY, Flight1EndY, StairOffsetX, HalfSteps);
+
+		// Mid-level landing
+		float MidZ = Flight1TopZ;
+		BuildLanding(FVector(StairOffsetX, Flight1EndY + LandingD * 0.5f, MidZ), StairW, LandingD);
+
+		// Flight 2: from mid-landing back toward building in -Y
+		float Flight2StartY = Flight1EndY + LandingD;
+		float Flight2EndY = Flight2StartY - StepDepth * RemainderSteps;
+
+		BuildFlight(MidZ, TopZ, Flight2StartY, Flight2EndY, StairOffsetX, RemainderSteps);
 	}
 
 	// ---- Roof ladder ----
@@ -847,6 +870,11 @@ FMonolithActionResult FMonolithMeshArchFeatureActions::CreateFireEscape(const TS
 	Result->SetNumberField(TEXT("floor_height"), FloorHeight);
 	Result->SetNumberField(TEXT("landing_width"), LandingW);
 	Result->SetNumberField(TEXT("landing_depth"), LandingD);
+	Result->SetNumberField(TEXT("stair_run_length"), StairRunLength);
+	Result->SetNumberField(TEXT("stair_angle_deg"), StairAngleDeg);
+	Result->SetNumberField(TEXT("steps_per_flight"), StepsPerFlight);
+	Result->SetNumberField(TEXT("step_depth"), StepDepth);
+	Result->SetNumberField(TEXT("step_rise"), ActualStepH);
 	Result->SetNumberField(TEXT("triangle_count"), TriCount);
 	Result->SetBoolField(TEXT("has_ladder"), bHasLadder);
 
@@ -898,40 +926,45 @@ FMonolithActionResult FMonolithMeshArchFeatureActions::CreateRampConnector(const
 
 	FGeometryScriptPrimitiveOptions Opts;
 
-	// Layout: ramp segments go in +Y direction, alternating between +Y and -Y for switchbacks.
-	// Segment 0 starts at origin (0,0,0) going in +Y.
-	// If switchback: segment 1 starts at (0, RunPerSeg, RisePerSeg) and goes in -Y direction,
-	// connected by a landing.
+	// Layout: switchback ramp with runs SIDE BY SIDE in plan view (not stacked vertically).
+	// Each segment offsets perpendicular (in X) so all runs have full headroom clearance.
+	// Run direction alternates in Y; lateral position steps in X for each segment.
+
+	const float LateralGap = Width + 30.0f; // 30cm gap between parallel runs for handrails (ADA 505.3)
 
 	// Bottom landing
 	{
-		FTransform LandXf(FRotator::ZeroRotator, FVector(0.0f, -LandingLen * 0.5f, LandingThick * 0.5f), FVector::OneVector);
+		FTransform LandXf(FRotator::ZeroRotator,
+			FVector(0.0f, -LandingLen * 0.5f, LandingThick * 0.5f),
+			FVector::OneVector);
 		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
 			Mesh, Opts, LandXf, Width, LandingLen, LandingThick, 0, 0, 0,
 			EGeometryScriptPrimitiveOriginMode::Center);
 	}
 
-	float CurrentZ = 0.0f;
-	float CurrentY = 0.0f;
-	int32 Direction = 1; // +1 = going in +Y, -1 = going in -Y
-
 	for (int32 Seg = 0; Seg < NumSegments; ++Seg)
 	{
-		float SegStartZ = CurrentZ;
-		float SegEndZ = CurrentZ + RisePerSeg;
-		float SegStartY = CurrentY;
-		float SegEndY = CurrentY + Direction * RunPerSeg;
+		float SegStartZ = RisePerSeg * Seg;
+		float SegEndZ = SegStartZ + RisePerSeg;
+
+		// Alternate direction: even segments go +Y, odd go -Y
+		int32 Direction = (Seg % 2 == 0) ? 1 : -1;
+
+		// Lateral offset: each segment shifts in +X
+		float LateralX = Seg * LateralGap;
+
+		// Y positions: all runs span the same Y range (0 to RunPerSeg)
+		float SegStartY = (Direction > 0) ? 0.0f : RunPerSeg;
+		float SegEndY = (Direction > 0) ? RunPerSeg : 0.0f;
 
 		// Ramp surface: a tilted box
 		float RampLen = FMath::Sqrt(FMath::Square(RunPerSeg) + FMath::Square(RisePerSeg));
 		float Angle = FMath::Atan2(RisePerSeg, RunPerSeg);
 		float AngleDeg = FMath::RadiansToDegrees(Angle);
 
-		// Pitch: rotation around right axis (X). Positive pitch = nose up.
-		// When going in +Y, we pitch up. When going in -Y, we pitch down.
 		float PitchDeg = (Direction > 0) ? -AngleDeg : AngleDeg;
 
-		FVector RampCenter(0.0f, (SegStartY + SegEndY) * 0.5f, (SegStartZ + SegEndZ) * 0.5f);
+		FVector RampCenter(LateralX, RunPerSeg * 0.5f, (SegStartZ + SegEndZ) * 0.5f);
 		FRotator RampRot(PitchDeg, (Direction > 0) ? 0.0f : 180.0f, 0.0f);
 		FTransform RampXf(RampRot, RampCenter, FVector::OneVector);
 
@@ -945,7 +978,7 @@ FMonolithActionResult FMonolithMeshArchFeatureActions::CreateRampConnector(const
 			const float HalfW = Width * 0.5f;
 			for (int32 Side = 0; Side < 2; ++Side)
 			{
-				float X = (Side == 0) ? -HalfW : HalfW;
+				float X = LateralX + ((Side == 0) ? -HalfW : HalfW);
 				TArray<FVector> RailPath;
 				RailPath.Add(FVector(X, SegStartY, SegStartZ + RampThick * 0.5f));
 				RailPath.Add(FVector(X, SegEndY, SegEndZ + RampThick * 0.5f));
@@ -957,47 +990,52 @@ FMonolithActionResult FMonolithMeshArchFeatureActions::CreateRampConnector(const
 			}
 		}
 
-		CurrentZ = SegEndZ;
-		CurrentY = SegEndY;
-
-		// Intermediate landing (between segments, not after the last one)
+		// 180-degree landing connecting this segment's end to the next segment's start
 		if (Seg < NumSegments - 1)
 		{
+			// Landing spans laterally from this run's end X to next run's start X
+			float ThisEndX = LateralX;
+			float NextStartX = (Seg + 1) * LateralGap;
+			float LandingCenterX = (ThisEndX + NextStartX) * 0.5f;
+			float LandingSpanX = NextStartX - ThisEndX + Width; // spans both run widths + gap
+
+			// Landing sits at the Y-end of the current segment
+			float LandingY = SegEndY;
+			float LandingZ = SegEndZ;
+
 			FTransform LandXf(FRotator::ZeroRotator,
-				FVector(0.0f, CurrentY, CurrentZ),
+				FVector(LandingCenterX, LandingY, LandingZ),
 				FVector::OneVector);
 			UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
-				Mesh, Opts, LandXf, Width, LandingLen, LandingThick, 0, 0, 0,
+				Mesh, Opts, LandXf, LandingSpanX, LandingLen, LandingThick, 0, 0, 0,
 				EGeometryScriptPrimitiveOriginMode::Center);
 
-			// Railings around the landing (three sides, not the side connecting to ramps)
+			// Landing railing on the far edge (perpendicular to run direction)
 			if (RailHeight > 0.0f)
 			{
-				const float HalfW = Width * 0.5f;
-				const float HalfL = LandingLen * 0.5f;
-				float LandZ = CurrentZ + LandingThick * 0.5f;
-
-				// Front edge (perpendicular to ramp direction)
-				float FrontY = CurrentY + Direction * HalfL;
+				float LandZ = LandingZ + LandingThick * 0.5f;
+				float FarY = LandingY + Direction * LandingLen * 0.5f;
 				TArray<FVector> FrontRail;
-				FrontRail.Add(FVector(-HalfW, FrontY, LandZ));
-				FrontRail.Add(FVector(HalfW, FrontY, LandZ));
+				FrontRail.Add(FVector(LandingCenterX - LandingSpanX * 0.5f, FarY, LandZ));
+				FrontRail.Add(FVector(LandingCenterX + LandingSpanX * 0.5f, FarY, LandZ));
 
 				BuildRailingGeometry(Mesh, FrontRail, RailHeight, RailStyle,
 					/*PostSpacing=*/100.0f, /*PostWidth=*/4.0f, /*RailWidth=*/5.0f,
 					/*BarSpacing=*/12.0f, /*BarWidth=*/2.0f, /*PanelThick=*/3.0f,
 					/*bClosedLoop=*/false);
 			}
-
-			// Switch direction for next segment
-			Direction = -Direction;
 		}
 	}
 
-	// Top landing
+	// Top landing (at the end of the last segment)
 	{
+		int32 LastDir = ((NumSegments - 1) % 2 == 0) ? 1 : -1;
+		float TopLandingX = (NumSegments - 1) * LateralGap;
+		float TopLandingY = (LastDir > 0) ? RunPerSeg : 0.0f;
+		float TopLandingZ = Rise;
+
 		FTransform LandXf(FRotator::ZeroRotator,
-			FVector(0.0f, CurrentY, CurrentZ),
+			FVector(TopLandingX, TopLandingY, TopLandingZ),
 			FVector::OneVector);
 		UGeometryScriptLibrary_MeshPrimitiveFunctions::AppendBox(
 			Mesh, Opts, LandXf, Width, LandingLen, LandingThick, 0, 0, 0,
@@ -1009,18 +1047,20 @@ FMonolithActionResult FMonolithMeshArchFeatureActions::CreateRampConnector(const
 
 	int32 TriCount = Mesh->GetTriangleCount();
 
-	// Compute total run length
-	float TotalRun = RunPerSeg * NumSegments;
-	float TotalLandingLength = (NumSegments > 1) ? LandingLen * (NumSegments - 1) : 0.0f;
+	// Compute footprint: runs are side-by-side, not end-to-end
+	float FootprintY = RunPerSeg + LandingLen; // single run length + landing overhang
+	float FootprintX = (NumSegments > 1) ? (NumSegments - 1) * LateralGap + Width : Width;
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("type"), TEXT("ramp_connector"));
 	Result->SetNumberField(TEXT("rise"), Rise);
-	Result->SetNumberField(TEXT("total_run"), TotalRun);
+	Result->SetNumberField(TEXT("run_per_segment"), RunPerSeg);
 	Result->SetNumberField(TEXT("segments"), NumSegments);
 	Result->SetNumberField(TEXT("slope_ratio"), SlopeRatio);
 	Result->SetNumberField(TEXT("width"), Width);
-	Result->SetNumberField(TEXT("total_length"), TotalRun + TotalLandingLength + LandingLen * 2.0f);
+	Result->SetNumberField(TEXT("lateral_gap"), LateralGap);
+	Result->SetNumberField(TEXT("footprint_x"), FootprintX);
+	Result->SetNumberField(TEXT("footprint_y"), FootprintY);
 	Result->SetBoolField(TEXT("ada_compliant"), SlopeRatio <= (1.0f / 12.0f) + 0.001f);
 	Result->SetNumberField(TEXT("triangle_count"), TriCount);
 
