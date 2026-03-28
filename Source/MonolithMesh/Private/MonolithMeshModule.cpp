@@ -27,6 +27,7 @@
 #if WITH_GEOMETRYSCRIPT
 #include "MonolithMeshOperationActions.h"
 #include "MonolithMeshProceduralActions.h"
+#include "MonolithMeshBuildingActions.h"
 #include "MonolithMeshHandlePool.h"
 #endif
 
@@ -69,6 +70,8 @@ void FMonolithMeshModule::StartupModule()
 	FMonolithMeshOperationActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshProceduralActions::SetHandlePool(HandlePool);
 	FMonolithMeshProceduralActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshBuildingActions::SetHandlePool(HandlePool);
+	FMonolithMeshBuildingActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshTechArtActions::SetHandlePool(HandlePool);
 
 	// Clean up handle pool on PreExit — before GC destroys UObjects.
@@ -81,6 +84,7 @@ void FMonolithMeshModule::StartupModule()
 			HandlePool->RemoveFromRoot();
 			FMonolithMeshOperationActions::SetHandlePool(nullptr);
 			FMonolithMeshProceduralActions::SetHandlePool(nullptr);
+			FMonolithMeshBuildingActions::SetHandlePool(nullptr);
 			FMonolithMeshTechArtActions::SetHandlePool(nullptr);
 			HandlePool = nullptr;
 		}

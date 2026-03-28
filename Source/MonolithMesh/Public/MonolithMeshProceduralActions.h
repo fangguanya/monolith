@@ -26,6 +26,17 @@ public:
 	/** Set the handle pool instance (called during module startup) */
 	static void SetHandlePool(UMonolithMeshHandlePool* InPool);
 
+	// ---- Shared helpers (public for cross-module use, e.g. FMonolithMeshBuildingActions) ----
+
+	/** Optionally save the built mesh to a UStaticMesh asset. Returns save_path in result. */
+	static bool SaveMeshToAsset(UDynamicMesh* Mesh, const FString& SavePath, bool bOverwrite, FString& OutError);
+
+	/** Optionally place a StaticMesh actor in the scene */
+	static AActor* PlaceMeshInScene(const FString& AssetPath, const FVector& Location, const FRotator& Rotation, const FString& Label, bool bSnapToFloor = true, const FString& Folder = TEXT(""));
+
+	/** Apply final cleanup: SelfUnion (additive-only) or ComputeSplitNormals (post-boolean) */
+	static void CleanupMesh(UDynamicMesh* Mesh, bool bHadBooleans);
+
 private:
 	static UMonolithMeshHandlePool* Pool;
 
@@ -72,15 +83,7 @@ private:
 	static bool BuildBrokenWall(UDynamicMesh* Mesh, float Width, float Height, float Thickness, float NoiseScale, float HoleRadius, int32 Seed, FString& OutError);
 	static bool BuildVentGrate(UDynamicMesh* Mesh, float Width, float Height, float Depth, int32 SlotCount, float FrameThickness, FString& OutError);
 
-	// ---- Shared helpers ----
-	/** Optionally save the built mesh to a UStaticMesh asset. Returns save_path in result. */
-	static bool SaveMeshToAsset(UDynamicMesh* Mesh, const FString& SavePath, bool bOverwrite, FString& OutError);
-
-	/** Optionally place a StaticMesh actor in the scene */
-	static AActor* PlaceMeshInScene(const FString& AssetPath, const FVector& Location, const FRotator& Rotation, const FString& Label, bool bSnapToFloor = true, const FString& Folder = TEXT(""));
-
-	/** Apply final cleanup: SelfUnion (additive-only) or ComputeSplitNormals (post-boolean) */
-	static void CleanupMesh(UDynamicMesh* Mesh, bool bHadBooleans);
+	// ---- Shared helpers (private) ----
 
 	/** Parse a "dimensions" sub-object, filling defaults from the provided values */
 	static void ParseDimensions(const TSharedPtr<FJsonObject>& Params, float& Width, float& Depth, float& Height,
