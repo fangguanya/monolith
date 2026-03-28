@@ -881,7 +881,7 @@ void FMonolithMeshFloorPlanGenerator::InsertCorridors(
 	CorridorRoom.RoomId = TEXT("corridor");
 	CorridorRoom.RoomType = TEXT("corridor");
 
-	int32 CorridorWidth = bHospiceMode ? 4 : 2;  // 4 cells * 50cm = 200cm > 180cm min; 2 cells = 100cm normal
+	int32 CorridorWidth = bHospiceMode ? 4 : 3;  // 4 cells * 50cm = 200cm hospice; 3 cells * 50cm = 150cm normal (84cm capsule + 33cm clearance/side)
 
 	// Carve corridors for each pair
 	for (const auto& Pair : NeedsCorridor)
@@ -1094,7 +1094,7 @@ TArray<FDoorDef> FMonolithMeshFloorPlanGenerator::PlaceDoors(
 	};
 
 	int32 DoorCounter = 0;
-	float DoorWidth = bHospiceMode ? 100.0f : 90.0f;
+	float DoorWidth = bHospiceMode ? 120.0f : 110.0f;  // 110cm normal (84cm capsule + 13cm/side); 120cm hospice (18cm/side for wheelchair)
 
 	// Place doors for each adjacency rule
 	for (const FAdjacencyRule& Rule : Adjacency)
@@ -1270,6 +1270,295 @@ TArray<FDoorDef> FMonolithMeshFloorPlanGenerator::PlaceDoors(
 	}
 
 	return Doors;
+}
+
+// ============================================================================
+// Exterior Entrance Guarantee
+// ============================================================================
+
+static void EnsureExteriorEntrance(const TArray<TArray<int32>>& Grid, int32 GridW, int32 GridH,
+	const TArray<FRoomDef>& Rooms, TArray<FDoorDef>& Doors, bool bHospiceMode, FRandomStream& Rng)
+{
+	// 1. Check if any existing door already connects to exterior
+	for (const FDoorDef& D : Doors)
+	{
+		if (D.RoomB == TEXT("exterior") || D.RoomA == TEXT("exterior"))
+		{
+			return;  // Already have an exterior entrance
+		}
+	}
+
+	// 2. Find rooms that touch the building perimeter
+	TArray<int32> PerimeterRoomIndices;
+	for (int32 RoomIdx = 0; RoomIdx < Rooms.Num(); ++RoomIdx)
+	{
+		if (Rooms[RoomIdx].RoomType == TEXT("corridor")) continue;  // Prefer non-corridor rooms
+
+		for (const FIntPoint& Cell : Rooms[RoomIdx].GridCells)
+		{
+			if (Cell.X == 0 || Cell.X == GridW - 1 || Cell.Y == 0 || Cell.Y == GridH - 1)
+			{
+				PerimeterRoomIndices.AddUnique(RoomIdx);
+				break;
+			}
+		}
+	}
+
+	if (PerimeterRoomIndices.IsEmpty())
+	{
+		// Fallback: try corridors too
+		for (int32 RoomIdx = 0; RoomIdx < Rooms.Num(); ++RoomIdx)
+		{
+			for (const FIntPoint& Cell : Rooms[RoomIdx].GridCells)
+			{
+				if (Cell.X == 0 || Cell.X == GridW - 1 || Cell.Y == 0 || Cell.Y == GridH - 1)
+				{
+					PerimeterRoomIndices.AddUnique(RoomIdx);
+					break;
+				}
+			}
+		}
+	}
+
+	if (PerimeterRoomIndices.IsEmpty())
+	{
+		UE_LOG(LogMonolithFloorPlan, Warning, TEXT("EnsureExteriorEntrance: no rooms touch building perimeter -- cannot place entrance"));
+		return;
+	}
+
+	// 3. Prefer entryway, lobby, foyer, reception types
+	int32 BestRoomIdx = -1;
+	static const TArray<FString> PreferredTypes = { TEXT("entryway"), TEXT("lobby"), TEXT("foyer"), TEXT("reception") };
+	for (int32 Idx : PerimeterRoomIndices)
+	{
+		if (PreferredTypes.Contains(Rooms[Idx].RoomType))
+		{
+			BestRoomIdx = Idx;
+			break;
+		}
+	}
+
+	// 4. Fallback: largest perimeter room
+	if (BestRoomIdx < 0)
+	{
+		int32 MaxCells = 0;
+		for (int32 Idx : PerimeterRoomIndices)
+		{
+			if (Rooms[Idx].GridCells.Num() > MaxCells)
+			{
+				MaxCells = Rooms[Idx].GridCells.Num();
+				BestRoomIdx = Idx;
+			}
+		}
+	}
+
+	if (BestRoomIdx < 0) return;
+
+	// 5. Find best perimeter cell -- prefer SOUTH edge (building fronts face south per project convention)
+	//    Grid convention: Y==0 is south edge, Y==GridH-1 is north edge
+	FIntPoint BestCell(-1, -1);
+	FString BestWall;
+	int32 BestPriority = 0;  // Higher = better. South=4, East=3, West=2, North=1
+
+	for (const FIntPoint& Cell : Rooms[BestRoomIdx].GridCells)
+	{
+		// South edge (Y == 0) — highest priority
+		if (Cell.Y == 0 && BestPriority < 4)
+		{
+			BestCell = Cell;
+			BestWall = TEXT("south");
+			BestPriority = 4;
+		}
+		// East edge (X == GridW - 1)
+		if (Cell.X == GridW - 1 && BestPriority < 3)
+		{
+			BestCell = Cell;
+			BestWall = TEXT("east");
+			BestPriority = 3;
+		}
+		// West edge (X == 0)
+		if (Cell.X == 0 && BestPriority < 2)
+		{
+			BestCell = Cell;
+			BestWall = TEXT("west");
+			BestPriority = 2;
+		}
+		// North edge (Y == GridH - 1) — lowest priority
+		if (Cell.Y == GridH - 1 && BestPriority < 1)
+		{
+			BestCell = Cell;
+			BestWall = TEXT("north");
+			BestPriority = 1;
+		}
+	}
+
+	if (BestCell.X < 0)
+	{
+		UE_LOG(LogMonolithFloorPlan, Warning, TEXT("EnsureExteriorEntrance: could not find perimeter cell on room '%s'"), *Rooms[BestRoomIdx].RoomId);
+		return;
+	}
+
+	// 6. Try to find a run of perimeter cells on the same wall for a wider entrance placement
+	//    Pick the midpoint of the run that includes BestCell
+	TArray<FIntPoint> SameWallCells;
+	for (const FIntPoint& Cell : Rooms[BestRoomIdx].GridCells)
+	{
+		bool bOnSameWall = false;
+		if (BestWall == TEXT("south") && Cell.Y == 0) bOnSameWall = true;
+		else if (BestWall == TEXT("north") && Cell.Y == GridH - 1) bOnSameWall = true;
+		else if (BestWall == TEXT("east") && Cell.X == GridW - 1) bOnSameWall = true;
+		else if (BestWall == TEXT("west") && Cell.X == 0) bOnSameWall = true;
+
+		if (bOnSameWall) SameWallCells.Add(Cell);
+	}
+
+	// Sort by the axis parallel to the wall and pick the midpoint
+	if (SameWallCells.Num() > 1)
+	{
+		if (BestWall == TEXT("south") || BestWall == TEXT("north"))
+		{
+			SameWallCells.Sort([](const FIntPoint& A, const FIntPoint& B) { return A.X < B.X; });
+		}
+		else
+		{
+			SameWallCells.Sort([](const FIntPoint& A, const FIntPoint& B) { return A.Y < B.Y; });
+		}
+		BestCell = SameWallCells[SameWallCells.Num() / 2];
+	}
+
+	// 7. Create exterior entrance door
+	FDoorDef EntDoor;
+	EntDoor.DoorId = TEXT("entrance_01");
+	EntDoor.RoomA = Rooms[BestRoomIdx].RoomId;
+	EntDoor.RoomB = TEXT("exterior");
+	EntDoor.EdgeStart = BestCell;
+	EntDoor.EdgeEnd = BestCell;
+	EntDoor.Wall = BestWall;
+	EntDoor.Width = bHospiceMode ? 120.0f : 110.0f;   // Exterior entrance matches interior width minimum
+	EntDoor.Height = 240.0f;   // Taller exterior entrance
+	EntDoor.bTraversable = true;
+
+	Doors.Add(MoveTemp(EntDoor));
+
+	UE_LOG(LogMonolithFloorPlan, Log, TEXT("Placed exterior entrance: room='%s', wall=%s, cell=(%d,%d)"),
+		*Rooms[BestRoomIdx].RoomId, *BestWall, BestCell.X, BestCell.Y);
+}
+
+// ============================================================================
+// Door Clearance Validation
+// ============================================================================
+
+static void ValidateDoorClearances(const TArray<TArray<int32>>& Grid, int32 GridW, int32 GridH,
+	const TArray<FRoomDef>& Rooms, TArray<FDoorDef>& Doors, float CellSize)
+{
+	// Player capsule: 42cm radius, 84cm diameter (Leviathan / Game Animation Sample character)
+	constexpr float CapsuleDiameter = 84.0f;
+	constexpr float MinClearanceBuffer = 26.0f;  // 13cm per side for comfortable diagonal approach
+	const float MinDoorWidth = CapsuleDiameter + MinClearanceBuffer;  // 110cm
+	const float MinDepthCells = 2.0f;  // At least 2 cells (100cm) depth adjacent to door for passage
+
+	int32 WarningCount = 0;
+
+	for (FDoorDef& Door : Doors)
+	{
+		// 1. Width check -- auto-widen if below minimum
+		if (Door.Width < MinDoorWidth && Door.bTraversable)
+		{
+			UE_LOG(LogMonolithFloorPlan, Warning,
+				TEXT("Door '%s' width %.0fcm < minimum %.0fcm for player capsule (84cm diameter + 26cm buffer). Widening."),
+				*Door.DoorId, Door.Width, MinDoorWidth);
+			Door.Width = MinDoorWidth;
+			++WarningCount;
+		}
+
+		// 2. Check rooms on both sides have enough depth adjacent to the door
+		//    "Depth" = cells in the direction perpendicular to the door wall
+		if (Door.RoomB == TEXT("exterior")) continue;  // Skip exterior doors for depth check
+
+		auto CheckRoomDepthAtDoor = [&](const FString& RoomId, const FIntPoint& DoorEdge) -> bool
+		{
+			// Find the room
+			const FRoomDef* Room = nullptr;
+			for (const FRoomDef& R : Rooms)
+			{
+				if (R.RoomId == RoomId)
+				{
+					Room = &R;
+					break;
+				}
+			}
+			if (!Room) return true;  // Can't validate, assume OK
+
+			// Count cells adjacent to door in perpendicular direction
+			int32 DepthCount = 0;
+			if (Door.Wall == TEXT("north") || Door.Wall == TEXT("south"))
+			{
+				// Door on N/S wall -- check depth in Y direction from door cell
+				int32 DY = (Door.Wall == TEXT("south")) ? 1 : -1;
+				for (int32 Step = 0; Step < GridH; ++Step)
+				{
+					int32 CheckY = DoorEdge.Y + DY * Step;
+					if (CheckY < 0 || CheckY >= GridH) break;
+					if (Grid[CheckY][DoorEdge.X] < 0) break;
+
+					// Check this cell belongs to the room
+					bool bInRoom = false;
+					for (const FIntPoint& C : Room->GridCells)
+					{
+						if (C.X == DoorEdge.X && C.Y == CheckY) { bInRoom = true; break; }
+					}
+					if (!bInRoom) break;
+					++DepthCount;
+				}
+			}
+			else
+			{
+				// Door on E/W wall -- check depth in X direction
+				int32 DX = (Door.Wall == TEXT("west")) ? 1 : -1;
+				for (int32 Step = 0; Step < GridW; ++Step)
+				{
+					int32 CheckX = DoorEdge.X + DX * Step;
+					if (CheckX < 0 || CheckX >= GridW) break;
+					if (Grid[DoorEdge.Y][CheckX] < 0) break;
+
+					bool bInRoom = false;
+					for (const FIntPoint& C : Room->GridCells)
+					{
+						if (C.X == CheckX && C.Y == DoorEdge.Y) { bInRoom = true; break; }
+					}
+					if (!bInRoom) break;
+					++DepthCount;
+				}
+			}
+
+			return DepthCount >= static_cast<int32>(MinDepthCells);
+		};
+
+		if (!CheckRoomDepthAtDoor(Door.RoomA, Door.EdgeStart))
+		{
+			UE_LOG(LogMonolithFloorPlan, Warning,
+				TEXT("Door '%s': room '%s' has insufficient depth (< %.0fcm) adjacent to door for player passage"),
+				*Door.DoorId, *Door.RoomA, MinDepthCells * CellSize);
+			++WarningCount;
+		}
+
+		if (!CheckRoomDepthAtDoor(Door.RoomB, Door.EdgeEnd))
+		{
+			UE_LOG(LogMonolithFloorPlan, Warning,
+				TEXT("Door '%s': room '%s' has insufficient depth (< %.0fcm) adjacent to door for player passage"),
+				*Door.DoorId, *Door.RoomB, MinDepthCells * CellSize);
+			++WarningCount;
+		}
+	}
+
+	if (WarningCount > 0)
+	{
+		UE_LOG(LogMonolithFloorPlan, Warning, TEXT("Door clearance validation: %d warning(s) across %d doors"), WarningCount, Doors.Num());
+	}
+	else
+	{
+		UE_LOG(LogMonolithFloorPlan, Log, TEXT("Door clearance validation: all %d doors passed"), Doors.Num());
+	}
 }
 
 // ============================================================================
@@ -1474,6 +1763,12 @@ FMonolithActionResult FMonolithMeshFloorPlanGenerator::GenerateFloorPlan(const T
 	// ---- Place doors ----
 	TArray<FDoorDef> Doors = PlaceDoors(Grid, GridW, GridH, Rooms, Archetype.Adjacency, bHospiceMode, Rng);
 
+	// ---- Ensure exterior entrance exists ----
+	EnsureExteriorEntrance(Grid, GridW, GridH, Rooms, Doors, bHospiceMode, Rng);
+
+	// ---- Validate door clearances ----
+	ValidateDoorClearances(Grid, GridW, GridH, Rooms, Doors, CellSize);
+
 	// ---- Build output ----
 	TSharedPtr<FJsonObject> ResultJson = BuildOutputJson(
 		Grid, GridW, GridH, Rooms, Doors,
@@ -1483,6 +1778,29 @@ FMonolithActionResult FMonolithMeshFloorPlanGenerator::GenerateFloorPlan(const T
 	ResultJson->SetNumberField(TEXT("seed"), Seed);
 	ResultJson->SetNumberField(TEXT("floor_index"), FloorIndex);
 	ResultJson->SetNumberField(TEXT("floor_height"), Archetype.FloorHeight);
+
+	// ---- Entrance info ----
+	{
+		const FDoorDef* EntranceDoor = nullptr;
+		for (const FDoorDef& D : Doors)
+		{
+			if (D.RoomB == TEXT("exterior") || D.RoomA == TEXT("exterior"))
+			{
+				EntranceDoor = &D;
+				break;
+			}
+		}
+
+		ResultJson->SetBoolField(TEXT("has_exterior_entrance"), EntranceDoor != nullptr);
+		if (EntranceDoor)
+		{
+			ResultJson->SetStringField(TEXT("entrance_door_id"), EntranceDoor->DoorId);
+			ResultJson->SetStringField(TEXT("entrance_wall"), EntranceDoor->Wall);
+			// entrance_room = whichever side is not "exterior"
+			FString EntranceRoom = (EntranceDoor->RoomA == TEXT("exterior")) ? EntranceDoor->RoomB : EntranceDoor->RoomA;
+			ResultJson->SetStringField(TEXT("entrance_room"), EntranceRoom);
+		}
+	}
 
 	// Include material hints if present
 	if (!Archetype.MaterialHints.Exterior.IsEmpty() || !Archetype.MaterialHints.Interior.IsEmpty() || !Archetype.MaterialHints.FloorMaterial.IsEmpty())
