@@ -47,13 +47,23 @@ bool FMeshCatalogIndexer::IndexAsset(const FAssetData& AssetData, UObject* Loade
 		DeleteStmt.Execute();
 	}
 
-	// Enumerate all StaticMesh assets via Asset Registry
+	// Enumerate all StaticMesh assets via Asset Registry across all indexed paths
 	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 	TArray<FAssetData> MeshAssets;
 	{
 		FARFilter Filter;
 		Filter.ClassPaths.Add(UStaticMesh::StaticClass()->GetClassPathName());
-		Filter.PackagePaths.Add(FName(TEXT("/Game")));
+		if (IndexedPaths.Num() > 0)
+		{
+			for (const FName& Path : IndexedPaths)
+			{
+				Filter.PackagePaths.Add(Path);
+			}
+		}
+		else
+		{
+			Filter.PackagePaths.Add(FName(TEXT("/Game")));
+		}
 		Filter.bRecursivePaths = true;
 		AssetRegistry.GetAssets(Filter, MeshAssets);
 	}
@@ -119,7 +129,20 @@ bool FMeshCatalogIndexer::IndexAsset(const FAssetData& AssetData, UObject* Loade
 		FString Category;
 		{
 			FString Folder = FPaths::GetPath(Path);
-			Folder.RemoveFromStart(TEXT("/Game/"));
+			// Strip known mount roots (/Game/, /PluginName/) to get relative content path
+			if (!Folder.RemoveFromStart(TEXT("/Game/")))
+			{
+				// Plugin path: strip leading /PluginName/ (first two segments)
+				if (Folder.StartsWith(TEXT("/")))
+				{
+					Folder.RemoveFromStart(TEXT("/"));
+					int32 SlashIdx;
+					if (Folder.FindChar(TEXT('/'), SlashIdx))
+					{
+						Folder.RightChopInline(SlashIdx + 1);
+					}
+				}
+			}
 			TArray<FString> Parts;
 			Folder.ParseIntoArray(Parts, TEXT("/"));
 			if (Parts.Num() >= 2)

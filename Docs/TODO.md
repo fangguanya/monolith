@@ -263,6 +263,12 @@ The mesh module ships horror defaults (storytelling patterns, room templates, ac
 
 - [ ] **Mac/Linux support** — DEFERRED (Windows-only project). All build-related actions are `#if PLATFORM_WINDOWS` guarded. Live Coding is Windows-only. Update system is Windows-only.
 
+### MonolithIndex — Incremental Indexer Remaining Work
+
+- [ ] **Implement IndexScoped() for individual sentinels** — DependencyIndexer, AnimationIndexer, and other sentinels currently fall back to per-asset `IndexAsset()`. Implement proper `IndexScoped()` for batch efficiency.
+- [ ] **Batched frame-budget deep indexing for >10 assets** — When more than 10 assets need deep indexing, spread work across frames with a per-frame time budget to avoid hitches.
+- [ ] **External file deletion detection (FDirectoryWatcherModule)** — AR callbacks don't fire for files deleted outside the editor. Hook `FDirectoryWatcherModule` to detect and reconcile external deletions.
+
 ### Niagara Module — Improvements
 
 - [ ] **`FindEmitterHandleIndex` should accept numeric index** — `list_emitters` returns `"index"` for each emitter. Allow passing `"0"`, `"1"` etc. as emitter identifier for convenient fallback.
@@ -429,3 +435,8 @@ Priority features identified for future waves:
 - [x] **Offline CLI (`monolith_offline.py`)** — IMPLEMENTED (2026-03-13). Pure Python (stdlib only) CLI that queries `EngineSource.db` and `ProjectIndex.db` directly without the editor running. 14 actions across 2 namespaces: `source` (9 actions, mirrors `source_query`) and `project` (5 actions, mirrors `project_query`). Read-only, zero footprint, zero dependencies. Fallback for when MCP/editor is unavailable. Location: `Saved/monolith_offline.py`.
 - [x] **NEW: MonolithUI module** — IMPLEMENTED (2026-03-22). New module at `Source/MonolithUI/`. 42 actions in `ui` namespace (`ui_query` tool). 8 action classes: FMonolithUIActions (7), FMonolithUISlotActions (3), FMonolithUITemplateActions (8), FMonolithUIStylingActions (6), FMonolithUIAnimationActions (5), FMonolithUIBindingActions (4), FMonolithUISettingsActions (5), FMonolithUIAccessibilityActions (4).
 - [x] **NEW: MonolithMesh module** — IMPLEMENTED (2026-03-27). New module at `Source/MonolithMesh/`. 46 actions in `mesh` namespace (`mesh_query` tool). 4 action classes: FMonolithMeshInspectionActions (12), FMonolithMeshSceneActions (8), FMonolithMeshSpatialActions (11), FMonolithMeshBlockoutActions (15). MeshCatalogIndexer added to MonolithIndex.
+- [x] **Incremental indexer (3-layer architecture)** — IMPLEMENTED (2026-03-28). Startup hash-based delta engine, live AR callbacks on 2s timer, forced full reindex fallback. <1s startup with no changes, ~14K assets hashed in ~20ms.
+- [x] **Schema v2 migration** — IMPLEMENTED (2026-03-28). Added `saved_hash` column (Blake3 FIoHash hex) to assets table, `schema_version` meta key. Auto-migrates via `PRAGMA table_info` check + `ALTER TABLE`.
+- [x] **Live AR callbacks** — IMPLEMENTED (2026-03-28). Batched Asset Registry delegates (OnAssetsAdded, OnAssetsRemoved, OnAssetRenamed, OnAssetsUpdatedOnDisk) drained on 2s timer with dedup and transactional apply.
+- [x] **Plugin content scope fix (bInstalled filter)** — FIXED (2026-03-28). Replaced `bInstalled` filter with explicit path enumeration. DrawCallReducer and NiagaraDestructionDriver now indexed. MeshCatalogIndexer paths corrected.
+- [x] **MCP reindex action (incremental default + force param)** — IMPLEMENTED (2026-03-28). `monolith_reindex()` defaults to incremental mode; `force=true` triggers full wipe-and-rebuild.

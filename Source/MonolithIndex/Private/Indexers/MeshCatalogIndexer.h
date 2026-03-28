@@ -19,4 +19,11 @@ public:
 
 	virtual bool IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId) override;
 	virtual FString GetName() const override { return TEXT("MeshCatalogIndexer"); }
+	virtual bool IsSentinel() const override { return true; }
+
+	/** Set the content root paths to scan (e.g. /Game, /PluginName). */
+	void SetIndexedPaths(const TArray<FName>& InPaths) { IndexedPaths = InPaths; }
+
+private:
+	TArray<FName> IndexedPaths;
 };
