@@ -335,7 +335,10 @@ TArray<FMonolithMeshBuildingActions::FWallSegment> FMonolithMeshBuildingActions:
 			int32 RightId = GetCell(X, Y);
 
 			bool bNeedWall = (LeftId != RightId);
-			bool bIsDoor = bNeedWall && IsDoorEdge(X, Y, true, Doors);
+			// Don't break wall segments at door cells — let boolean cutter handle doors entirely.
+			// Breaking here creates cell-aligned segment boundaries that don't match Door.Width,
+			// producing 20cm wall stubs on both sides of every door opening.
+			bool bIsDoor = false;
 
 			// Also suppress wall if both sides are empty
 			if (LeftId == -1 && RightId == -1) bNeedWall = false;
@@ -402,7 +405,8 @@ TArray<FMonolithMeshBuildingActions::FWallSegment> FMonolithMeshBuildingActions:
 			int32 BottomId = GetCell(X, Y);
 
 			bool bNeedWall = (TopId != BottomId);
-			bool bIsDoor = bNeedWall && IsDoorEdge(Y, X, false, Doors);
+			// Don't break wall segments at door cells — boolean cutter handles doors.
+			bool bIsDoor = false;
 
 			if (TopId == -1 && BottomId == -1) bNeedWall = false;
 
