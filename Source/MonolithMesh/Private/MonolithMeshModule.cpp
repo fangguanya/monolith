@@ -24,6 +24,7 @@
 #include "MonolithMeshAutoVolumeActions.h"
 #include "MonolithMeshFurnishingActions.h"
 #include "MonolithMeshDebugViewActions.h"
+#include "MonolithMeshBuildingValidationActions.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
@@ -76,6 +77,7 @@ void FMonolithMeshModule::StartupModule()
 	FMonolithMeshAutoVolumeActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshFurnishingActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshDebugViewActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshBuildingValidationActions::RegisterActions(FMonolithToolRegistry::Get());
 
 #if WITH_GEOMETRYSCRIPT
 	HandlePool = NewObject<UMonolithMeshHandlePool>();
