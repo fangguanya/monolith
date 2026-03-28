@@ -10,6 +10,8 @@
 #include "MonolithMeshDecalActions.h"
 #include "MonolithMeshAudioActions.h"
 #include "MonolithMeshTemplateActions.h"
+#include "MonolithMeshLevelDesignActions.h"
+#include "MonolithMeshVolumeActions.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
@@ -41,6 +43,8 @@ void FMonolithMeshModule::StartupModule()
 	FMonolithMeshDecalActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshAudioActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshTemplateActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshLevelDesignActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshVolumeActions::RegisterActions(FMonolithToolRegistry::Get());
 
 #if WITH_GEOMETRYSCRIPT
 	HandlePool = NewObject<UMonolithMeshHandlePool>();
