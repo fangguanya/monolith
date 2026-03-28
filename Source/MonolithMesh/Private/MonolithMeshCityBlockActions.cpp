@@ -73,6 +73,9 @@ void FMonolithMeshCityBlockActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Optional(TEXT("skip_furniture"), TEXT("boolean"), TEXT("Skip street furniture"), TEXT("false"))
 			.Optional(TEXT("skip_validation"), TEXT("boolean"), TEXT("Skip post-generation validation for faster iteration"), TEXT("false"))
 			.Optional(TEXT("validate_and_retry"), TEXT("boolean"), TEXT("Retry buildings that fail validation (score < 0.5) with different seeds, max 2 retries"), TEXT("false"))
+			.Optional(TEXT("skip_furnishing"), TEXT("boolean"), TEXT("Skip interior furnishing"), TEXT("false"))
+			.Optional(TEXT("skip_volumes"), TEXT("boolean"), TEXT("Skip navmesh/audio volume generation"), TEXT("false"))
+			.Optional(TEXT("use_templates"), TEXT("boolean"), TEXT("Use template-based floor plans when available (false = algorithmic treemap only)"), TEXT("true"))
 			.Build());
 
 	// 2. create_lot_layout — standalone subdivision
@@ -241,7 +244,8 @@ TArray<FString> FMonolithMeshCityBlockActions::GetGenreArchetypes(const FString&
 
 	if (Genre == TEXT("suburban"))
 	{
-		TArray<FString> ArchPool = { TEXT("residential_house"), TEXT("residential_house"), TEXT("residential_house"), TEXT("garage") };
+		// suburban: mostly residential, small_house for variety (warehouse replaces non-existent garage)
+		TArray<FString> ArchPool = { TEXT("residential_house"), TEXT("residential_house"), TEXT("small_house"), TEXT("residential_house") };
 		for (int32 i = 0; i < BuildingCount; ++i)
 		{
 			Archetypes.Add(ArchPool[Rng.RandRange(0, ArchPool.Num() - 1)]);
@@ -249,7 +253,8 @@ TArray<FString> FMonolithMeshCityBlockActions::GetGenreArchetypes(const FString&
 	}
 	else if (Genre == TEXT("downtown"))
 	{
-		TArray<FString> ArchPool = { TEXT("commercial_shop"), TEXT("commercial_shop"), TEXT("office_small"), TEXT("apartment") };
+		// downtown: commercial mix (restaurant replaces commercial_shop, office_building replaces office_small)
+		TArray<FString> ArchPool = { TEXT("restaurant"), TEXT("office_building"), TEXT("apartment"), TEXT("warehouse") };
 		for (int32 i = 0; i < BuildingCount; ++i)
 		{
 			Archetypes.Add(ArchPool[Rng.RandRange(0, ArchPool.Num() - 1)]);
@@ -257,8 +262,8 @@ TArray<FString> FMonolithMeshCityBlockActions::GetGenreArchetypes(const FString&
 	}
 	else // "horror" or default
 	{
-		// Mix of residential + one commercial for variety
-		TArray<FString> ArchPool = { TEXT("residential_house"), TEXT("residential_house"), TEXT("commercial_shop"), TEXT("residential_house") };
+		// Mix of residential + restaurant for variety (restaurant replaces non-existent commercial_shop)
+		TArray<FString> ArchPool = { TEXT("residential_house"), TEXT("residential_house"), TEXT("restaurant"), TEXT("small_house") };
 		for (int32 i = 0; i < BuildingCount; ++i)
 		{
 			Archetypes.Add(ArchPool[Rng.RandRange(0, ArchPool.Num() - 1)]);
@@ -1220,6 +1225,12 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 		? Params->GetBoolField(TEXT("skip_validation")) : false;
 	const bool bValidateAndRetry = Params->HasField(TEXT("validate_and_retry"))
 		? Params->GetBoolField(TEXT("validate_and_retry")) : false;
+	const bool bSkipFurnishing = Params->HasField(TEXT("skip_furnishing"))
+		? Params->GetBoolField(TEXT("skip_furnishing")) : false;
+	const bool bSkipVolumes = Params->HasField(TEXT("skip_volumes"))
+		? Params->GetBoolField(TEXT("skip_volumes")) : false;
+	const bool bUseTemplates = Params->HasField(TEXT("use_templates"))
+		? Params->GetBoolField(TEXT("use_templates")) : true;
 
 	FVector BlockOrigin = FVector::ZeroVector;
 	MonolithMeshUtils::ParseVector(Params, TEXT("location"), BlockOrigin);
@@ -1333,6 +1344,24 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 		if (bHospiceMode)
 		{
 			FloorPlanParams->SetBoolField(TEXT("hospice_mode"), true);
+		}
+
+		// Fix #2: Pass horror_level so floor plan generator can apply horror modifiers
+		if (Decay > 0.0f)
+		{
+			FloorPlanParams->SetNumberField(TEXT("horror_level"), Decay);
+		}
+
+		// Fix #8: Pass use_templates flag through to floor plan generator
+		if (!bUseTemplates)
+		{
+			FloorPlanParams->SetBoolField(TEXT("use_templates"), false);
+		}
+
+		// Fix #9: When genre is horror, hint the template system to prefer horror-category templates
+		if (Genre == TEXT("horror"))
+		{
+			FloorPlanParams->SetStringField(TEXT("template_category"), TEXT("horror"));
 		}
 
 		TSharedPtr<FJsonObject> FloorPlanResult;
@@ -1462,6 +1491,31 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 		{
 			BuildingGridParams->SetStringField(TEXT("facade_style"), BlockFacadeStyle);
 			BuildingGridParams->SetNumberField(TEXT("facade_seed"), Seed + i * 31);
+		}
+
+		// Fix #3: Transfer decay metadata from BuildingMeta to BuildingGridParams
+		// Transfer decay metadata (BuildingMeta is always valid — it's a TSharedRef from MakeShared)
+		{
+			if (BuildingMeta->HasField(TEXT("decay_level")))
+			{
+				BuildingGridParams->SetNumberField(TEXT("decay_level"),
+					BuildingMeta->GetNumberField(TEXT("decay_level")));
+			}
+			if (BuildingMeta->HasField(TEXT("tilt_pitch")))
+			{
+				BuildingGridParams->SetNumberField(TEXT("tilt_pitch"),
+					BuildingMeta->GetNumberField(TEXT("tilt_pitch")));
+			}
+			if (BuildingMeta->HasField(TEXT("tilt_roll")))
+			{
+				BuildingGridParams->SetNumberField(TEXT("tilt_roll"),
+					BuildingMeta->GetNumberField(TEXT("tilt_roll")));
+			}
+			if (BuildingMeta->HasField(TEXT("boarded_window_pct")))
+			{
+				BuildingGridParams->SetNumberField(TEXT("boarded_window_pct"),
+					BuildingMeta->GetNumberField(TEXT("boarded_window_pct")));
+			}
 		}
 
 		// Execute SP1: create_building_from_grid
@@ -1617,6 +1671,78 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 			}
 		}
 
+		// Fix #6: Wire furnish_building — furnish interior of each building
+		if (!bSkipFurnishing)
+		{
+			const FString BuildingId = FString::Printf(TEXT("Building_%02d"), i);
+			auto FurnishParams = MakeShared<FJsonObject>();
+			FurnishParams->SetStringField(TEXT("building_id"), BuildingId);
+			if (BuildingResult.IsValid())
+			{
+				FurnishParams->SetObjectField(TEXT("building_descriptor"), BuildingResult);
+			}
+			FurnishParams->SetStringField(TEXT("save_path_prefix"), SavePathPrefix + TEXT("/Furniture"));
+			FurnishParams->SetStringField(TEXT("folder"), Folder + TEXT("/Furniture"));
+			FurnishParams->SetNumberField(TEXT("seed"), Seed + i + 5000);
+			if (Decay > 0.0f)
+			{
+				FurnishParams->SetNumberField(TEXT("decay"), Decay);
+			}
+
+			TSharedPtr<FJsonObject> FurnishResult;
+			FString FurnishError;
+			if (TryExecuteAction(TEXT("furnish_building"), FurnishParams, FurnishResult, FurnishError))
+			{
+				UE_LOG(LogMonolithCityBlock, Log, TEXT("    Furnish %d: OK"), i);
+				if (BuildingResult.IsValid() && FurnishResult.IsValid())
+				{
+					BuildingResult->SetObjectField(TEXT("furnishing"), FurnishResult);
+				}
+			}
+			else
+			{
+				UE_LOG(LogMonolithCityBlock, Warning, TEXT("    Furnish %d skipped: %s"), i, *FurnishError);
+				SkippedSteps.AddUnique(TEXT("furnishing"));
+			}
+		}
+		else
+		{
+			SkippedSteps.AddUnique(TEXT("furnishing"));
+		}
+
+		// Fix #7: Wire auto_volumes_for_building — generate navmesh/audio volumes
+		if (!bSkipVolumes)
+		{
+			const FString BuildingId = FString::Printf(TEXT("Building_%02d"), i);
+			auto VolParams = MakeShared<FJsonObject>();
+			VolParams->SetStringField(TEXT("building_id"), BuildingId);
+			if (BuildingResult.IsValid())
+			{
+				VolParams->SetObjectField(TEXT("building_descriptor"), BuildingResult);
+			}
+			VolParams->SetStringField(TEXT("folder"), Folder + TEXT("/Volumes"));
+
+			TSharedPtr<FJsonObject> VolResult;
+			FString VolError;
+			if (TryExecuteAction(TEXT("auto_volumes_for_building"), VolParams, VolResult, VolError))
+			{
+				UE_LOG(LogMonolithCityBlock, Log, TEXT("    Volumes %d: OK"), i);
+				if (BuildingResult.IsValid() && VolResult.IsValid())
+				{
+					BuildingResult->SetObjectField(TEXT("volumes"), VolResult);
+				}
+			}
+			else
+			{
+				UE_LOG(LogMonolithCityBlock, Warning, TEXT("    Volumes %d skipped: %s"), i, *VolError);
+				SkippedSteps.AddUnique(TEXT("volumes"));
+			}
+		}
+		else
+		{
+			SkippedSteps.AddUnique(TEXT("volumes"));
+		}
+
 		// ---- Post-generation validation ----
 		if (!bSkipValidation)
 		{
@@ -1651,7 +1777,52 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 						UE_LOG(LogMonolithCityBlock, Log, TEXT("    Retry %d/%d for building %d (score %.2f < 0.5), seed=%d"),
 							Retry, MaxRetries, i, BestScore, RetrySeed);
 
-						// Regenerate with new seed
+						// Fix #4: Regenerate floor plan with new seed BEFORE rebuilding geometry
+						FloorPlanParams->SetNumberField(TEXT("seed"), RetrySeed);
+						TSharedPtr<FJsonObject> RetryFloorPlan;
+						FString RetryFPError;
+						if (TryExecuteAction(TEXT("generate_floor_plan"), FloorPlanParams, RetryFloorPlan, RetryFPError)
+							&& RetryFloorPlan.IsValid())
+						{
+							// Use the new floor plan as the building grid params
+							BuildingGridParams = RetryFloorPlan;
+							// Re-apply building metadata that was on the original params
+							BuildingGridParams->SetStringField(TEXT("save_path"), BuildingAssetPath);
+							BuildingGridParams->SetStringField(TEXT("building_id"), FString::Printf(TEXT("Building_%02d"), i));
+
+							TArray<TSharedPtr<FJsonValue>> RetryBuildingLoc;
+							RetryBuildingLoc.Add(MakeShared<FJsonValueNumber>(BlockOrigin.X + LotX + LotW * 0.15f));
+							RetryBuildingLoc.Add(MakeShared<FJsonValueNumber>(BlockOrigin.Y + LotY + LotH * 0.15f));
+							RetryBuildingLoc.Add(MakeShared<FJsonValueNumber>(BlockOrigin.Z));
+							BuildingGridParams->SetArrayField(TEXT("location"), RetryBuildingLoc);
+							BuildingGridParams->SetStringField(TEXT("folder"), Folder + TEXT("/Buildings"));
+							BuildingGridParams->SetBoolField(TEXT("overwrite"), true);
+
+							if (!bSkipFacades && !BlockFacadeStyle.IsEmpty())
+							{
+								BuildingGridParams->SetStringField(TEXT("facade_style"), BlockFacadeStyle);
+								BuildingGridParams->SetNumberField(TEXT("facade_seed"), RetrySeed + i * 31);
+							}
+
+							// Re-apply decay metadata
+							// Re-apply decay metadata (BuildingMeta is TSharedRef, always valid)
+							{
+								if (BuildingMeta->HasField(TEXT("decay_level")))
+									BuildingGridParams->SetNumberField(TEXT("decay_level"), BuildingMeta->GetNumberField(TEXT("decay_level")));
+								if (BuildingMeta->HasField(TEXT("tilt_pitch")))
+									BuildingGridParams->SetNumberField(TEXT("tilt_pitch"), BuildingMeta->GetNumberField(TEXT("tilt_pitch")));
+								if (BuildingMeta->HasField(TEXT("tilt_roll")))
+									BuildingGridParams->SetNumberField(TEXT("tilt_roll"), BuildingMeta->GetNumberField(TEXT("tilt_roll")));
+								if (BuildingMeta->HasField(TEXT("boarded_window_pct")))
+									BuildingGridParams->SetNumberField(TEXT("boarded_window_pct"), BuildingMeta->GetNumberField(TEXT("boarded_window_pct")));
+							}
+						}
+						else
+						{
+							UE_LOG(LogMonolithCityBlock, Warning, TEXT("    Retry %d floor plan regen failed: %s (using previous grid)"), Retry, *RetryFPError);
+						}
+
+						// Rebuild geometry with (possibly new) grid params
 						BuildingGridParams->SetNumberField(TEXT("seed"), RetrySeed);
 						BuildingGridParams->SetBoolField(TEXT("overwrite"), true);
 
@@ -1812,46 +1983,73 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 	}
 
 	// ---- Step 7: Street furniture ----
+	// Fix #5: Place furniture on ALL street segments, not just the south street
 
-	TSharedPtr<FJsonObject> FurnitureResult;
+	TArray<TSharedPtr<FJsonValue>> FurnitureResults;
 
 	if (!bSkipFurniture && !bSkipStreets)
 	{
 		TArray<FString> FurnitureTypes = GetGenreFurniture(Genre);
 
-		// Place furniture along the bottom (front) street
-		auto FurnParams = MakeShared<FJsonObject>();
-
-		TArray<TSharedPtr<FJsonValue>> FurnStart, FurnEnd;
-		FurnStart.Add(MakeShared<FJsonValueNumber>(BlockOrigin.X));
-		FurnStart.Add(MakeShared<FJsonValueNumber>(BlockOrigin.Y));
-		FurnEnd.Add(MakeShared<FJsonValueNumber>(BlockOrigin.X + BlockWidth));
-		FurnEnd.Add(MakeShared<FJsonValueNumber>(BlockOrigin.Y));
-		FurnParams->SetArrayField(TEXT("street_start"), FurnStart);
-		FurnParams->SetArrayField(TEXT("street_end"), FurnEnd);
-
+		// Build shared types array once
 		TArray<TSharedPtr<FJsonValue>> TypesArr;
 		for (const FString& FT : FurnitureTypes)
 		{
 			TypesArr.Add(MakeShared<FJsonValueString>(FT));
 		}
-		FurnParams->SetArrayField(TEXT("types"), TypesArr);
-		FurnParams->SetNumberField(TEXT("spacing"), 800.0);
-		FurnParams->SetNumberField(TEXT("offset"), StreetWidth * 0.5f + SidewalkWidth * 0.5f);
-		FurnParams->SetNumberField(TEXT("seed"), Seed + 5000);
-		FurnParams->SetNumberField(TEXT("decay"), Decay);
-		FurnParams->SetStringField(TEXT("folder"), Folder + TEXT("/Furniture"));
-		FurnParams->SetStringField(TEXT("save_path_prefix"), SavePathPrefix);
 
-		FMonolithActionResult FurnResult = PlaceStreetFurniture(FurnParams);
-		if (FurnResult.bSuccess)
+		// Parse street segments from lot layout results
+		const TArray<TSharedPtr<FJsonValue>>* FurnStreetsArr = nullptr;
+		if (LotResult.Result->TryGetArrayField(TEXT("streets"), FurnStreetsArr) && FurnStreetsArr)
 		{
-			FurnitureResult = FurnResult.Result;
-			UE_LOG(LogMonolithCityBlock, Log, TEXT("  Street furniture: OK"));
+			for (int32 FurnIdx = 0; FurnIdx < FurnStreetsArr->Num(); ++FurnIdx)
+			{
+				const TSharedPtr<FJsonObject>* StreetObj = nullptr;
+				if (!(*FurnStreetsArr)[FurnIdx]->TryGetObject(StreetObj) || !StreetObj || !(*StreetObj).IsValid())
+				{
+					continue;
+				}
+
+				const TArray<TSharedPtr<FJsonValue>>* SArr = nullptr;
+				const TArray<TSharedPtr<FJsonValue>>* EArr = nullptr;
+				if (!(*StreetObj)->TryGetArrayField(TEXT("start"), SArr) || !SArr || SArr->Num() < 2) continue;
+				if (!(*StreetObj)->TryGetArrayField(TEXT("end"), EArr) || !EArr || EArr->Num() < 2) continue;
+
+				auto FurnParams = MakeShared<FJsonObject>();
+
+				// Offset to world coords (same as street generation)
+				TArray<TSharedPtr<FJsonValue>> WorldStart, WorldEnd;
+				WorldStart.Add(MakeShared<FJsonValueNumber>(BlockOrigin.X + (*SArr)[0]->AsNumber()));
+				WorldStart.Add(MakeShared<FJsonValueNumber>(BlockOrigin.Y + (*SArr)[1]->AsNumber()));
+				WorldEnd.Add(MakeShared<FJsonValueNumber>(BlockOrigin.X + (*EArr)[0]->AsNumber()));
+				WorldEnd.Add(MakeShared<FJsonValueNumber>(BlockOrigin.Y + (*EArr)[1]->AsNumber()));
+
+				FurnParams->SetArrayField(TEXT("street_start"), WorldStart);
+				FurnParams->SetArrayField(TEXT("street_end"), WorldEnd);
+				FurnParams->SetArrayField(TEXT("types"), TypesArr);
+				FurnParams->SetNumberField(TEXT("spacing"), 800.0);
+				FurnParams->SetNumberField(TEXT("offset"), StreetWidth * 0.5f + SidewalkWidth * 0.5f);
+				FurnParams->SetNumberField(TEXT("seed"), Seed + 5000 + FurnIdx);
+				FurnParams->SetNumberField(TEXT("decay"), Decay);
+				FurnParams->SetStringField(TEXT("folder"), Folder + TEXT("/Furniture"));
+				FurnParams->SetStringField(TEXT("save_path_prefix"), SavePathPrefix);
+
+				FMonolithActionResult FurnResult = PlaceStreetFurniture(FurnParams);
+				if (FurnResult.bSuccess)
+				{
+					FurnitureResults.Add(MakeShared<FJsonValueObject>(FurnResult.Result));
+					UE_LOG(LogMonolithCityBlock, Log, TEXT("  Street furniture %d: OK"), FurnIdx);
+				}
+				else
+				{
+					UE_LOG(LogMonolithCityBlock, Warning, TEXT("  Street furniture %d failed: %s"), FurnIdx, *FurnResult.ErrorMessage);
+				}
+			}
 		}
-		else
+
+		if (FurnitureResults.Num() > 0)
 		{
-			UE_LOG(LogMonolithCityBlock, Warning, TEXT("  Street furniture failed: %s"), *FurnResult.ErrorMessage);
+			UE_LOG(LogMonolithCityBlock, Log, TEXT("  Street furniture: %d segments furnished"), FurnitureResults.Num());
 		}
 	}
 	else
@@ -1903,9 +2101,9 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 	Result->SetArrayField(TEXT("streets"), StreetResults);
 
 	// Furniture
-	if (FurnitureResult.IsValid())
+	if (FurnitureResults.Num() > 0)
 	{
-		Result->SetObjectField(TEXT("furniture"), FurnitureResult);
+		Result->SetArrayField(TEXT("furniture"), FurnitureResults);
 	}
 
 	// Skipped steps
