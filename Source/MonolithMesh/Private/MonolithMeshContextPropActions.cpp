@@ -424,6 +424,9 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnSurface(const TS
 		ScaleMax = static_cast<float>((*ScaleRangeArr)[1]->AsNumber());
 	}
 
+	FString CollisionMode = TEXT("warn");
+	Params->TryGetStringField(TEXT("collision_mode"), CollisionMode);
+
 	// Find the surface actor
 	FString FindError;
 	AActor* SurfaceActor = MonolithMeshUtils::FindActorByName(SurfaceActorName, FindError);
@@ -495,7 +498,12 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnSurface(const TS
 	FCollisionQueryParams TraceParams(SCENE_QUERY_STAT(MonolithSurfaceTrace), true);
 
 	int32 Placed = 0;
+	int32 Rejected = 0;
 	TArray<TSharedPtr<FJsonValue>> PlacedArr;
+	TArray<FString> CollisionWarnings;
+
+	// Collect spawned actors for ignore list
+	TArray<AActor*> SpawnedActors;
 
 	for (const FVector2D& Sample : Samples)
 	{
@@ -552,12 +560,48 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnSurface(const TS
 			continue; // Skip this placement to avoid overhang
 		}
 
+		// Collision validation (unless mode is "none")
+		if (!CollisionMode.Equals(TEXT("none"), ESearchCase::IgnoreCase))
+		{
+			FVector PropHalfExtent = MeshBounds.BoxExtent * Scale * 0.9f;
+			PropHalfExtent = PropHalfExtent.ComponentMax(FVector(1.0f));
+
+			TArray<AActor*> IgnoreActors;
+			IgnoreActors.Add(SurfaceActor); // Don't count the surface itself as an overlap
+			IgnoreActors.Append(SpawnedActors);
+
+			bool bAllowPushOut = CollisionMode.Equals(TEXT("adjust"), ESearchCase::IgnoreCase);
+			MonolithMeshUtils::FPropPlacementResult PlacementResult = MonolithMeshUtils::ValidatePropPlacement(
+				World, SpawnLocation, SpawnRotation.Quaternion(), PropHalfExtent, IgnoreActors, bAllowPushOut);
+
+			if (!PlacementResult.bValid)
+			{
+				if (CollisionMode.Equals(TEXT("reject"), ESearchCase::IgnoreCase) || CollisionMode.Equals(TEXT("adjust"), ESearchCase::IgnoreCase))
+				{
+					Rejected++;
+					continue;
+				}
+				// "warn" mode: place anyway but record warning
+				CollisionWarnings.Add(FString::Printf(TEXT("Surface prop at (%.0f, %.0f, %.0f): %s"),
+					SpawnLocation.X, SpawnLocation.Y, SpawnLocation.Z, *PlacementResult.RejectReason));
+			}
+			else
+			{
+				SpawnLocation = PlacementResult.FinalLocation;
+				for (const FString& W : PlacementResult.Warnings)
+				{
+					CollisionWarnings.Add(W);
+				}
+			}
+		}
+
 		FActorSpawnParameters SpawnParams;
 		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
 		AStaticMeshActor* PropActor = World->SpawnActor<AStaticMeshActor>(SpawnLocation, SpawnRotation, SpawnParams);
 		if (!PropActor) continue;
 
+		SpawnedActors.Add(PropActor);
 		PropActor->GetStaticMeshComponent()->SetStaticMesh(ChosenMesh);
 		PropActor->SetActorScale3D(FVector(Scale));
 
@@ -579,10 +623,21 @@ FMonolithActionResult FMonolithMeshContextPropActions::ScatterOnSurface(const TS
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetNumberField(TEXT("placed"), Placed);
 	Result->SetNumberField(TEXT("requested"), Count);
+	Result->SetNumberField(TEXT("rejected"), Rejected);
 	Result->SetStringField(TEXT("surface_actor"), SurfaceActorName);
 	Result->SetStringField(TEXT("surface_side"), SurfaceSide);
+	Result->SetStringField(TEXT("collision_mode"), CollisionMode);
 	Result->SetNumberField(TEXT("seed"), Seed);
 	Result->SetArrayField(TEXT("props"), PlacedArr);
+	if (CollisionWarnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarningsArr;
+		for (const FString& W : CollisionWarnings)
+		{
+			WarningsArr.Add(MakeShared<FJsonValueString>(W));
+		}
+		Result->SetArrayField(TEXT("collision_warnings"), WarningsArr);
+	}
 
 	return FMonolithActionResult::Success(Result);
 }
@@ -1068,6 +1123,7 @@ FMonolithActionResult FMonolithMeshContextPropActions::SettleProps(const TShared
 	FScopedMeshTransaction Transaction(FText::FromString(TEXT("Monolith: Settle Props")));
 
 	int32 Settled = 0;
+	int32 FellThrough = 0;
 	TArray<TSharedPtr<FJsonValue>> SettledArr;
 
 	FCollisionQueryParams TraceParams(SCENE_QUERY_STAT(MonolithSettleTrace), true);
@@ -1083,16 +1139,35 @@ FMonolithActionResult FMonolithMeshContextPropActions::SettleProps(const TShared
 		FVector OriginalLoc = Actor->GetActorLocation();
 		FRotator OriginalRot = Actor->GetActorRotation();
 
-		// Trace downward from actor center
-		FVector TraceStart = ActorOrigin;
-		FVector TraceEnd = ActorOrigin - FVector(0, 0, 10000.0f);
+		// Use SweepSingle with prop bounding box instead of LineTrace
+		// This prevents props from settling through thin geometry (shelves, platforms)
+		FCollisionShape PropShape = FCollisionShape::MakeBox(
+			FVector(ActorExtent.X * 0.9f, ActorExtent.Y * 0.9f, 1.0f).ComponentMax(FVector(1.0f)));
+
+		FVector SweepStart = ActorOrigin;
+		FVector SweepEnd = ActorOrigin - FVector(0, 0, 10000.0f);
 
 		FHitResult Hit;
-		bool bHit = World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, TraceParams);
+		bool bHit = World->SweepSingleByChannel(
+			Hit, SweepStart, SweepEnd, FQuat::Identity,
+			ECC_WorldStatic, PropShape, TraceParams);
 
 		if (!bHit)
 		{
-			continue; // Nothing to settle onto
+			// Fallback: try a simple line trace in case sweep misses (e.g., brush geometry)
+			bHit = World->LineTraceSingleByChannel(Hit, SweepStart, SweepEnd, ECC_Visibility, TraceParams);
+			if (!bHit)
+			{
+				FellThrough++;
+				continue; // Nothing to settle onto
+			}
+		}
+
+		if (Hit.bStartPenetrating)
+		{
+			// Already embedded in geometry -- skip to avoid making it worse
+			FellThrough++;
+			continue;
 		}
 
 		Actor->Modify();
@@ -1123,6 +1198,10 @@ FMonolithActionResult FMonolithMeshContextPropActions::SettleProps(const TShared
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetNumberField(TEXT("settled_count"), Settled);
+	if (FellThrough > 0)
+	{
+		Result->SetNumberField(TEXT("skipped_no_surface"), FellThrough);
+	}
 	Result->SetNumberField(TEXT("seed"), Seed);
 	Result->SetArrayField(TEXT("actors"), SettledArr);
 
