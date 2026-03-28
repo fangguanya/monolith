@@ -18,6 +18,7 @@
 #include "Editor.h"
 #include "Selection.h"
 #include "UObject/UObjectGlobals.h"
+#include "CollisionQueryParams.h"
 
 // ============================================================================
 // Static member
@@ -173,6 +174,23 @@ void FMonolithMeshSceneActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshSceneActions::BatchExecute),
 		FParamSchemaBuilder()
 			.Required(TEXT("actions"), TEXT("array"), TEXT("Array of {action, params} objects"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("mesh"), TEXT("align_actors"),
+		TEXT("Align multiple actors along an axis. Modes: min/max (snap to extremes), center (average), distribute (spread evenly between min/max)."),
+		FMonolithActionHandler::CreateStatic(&FMonolithMeshSceneActions::AlignActors),
+		FParamSchemaBuilder()
+			.Required(TEXT("actor_names"), TEXT("array"), TEXT("Array of actor names or labels to align"))
+			.Required(TEXT("axis"), TEXT("string"), TEXT("Axis to align on: X, Y, or Z"))
+			.Required(TEXT("mode"), TEXT("string"), TEXT("Alignment mode: min, max, center, or distribute"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("mesh"), TEXT("snap_to_floor"),
+		TEXT("Snap actors to the floor by tracing downward. Places the bottom of each actor on the hit surface."),
+		FMonolithActionHandler::CreateStatic(&FMonolithMeshSceneActions::SnapToFloor),
+		FParamSchemaBuilder()
+			.Required(TEXT("actor_names"), TEXT("array"), TEXT("Array of actor names or labels to snap"))
+			.Optional(TEXT("trace_distance"), TEXT("number"), TEXT("Maximum downward trace distance"), TEXT("10000"))
 			.Build());
 }
 
@@ -893,6 +911,254 @@ FMonolithActionResult FMonolithMeshSceneActions::BatchExecute(const TSharedPtr<F
 	Result->SetNumberField(TEXT("succeeded"), Succeeded);
 	Result->SetNumberField(TEXT("failed"), Failed);
 	Result->SetArrayField(TEXT("results"), ResultsArr);
+
+	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// 9. align_actors
+// ============================================================================
+
+FMonolithActionResult FMonolithMeshSceneActions::AlignActors(const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* NamesArr;
+	if (!Params->TryGetArrayField(TEXT("actor_names"), NamesArr) || NamesArr->Num() < 2)
+	{
+		return FMonolithActionResult::Error(TEXT("Missing or insufficient actor_names (need at least 2 actors to align)"));
+	}
+
+	FString AxisStr;
+	if (!Params->TryGetStringField(TEXT("axis"), AxisStr))
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required param: axis (X, Y, or Z)"));
+	}
+	AxisStr = AxisStr.ToUpper();
+	int32 AxisIndex = -1;
+	if (AxisStr == TEXT("X")) AxisIndex = 0;
+	else if (AxisStr == TEXT("Y")) AxisIndex = 1;
+	else if (AxisStr == TEXT("Z")) AxisIndex = 2;
+	else
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid axis: '%s'. Use X, Y, or Z."), *AxisStr));
+	}
+
+	FString ModeStr;
+	if (!Params->TryGetStringField(TEXT("mode"), ModeStr))
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required param: mode (min, max, center, or distribute)"));
+	}
+	ModeStr = ModeStr.ToLower();
+	if (ModeStr != TEXT("min") && ModeStr != TEXT("max") && ModeStr != TEXT("center") && ModeStr != TEXT("distribute"))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid mode: '%s'. Use min, max, center, or distribute."), *ModeStr));
+	}
+
+	// Resolve all actors first — fail if any missing
+	TArray<AActor*> Actors;
+	Actors.Reserve(NamesArr->Num());
+	for (const auto& Val : *NamesArr)
+	{
+		FString Name = Val->AsString();
+		FString Error;
+		AActor* Actor = MonolithMeshUtils::FindActorByName(Name, Error);
+		if (!Actor)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Actor not found: %s"), *Name));
+		}
+		Actors.Add(Actor);
+	}
+
+	// Lambdas for axis access
+	auto GetAxisValue = [AxisIndex](const FVector& V) -> double
+	{
+		return (AxisIndex == 0) ? V.X : (AxisIndex == 1) ? V.Y : V.Z;
+	};
+
+	auto SetAxisValue = [AxisIndex](FVector& V, double Val)
+	{
+		if (AxisIndex == 0) V.X = Val;
+		else if (AxisIndex == 1) V.Y = Val;
+		else V.Z = Val;
+	};
+
+	// Compute stats along the target axis
+	double MinVal = TNumericLimits<double>::Max();
+	double MaxVal = TNumericLimits<double>::Lowest();
+	double Sum = 0.0;
+	for (AActor* Actor : Actors)
+	{
+		double Val = GetAxisValue(Actor->GetActorLocation());
+		MinVal = FMath::Min(MinVal, Val);
+		MaxVal = FMath::Max(MaxVal, Val);
+		Sum += Val;
+	}
+
+	SceneActionHelpers::FScopedMeshTransaction Transaction(FText::FromString(TEXT("Monolith: Align Actors")));
+
+	TArray<TSharedPtr<FJsonValue>> ResultArr;
+
+	if (ModeStr == TEXT("distribute"))
+	{
+		// Sort actors by current position on the target axis, then spread evenly
+		struct FActorSortEntry
+		{
+			AActor* Actor;
+			double AxisVal;
+		};
+		TArray<FActorSortEntry> Sorted;
+		Sorted.Reserve(Actors.Num());
+		for (AActor* Actor : Actors)
+		{
+			Sorted.Add({ Actor, GetAxisValue(Actor->GetActorLocation()) });
+		}
+		Sorted.Sort([](const FActorSortEntry& A, const FActorSortEntry& B) { return A.AxisVal < B.AxisVal; });
+
+		double Range = MaxVal - MinVal;
+		int32 Count = Sorted.Num();
+
+		for (int32 i = 0; i < Count; ++i)
+		{
+			AActor* Actor = Sorted[i].Actor;
+			double NewVal = (Count > 1) ? (MinVal + (Range * i) / (Count - 1)) : MinVal;
+			FVector Loc = Actor->GetActorLocation();
+			SetAxisValue(Loc, NewVal);
+			Actor->SetActorLocation(Loc);
+
+			auto Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("actor"), Actor->GetActorNameOrLabel());
+			Entry->SetArrayField(TEXT("new_location"), SceneActionHelpers::VectorToJsonArray(Loc));
+			ResultArr.Add(MakeShared<FJsonValueObject>(Entry));
+		}
+	}
+	else
+	{
+		double Target = 0.0;
+		if (ModeStr == TEXT("min")) Target = MinVal;
+		else if (ModeStr == TEXT("max")) Target = MaxVal;
+		else /* center */ Target = Sum / Actors.Num();
+
+		for (AActor* Actor : Actors)
+		{
+			FVector Loc = Actor->GetActorLocation();
+			SetAxisValue(Loc, Target);
+			Actor->SetActorLocation(Loc);
+
+			auto Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("actor"), Actor->GetActorNameOrLabel());
+			Entry->SetArrayField(TEXT("new_location"), SceneActionHelpers::VectorToJsonArray(Loc));
+			ResultArr.Add(MakeShared<FJsonValueObject>(Entry));
+		}
+	}
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("axis"), AxisStr);
+	Result->SetStringField(TEXT("mode"), ModeStr);
+	Result->SetNumberField(TEXT("aligned"), ResultArr.Num());
+	Result->SetArrayField(TEXT("actors"), ResultArr);
+
+	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// 10. snap_to_floor
+// ============================================================================
+
+FMonolithActionResult FMonolithMeshSceneActions::SnapToFloor(const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* NamesArr;
+	if (!Params->TryGetArrayField(TEXT("actor_names"), NamesArr) || NamesArr->Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("Missing or empty required param: actor_names"));
+	}
+
+	double TraceDistance = 10000.0;
+	Params->TryGetNumberField(TEXT("trace_distance"), TraceDistance);
+	if (TraceDistance <= 0.0)
+	{
+		return FMonolithActionResult::Error(TEXT("trace_distance must be positive"));
+	}
+
+	// Resolve all actors first — fail if any missing
+	TArray<AActor*> Actors;
+	Actors.Reserve(NamesArr->Num());
+	for (const auto& Val : *NamesArr)
+	{
+		FString Name = Val->AsString();
+		FString Error;
+		AActor* Actor = MonolithMeshUtils::FindActorByName(Name, Error);
+		if (!Actor)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Actor not found: %s"), *Name));
+		}
+		Actors.Add(Actor);
+	}
+
+	UWorld* World = MonolithMeshUtils::GetEditorWorld();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("No editor world available"));
+	}
+
+	SceneActionHelpers::FScopedMeshTransaction Transaction(FText::FromString(TEXT("Monolith: Snap to Floor")));
+
+	TArray<TSharedPtr<FJsonValue>> ResultArr;
+	int32 Snapped = 0;
+	int32 Missed = 0;
+
+	for (AActor* Actor : Actors)
+	{
+		// Get actor bounds to compute half-height (distance from center to bottom)
+		FVector BoundsOrigin, BoundsExtent;
+		Actor->GetActorBounds(false, BoundsOrigin, BoundsExtent);
+		double ActorHalfHeight = BoundsExtent.Z; // Extent is half-size per axis
+
+		FVector ActorLoc = Actor->GetActorLocation();
+
+		// Trace downward from actor location
+		FVector TraceStart = ActorLoc;
+		FVector TraceEnd = TraceStart - FVector(0, 0, TraceDistance);
+
+		FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(SnapToFloor), true);
+		QueryParams.AddIgnoredActor(Actor);
+
+		FHitResult Hit;
+		bool bHit = World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, QueryParams);
+
+		auto Entry = MakeShared<FJsonObject>();
+		Entry->SetStringField(TEXT("actor"), Actor->GetActorNameOrLabel());
+
+		if (bHit)
+		{
+			// Place actor so its bottom sits on the hit point.
+			// Account for pivot offset: the actor's pivot may not be at bounds center.
+			// PivotOffset = ActorLocation.Z - BoundsOrigin.Z
+			// NewZ = HitPoint.Z + ActorHalfHeight + PivotOffset
+			double PivotOffset = ActorLoc.Z - BoundsOrigin.Z;
+			double NewZ = Hit.ImpactPoint.Z + ActorHalfHeight + PivotOffset;
+			FVector NewLoc = ActorLoc;
+			NewLoc.Z = NewZ;
+			Actor->SetActorLocation(NewLoc);
+
+			Entry->SetArrayField(TEXT("new_location"), SceneActionHelpers::VectorToJsonArray(NewLoc));
+			Entry->SetNumberField(TEXT("floor_z"), Hit.ImpactPoint.Z);
+			Entry->SetBoolField(TEXT("snapped"), true);
+			Snapped++;
+		}
+		else
+		{
+			Entry->SetBoolField(TEXT("snapped"), false);
+			Entry->SetStringField(TEXT("reason"), TEXT("No floor found within trace distance"));
+			Missed++;
+		}
+
+		ResultArr.Add(MakeShared<FJsonValueObject>(Entry));
+	}
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetNumberField(TEXT("snapped"), Snapped);
+	Result->SetNumberField(TEXT("missed"), Missed);
+	Result->SetNumberField(TEXT("trace_distance"), TraceDistance);
+	Result->SetArrayField(TEXT("actors"), ResultArr);
 
 	return FMonolithActionResult::Success(Result);
 }

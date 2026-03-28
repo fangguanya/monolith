@@ -9,9 +9,11 @@
 #include "MonolithMeshLightingActions.h"
 #include "MonolithMeshDecalActions.h"
 #include "MonolithMeshAudioActions.h"
+#include "MonolithMeshTemplateActions.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
+#include "Misc/CoreDelegates.h"
 
 #if WITH_GEOMETRYSCRIPT
 #include "MonolithMeshOperationActions.h"
@@ -38,6 +40,7 @@ void FMonolithMeshModule::StartupModule()
 	FMonolithMeshLightingActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshDecalActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshAudioActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithMeshTemplateActions::RegisterActions(FMonolithToolRegistry::Get());
 
 #if WITH_GEOMETRYSCRIPT
 	HandlePool = NewObject<UMonolithMeshHandlePool>();
@@ -45,6 +48,20 @@ void FMonolithMeshModule::StartupModule()
 	HandlePool->Initialize();
 	FMonolithMeshOperationActions::SetHandlePool(HandlePool);
 	FMonolithMeshOperationActions::RegisterActions(FMonolithToolRegistry::Get());
+
+	// Clean up handle pool on PreExit — before GC destroys UObjects.
+	// ShutdownModule runs too late; by then the UObject array may be torn down.
+	FCoreDelegates::OnPreExit.AddLambda([this]()
+	{
+		if (HandlePool && HandlePool->IsValidLowLevelFast())
+		{
+			HandlePool->Teardown();
+			HandlePool->RemoveFromRoot();
+			FMonolithMeshOperationActions::SetHandlePool(nullptr);
+			HandlePool = nullptr;
+		}
+	});
+
 	UE_LOG(LogMonolith, Log, TEXT("Monolith — Mesh operations enabled (GeometryScript available)"));
 #endif
 
@@ -54,13 +71,10 @@ void FMonolithMeshModule::StartupModule()
 
 void FMonolithMeshModule::ShutdownModule()
 {
+	// Handle pool cleanup happens in OnPreExit (before GC destroys UObjects).
+	// By the time ShutdownModule runs, the UObject array may already be torn down.
+	// Just null our pointer defensively.
 #if WITH_GEOMETRYSCRIPT
-	if (IsValid(HandlePool))
-	{
-		HandlePool->Teardown();
-		HandlePool->RemoveFromRoot();
-		FMonolithMeshOperationActions::SetHandlePool(nullptr);
-	}
 	HandlePool = nullptr;
 #endif
 
