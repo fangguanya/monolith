@@ -304,7 +304,7 @@ bool FMonolithMeshProceduralActions::SaveMeshToAsset(UDynamicMesh* Mesh, const F
 	return true;
 }
 
-AActor* FMonolithMeshProceduralActions::PlaceMeshInScene(const FString& AssetPath, const FVector& Location, const FRotator& Rotation, const FString& Label)
+AActor* FMonolithMeshProceduralActions::PlaceMeshInScene(const FString& AssetPath, const FVector& Location, const FRotator& Rotation, const FString& Label, bool bSnapToFloor /*= true*/)
 {
 	UWorld* World = MonolithMeshUtils::GetEditorWorld();
 	if (!World) return nullptr;
@@ -319,6 +319,25 @@ AActor* FMonolithMeshProceduralActions::PlaceMeshInScene(const FString& AssetPat
 	if (!Actor) return nullptr;
 
 	Actor->GetStaticMeshComponent()->SetStaticMesh(SM);
+
+	// Auto snap-to-floor: trace downward to find the actual floor surface.
+	// Proc gen meshes have pivot at bottom-center (min Z = 0), so NewZ = Hit.ImpactPoint.Z.
+	// Only snaps DOWN — if location is already below the actual floor, it stays put.
+	if (bSnapToFloor)
+	{
+		FHitResult FloorHit;
+		FVector TraceStart = Location + FVector(0, 0, 50.0);  // Start slightly above to catch floor at same Z
+		FVector TraceEnd = Location - FVector(0, 0, 500.0);    // Trace 5m down
+		FCollisionQueryParams FloorParams(SCENE_QUERY_STAT(ProcMeshFloorSnap), true);
+		FloorParams.AddIgnoredActor(Actor);
+
+		if (World->LineTraceSingleByChannel(FloorHit, TraceStart, TraceEnd, ECC_WorldStatic, FloorParams))
+		{
+			FVector NewLoc = Actor->GetActorLocation();
+			NewLoc.Z = FloorHit.ImpactPoint.Z;
+			Actor->SetActorLocation(NewLoc);
+		}
+	}
 
 	if (!Label.IsEmpty())
 	{
@@ -356,9 +375,9 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateParametricMesh(const
 	else if (Type == TEXT("shelf"))        ParseDimensions(Params, Width, Depth, Height, 80, 30, 180);
 	else if (Type == TEXT("cabinet"))      ParseDimensions(Params, Width, Depth, Height, 60, 45, 90);
 	else if (Type == TEXT("bed"))          ParseDimensions(Params, Width, Depth, Height, 100, 200, 55);
-	else if (Type == TEXT("door_frame"))   ParseDimensions(Params, Width, Depth, Height, 100, 20, 210);
+	else if (Type == TEXT("door_frame"))   ParseDimensions(Params, Width, Depth, Height, 90, 15, 210);
 	else if (Type == TEXT("window_frame")) ParseDimensions(Params, Width, Depth, Height, 120, 20, 100);
-	else if (Type == TEXT("stairs"))       ParseDimensions(Params, Width, Depth, Height, 100, 30, 20);
+	else if (Type == TEXT("stairs"))       ParseDimensions(Params, Width, Depth, Height, 90, 28, 18);
 	else if (Type == TEXT("ramp"))         ParseDimensions(Params, Width, Depth, Height, 100, 200, 100);
 	else if (Type == TEXT("pillar"))       ParseDimensions(Params, Width, Depth, Height, 30, 30, 300);
 	else if (Type == TEXT("counter"))      ParseDimensions(Params, Width, Depth, Height, 200, 60, 90);
@@ -547,11 +566,13 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateParametricMesh(const
 			MonolithMeshUtils::ParseRotator(Params, TEXT("rotation"), Rotation);
 			FString Label;
 			Params->TryGetStringField(TEXT("label"), Label);
+			bool bSnapToFloor = !Params->HasField(TEXT("snap_to_floor")) || Params->GetBoolField(TEXT("snap_to_floor"));
 
-			AActor* Actor = PlaceMeshInScene(SavePath, Location, Rotation, Label);
+			AActor* Actor = PlaceMeshInScene(SavePath, Location, Rotation, Label, bSnapToFloor);
 			if (Actor)
 			{
 				Result->SetStringField(TEXT("actor_name"), Actor->GetActorNameOrLabel());
+				Result->SetBoolField(TEXT("snapped_to_floor"), bSnapToFloor);
 			}
 		}
 	}
@@ -704,11 +725,13 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateHorrorProp(const TSh
 			MonolithMeshUtils::ParseRotator(Params, TEXT("rotation"), Rotation);
 			FString Label;
 			Params->TryGetStringField(TEXT("label"), Label);
+			bool bSnapToFloor = !Params->HasField(TEXT("snap_to_floor")) || Params->GetBoolField(TEXT("snap_to_floor"));
 
-			AActor* Actor = PlaceMeshInScene(SavePath, Location, Rotation, Label);
+			AActor* Actor = PlaceMeshInScene(SavePath, Location, Rotation, Label, bSnapToFloor);
 			if (Actor)
 			{
 				Result->SetStringField(TEXT("actor_name"), Actor->GetActorNameOrLabel());
+				Result->SetBoolField(TEXT("snapped_to_floor"), bSnapToFloor);
 			}
 		}
 	}
@@ -1561,11 +1584,13 @@ FString FMonolithMeshProceduralActions::FinalizeProceduralMesh(UDynamicMesh* Mes
 			MonolithMeshUtils::ParseRotator(Params, TEXT("rotation"), Rotation);
 			FString Label;
 			Params->TryGetStringField(TEXT("label"), Label);
+			bool bSnapToFloor = !Params->HasField(TEXT("snap_to_floor")) || Params->GetBoolField(TEXT("snap_to_floor"));
 
-			AActor* Actor = PlaceMeshInScene(SavePath, Location, Rotation, Label);
+			AActor* Actor = PlaceMeshInScene(SavePath, Location, Rotation, Label, bSnapToFloor);
 			if (Actor)
 			{
 				Result->SetStringField(TEXT("actor_name"), Actor->GetActorNameOrLabel());
+				Result->SetBoolField(TEXT("snapped_to_floor"), bSnapToFloor);
 			}
 		}
 	}
@@ -1707,10 +1732,10 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateStructure(const TSha
 			(*OpenObj)->TryGetStringField(TEXT("type"), OpenType);
 			OpenType = OpenType.ToLower();
 
-			float OpenW = (*OpenObj)->HasField(TEXT("width"))    ? static_cast<float>((*OpenObj)->GetNumberField(TEXT("width")))    : 120.0f;
-			float OpenH = (*OpenObj)->HasField(TEXT("height"))   ? static_cast<float>((*OpenObj)->GetNumberField(TEXT("height")))   : (OpenType == TEXT("door") ? 210.0f : 100.0f);
+			float OpenW = (*OpenObj)->HasField(TEXT("width"))    ? static_cast<float>((*OpenObj)->GetNumberField(TEXT("width")))    : (OpenType == TEXT("vent") ? 40.0f : 120.0f);
+			float OpenH = (*OpenObj)->HasField(TEXT("height"))   ? static_cast<float>((*OpenObj)->GetNumberField(TEXT("height")))   : (OpenType == TEXT("door") ? 210.0f : (OpenType == TEXT("vent") ? 30.0f : 100.0f));
 			float OffX  = (*OpenObj)->HasField(TEXT("offset_x")) ? static_cast<float>((*OpenObj)->GetNumberField(TEXT("offset_x"))) : 0.0f;
-			float OffZ  = (*OpenObj)->HasField(TEXT("offset_z")) ? static_cast<float>((*OpenObj)->GetNumberField(TEXT("offset_z"))) : (OpenType == TEXT("window") ? 100.0f : 0.0f);
+			float OffZ  = (*OpenObj)->HasField(TEXT("offset_z")) ? static_cast<float>((*OpenObj)->GetNumberField(TEXT("offset_z"))) : (OpenType == TEXT("window") ? 100.0f : (OpenType == TEXT("vent") ? 230.0f : 0.0f));
 
 			// Compute cutter position based on wall
 			FVector CutPos;
@@ -1718,26 +1743,26 @@ FMonolithActionResult FMonolithMeshProceduralActions::CreateStructure(const TSha
 
 			if (Wall == TEXT("north"))
 			{
-				CutPos = FVector(OffX, -Depth * 0.5f, FloorZ + OffZ);
+				CutPos = FVector(OffX, -Depth * 0.5f + WallT * 0.5f, FloorZ + OffZ);
 				CutBoxW = OpenW;
-				CutBoxD = WallT + 4.0f;
+				CutBoxD = WallT + 10.0f;
 			}
 			else if (Wall == TEXT("south"))
 			{
-				CutPos = FVector(OffX, Depth * 0.5f, FloorZ + OffZ);
+				CutPos = FVector(OffX, Depth * 0.5f - WallT * 0.5f, FloorZ + OffZ);
 				CutBoxW = OpenW;
-				CutBoxD = WallT + 4.0f;
+				CutBoxD = WallT + 10.0f;
 			}
 			else if (Wall == TEXT("east"))
 			{
-				CutPos = FVector(Width * 0.5f, OffX, FloorZ + OffZ);
-				CutBoxW = WallT + 4.0f;
+				CutPos = FVector(Width * 0.5f - WallT * 0.5f, OffX, FloorZ + OffZ);
+				CutBoxW = WallT + 10.0f;
 				CutBoxD = OpenW;
 			}
 			else if (Wall == TEXT("west"))
 			{
-				CutPos = FVector(-Width * 0.5f, OffX, FloorZ + OffZ);
-				CutBoxW = WallT + 4.0f;
+				CutPos = FVector(-Width * 0.5f + WallT * 0.5f, OffX, FloorZ + OffZ);
+				CutBoxW = WallT + 10.0f;
 				CutBoxD = OpenW;
 			}
 			else
