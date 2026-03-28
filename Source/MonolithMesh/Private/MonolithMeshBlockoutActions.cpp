@@ -21,6 +21,7 @@
 #include "Components/BrushComponent.h"
 #include "CollisionQueryParams.h"
 #include "WorldCollision.h"
+#include "Engine/OverlapResult.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "Dom/JsonObject.h"
@@ -86,6 +87,75 @@ TArray<TSharedPtr<FJsonValue>> FMonolithMeshBlockoutActions::RotatorToJsonArray(
 	Arr.Add(MakeShared<FJsonValueNumber>(R.Yaw));
 	Arr.Add(MakeShared<FJsonValueNumber>(R.Roll));
 	return Arr;
+}
+
+// ============================================================================
+// Overlap warning helper — checks if a newly spawned actor overlaps existing
+// non-blockout geometry and returns a warning string (empty if no overlap).
+// ============================================================================
+
+static FString CheckBlockoutOverlap(UWorld* World, AActor* SpawnedActor, const FString& Label)
+{
+	if (!World || !SpawnedActor)
+	{
+		return FString();
+	}
+
+	// Get the actor's bounding box for the overlap query
+	FVector Origin, Extent;
+	SpawnedActor->GetActorBounds(false, Origin, Extent);
+
+	// Minimum extent to avoid degenerate queries on flat shapes
+	Extent = Extent.ComponentMax(FVector(1.0f));
+
+	FCollisionShape BoxShape = FCollisionShape::MakeBox(Extent);
+	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(MonolithBlockoutOverlap), true);
+	QueryParams.AddIgnoredActor(SpawnedActor);
+
+	TArray<FOverlapResult> Overlaps;
+	World->OverlapMultiByChannel(Overlaps, Origin, SpawnedActor->GetActorQuat(), ECC_WorldStatic, BoxShape, QueryParams);
+
+	// Filter: only warn about non-blockout actors (skip other Monolith primitives)
+	TArray<FString> OverlappingNames;
+	TSet<AActor*> SeenActors;
+	for (const FOverlapResult& Overlap : Overlaps)
+	{
+		AActor* Other = Overlap.GetActor();
+		if (!Other || SeenActors.Contains(Other))
+		{
+			continue;
+		}
+		SeenActors.Add(Other);
+
+		// Skip other blockout primitives — those are expected to overlap
+		if (Other->Tags.Contains(FName(TEXT("Monolith.BlockoutPrimitive"))) ||
+			Other->Tags.Contains(FName(TEXT("Monolith.ScatteredProp"))))
+		{
+			continue;
+		}
+
+		OverlappingNames.Add(Other->GetActorNameOrLabel());
+	}
+
+	if (OverlappingNames.Num() == 0)
+	{
+		return FString();
+	}
+
+	// Build warning with up to 3 actor names to keep it readable
+	FString ActorList;
+	const int32 MaxNames = 3;
+	for (int32 i = 0; i < FMath::Min(OverlappingNames.Num(), MaxNames); ++i)
+	{
+		if (i > 0) ActorList += TEXT(", ");
+		ActorList += FString::Printf(TEXT("'%s'"), *OverlappingNames[i]);
+	}
+	if (OverlappingNames.Num() > MaxNames)
+	{
+		ActorList += FString::Printf(TEXT(" (+%d more)"), OverlappingNames.Num() - MaxNames);
+	}
+
+	return FString::Printf(TEXT("Primitive '%s' overlaps existing actor %s"), *Label, *ActorList);
 }
 
 ABlockingVolume* FMonolithMeshBlockoutActions::FindBlockingVolume(const FString& VolumeName, FString& OutError)
@@ -850,12 +920,25 @@ FMonolithActionResult FMonolithMeshBlockoutActions::CreateBlockoutPrimitive(cons
 		Actor->SetFolderPath(FName(TEXT("Blockout")));
 	}
 
+	// Check for overlaps with existing non-blockout geometry
+	TArray<TSharedPtr<FJsonValue>> Warnings;
+	FString OverlapLabel = Label.IsEmpty() ? Actor->GetActorNameOrLabel() : Label;
+	FString OverlapWarning = CheckBlockoutOverlap(World, Actor, OverlapLabel);
+	if (!OverlapWarning.IsEmpty())
+	{
+		Warnings.Add(MakeShared<FJsonValueString>(OverlapWarning));
+	}
+
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("actor_name"), Actor->GetActorNameOrLabel());
 	Result->SetStringField(TEXT("shape"), ShapeName);
 	Result->SetArrayField(TEXT("location"), VectorToJsonArray(Actor->GetActorLocation()));
 	Result->SetArrayField(TEXT("scale"), VectorToJsonArray(Scale));
 	Result->SetStringField(TEXT("category"), Category);
+	if (Warnings.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("warnings"), Warnings);
+	}
 
 	return FMonolithActionResult::Success(Result);
 }
@@ -1029,6 +1112,14 @@ FMonolithActionResult FMonolithMeshBlockoutActions::CreateBlockoutPrimitivesBatc
 		if (!VolumeName.IsEmpty())
 		{
 			Actor->SetFolderPath(FName(*FString::Printf(TEXT("Blockout/%s"), *VolumeName)));
+		}
+
+		// Check for overlaps with existing non-blockout geometry
+		FString OverlapLabel = Label.IsEmpty() ? FString::Printf(TEXT("index_%d"), i) : Label;
+		FString OverlapWarning = CheckBlockoutOverlap(World, Actor, OverlapLabel);
+		if (!OverlapWarning.IsEmpty())
+		{
+			Warnings.Add(MakeShared<FJsonValueString>(OverlapWarning));
 		}
 
 		Created++;
@@ -2027,6 +2118,14 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ImportBlockoutLayout(const T
 		Actor->Tags.Add(FName(*FString::Printf(TEXT("Monolith.Category:%s"), *Category)));
 		Actor->SetFolderPath(FName(*FString::Printf(TEXT("Blockout/%s"), *VolumeName)));
 
+		// Check for overlaps with existing non-blockout geometry
+		FString OverlapLabel = Label.IsEmpty() ? FString::Printf(TEXT("index_%d"), Created) : Label;
+		FString OverlapWarning = CheckBlockoutOverlap(World, Actor, OverlapLabel);
+		if (!OverlapWarning.IsEmpty())
+		{
+			Warnings.Add(MakeShared<FJsonValueString>(OverlapWarning));
+		}
+
 		Created++;
 	}
 
@@ -2649,9 +2748,29 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScatterProps(const TSharedPt
 		PlacedObj->SetStringField(TEXT("mesh"), ChosenMesh->GetPathName());
 		PlacedObj->SetArrayField(TEXT("location"), VectorToJsonArray(SpawnLocation));
 		PlacedObj->SetNumberField(TEXT("scale"), Scale);
+
+		// Check for overlaps with existing non-blockout geometry
+		FString OverlapWarning = CheckBlockoutOverlap(World, PropActor, PropActor->GetActorNameOrLabel());
+		if (!OverlapWarning.IsEmpty())
+		{
+			PlacedObj->SetStringField(TEXT("warning"), OverlapWarning);
+		}
+
 		PlacedArr.Add(MakeShared<FJsonValueObject>(PlacedObj));
 
 		Placed++;
+	}
+
+	// Collect all overlap warnings into a top-level array for easy scanning
+	TArray<TSharedPtr<FJsonValue>> ScatterWarnings;
+	for (const auto& P : PlacedArr)
+	{
+		const TSharedPtr<FJsonObject>& Obj = P->AsObject();
+		FString Warn;
+		if (Obj.IsValid() && Obj->TryGetStringField(TEXT("warning"), Warn))
+		{
+			ScatterWarnings.Add(MakeShared<FJsonValueString>(Warn));
+		}
 	}
 
 	auto Result = MakeShared<FJsonObject>();
@@ -2659,6 +2778,10 @@ FMonolithActionResult FMonolithMeshBlockoutActions::ScatterProps(const TSharedPt
 	Result->SetNumberField(TEXT("requested"), Count);
 	Result->SetNumberField(TEXT("seed"), Seed);
 	Result->SetArrayField(TEXT("props"), PlacedArr);
+	if (ScatterWarnings.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("warnings"), ScatterWarnings);
+	}
 
 	return FMonolithActionResult::Success(Result);
 }

@@ -233,7 +233,7 @@ void FMonolithMeshAudioActions::RegisterActions(FMonolithToolRegistry& Registry)
 
 	// 5. analyze_sound_propagation
 	Registry.RegisterAction(TEXT("mesh"), TEXT("analyze_sound_propagation"),
-		TEXT("Direct trace between two points. Counts wall hits, sums transmission loss per wall material. Returns occlusion factor and audibility."),
+		TEXT("Analyzes sound propagation between two points. Direct trace (wall occlusion) + indirect navmesh path (doorway propagation). Returns whichever path has better audibility."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshAudioActions::AnalyzeSoundPropagation),
 		FParamSchemaBuilder()
 			.Required(TEXT("from"), TEXT("array"), TEXT("Source position [x, y, z]"))
@@ -254,7 +254,7 @@ void FMonolithMeshAudioActions::RegisterActions(FMonolithToolRegistry& Registry)
 
 	// 7. find_sound_paths
 	Registry.RegisterAction(TEXT("mesh"), TEXT("find_sound_paths"),
-		TEXT("Image-source method: direct trace + first-bounce reflections off nearby surfaces. Returns path options with attenuation."),
+		TEXT("Multi-method sound path finder: direct trace, first-bounce reflections (image-source), and navmesh indirect path (doorway propagation). Returns all viable paths sorted by attenuation."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshAudioActions::FindSoundPaths),
 		FParamSchemaBuilder()
 			.Required(TEXT("from"), TEXT("array"), TEXT("Sound source position [x, y, z]"))
@@ -267,7 +267,7 @@ void FMonolithMeshAudioActions::RegisterActions(FMonolithToolRegistry& Registry)
 
 	// 8. can_ai_hear_from
 	Registry.RegisterAction(TEXT("mesh"), TEXT("can_ai_hear_from"),
-		TEXT("Can AI hear the player? Combines footstep loudness + distance attenuation + wall occlusion. Returns yes/faintly/no + detection radius."),
+		TEXT("Can AI hear the player? Direct trace (wall occlusion) + indirect navmesh path (doorway propagation). Uses best path. Returns yes/faintly/no + detection radius."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshAudioActions::CanAiHearFrom),
 		FParamSchemaBuilder()
 			.Required(TEXT("ai_location"), TEXT("array"), TEXT("AI position [x, y, z]"))
@@ -764,34 +764,95 @@ FMonolithActionResult FMonolithMeshAudioActions::AnalyzeSoundPropagation(const T
 		float TotalLossdB;
 		float OcclusionFactor = MonolithMeshAcoustics::TraceOcclusion(World, From, To, WallCount, TotalLossdB);
 
-		Result->SetNumberField(TEXT("wall_count"), WallCount);
-		Result->SetNumberField(TEXT("total_transmission_loss_db"), TotalLossdB);
-		Result->SetNumberField(TEXT("occlusion_factor"), OcclusionFactor);
+		float DirectCombinedFactor = DistAtten * OcclusionFactor;
 
-		float CombinedFactor = DistAtten * OcclusionFactor;
-		Result->SetNumberField(TEXT("combined_factor"), CombinedFactor);
+		// Direct path sub-object
+		auto DirectPathObj = MakeShared<FJsonObject>();
+		DirectPathObj->SetNumberField(TEXT("wall_count"), WallCount);
+		DirectPathObj->SetNumberField(TEXT("total_transmission_loss_db"), TotalLossdB);
+		DirectPathObj->SetNumberField(TEXT("occlusion_factor"), OcclusionFactor);
+		DirectPathObj->SetNumberField(TEXT("combined_factor"), DirectCombinedFactor);
 
-		// Audibility classification
-		FString Audibility;
-		if (CombinedFactor > 0.1f)
+		// Classify direct path audibility
+		FString DirectAudibility;
+		if (DirectCombinedFactor > 0.1f)
 		{
-			Audibility = TEXT("yes");
+			DirectAudibility = TEXT("yes");
 		}
-		else if (CombinedFactor > 0.01f)
+		else if (DirectCombinedFactor > 0.01f)
 		{
-			Audibility = TEXT("faintly");
+			DirectAudibility = TEXT("faintly");
 		}
 		else
 		{
-			Audibility = TEXT("no");
+			DirectAudibility = TEXT("no");
 		}
-		Result->SetStringField(TEXT("can_be_heard"), Audibility);
+		DirectPathObj->SetStringField(TEXT("can_hear"), DirectAudibility);
+		Result->SetObjectField(TEXT("direct_path"), DirectPathObj);
 
-		// Estimated dB at listener (relative to source)
-		float EstimatedReductionDb = 0.0f;
-		if (CombinedFactor > SMALL_NUMBER)
+		// Also set top-level fields for backward compatibility
+		Result->SetNumberField(TEXT("wall_count"), WallCount);
+		Result->SetNumberField(TEXT("total_transmission_loss_db"), TotalLossdB);
+		Result->SetNumberField(TEXT("occlusion_factor"), OcclusionFactor);
+		Result->SetNumberField(TEXT("combined_factor"), DirectCombinedFactor);
+
+		// --- Indirect navmesh path (doorway propagation) ---
+		float BestFactor = DirectCombinedFactor;
+		FString BestPath = TEXT("direct");
+		FString BestAudibility = DirectAudibility;
+
+		auto IndirectResult = MonolithMeshAcoustics::FindIndirectNavmeshPath(World, From, To);
+
+		if (IndirectResult.bFound)
 		{
-			EstimatedReductionDb = -20.0f * FMath::LogX(10.0f, CombinedFactor);
+			float IndirectFactor = IndirectResult.AttenuationFactor;
+
+			auto IndirectPathObj = MakeShared<FJsonObject>();
+			IndirectPathObj->SetStringField(TEXT("via"), TEXT("navmesh"));
+			IndirectPathObj->SetNumberField(TEXT("distance_cm"), IndirectResult.PathDistance);
+			IndirectPathObj->SetNumberField(TEXT("attenuation"), IndirectFactor);
+			IndirectPathObj->SetNumberField(TEXT("segment_count"), FMath::Max(0, IndirectResult.PathPoints.Num() - 1));
+
+			FString IndirectAudibility;
+			if (IndirectFactor > 0.1f)
+			{
+				IndirectAudibility = TEXT("yes");
+			}
+			else if (IndirectFactor > 0.01f)
+			{
+				IndirectAudibility = TEXT("faintly");
+			}
+			else
+			{
+				IndirectAudibility = TEXT("no");
+			}
+			IndirectPathObj->SetStringField(TEXT("can_hear"), IndirectAudibility);
+
+			Result->SetObjectField(TEXT("indirect_path"), IndirectPathObj);
+
+			// Pick the better path
+			if (IndirectFactor > DirectCombinedFactor)
+			{
+				BestFactor = IndirectFactor;
+				BestPath = TEXT("indirect");
+				BestAudibility = IndirectAudibility;
+			}
+		}
+		else if (!IndirectResult.bNavmeshAvailable)
+		{
+			auto IndirectPathObj = MakeShared<FJsonObject>();
+			IndirectPathObj->SetStringField(TEXT("note"), IndirectResult.Note);
+			Result->SetObjectField(TEXT("indirect_path"), IndirectPathObj);
+		}
+
+		Result->SetStringField(TEXT("best_path"), BestPath);
+		Result->SetStringField(TEXT("can_be_heard"), BestAudibility);
+
+		// Estimated dB at listener using best path
+		float EstimatedReductionDb = 0.0f;
+		if (BestFactor > SMALL_NUMBER)
+		{
+			EstimatedReductionDb = -20.0f * FMath::LogX(10.0f, BestFactor);
 		}
 		else
 		{
@@ -973,9 +1034,55 @@ FMonolithActionResult FMonolithMeshAudioActions::FindSoundPaths(const TSharedPtr
 		PathsArr.Add(MakeShared<FJsonValueObject>(PathObj));
 	}
 
+	// === Navmesh indirect path (doorway propagation) ===
+	auto IndirectResult = MonolithMeshAcoustics::FindIndirectNavmeshPath(World, From, To);
+	if (IndirectResult.bFound)
+	{
+		auto IndirectObj = MakeShared<FJsonObject>();
+		IndirectObj->SetBoolField(TEXT("direct"), false);
+		IndirectObj->SetNumberField(TEXT("bounce_count"), 0);
+		IndirectObj->SetNumberField(TEXT("total_distance_cm"), IndirectResult.PathDistance);
+		IndirectObj->SetNumberField(TEXT("attenuation_factor"), IndirectResult.AttenuationFactor);
+		IndirectObj->SetStringField(TEXT("type"), TEXT("navmesh_indirect"));
+
+		TArray<TSharedPtr<FJsonValue>> IndirectPointsArr;
+		for (const FVector& Pt : IndirectResult.PathPoints)
+		{
+			IndirectPointsArr.Add(MakeShared<FJsonValueArray>(VecToArr(Pt)));
+		}
+		IndirectObj->SetArrayField(TEXT("points"), IndirectPointsArr);
+
+		// Insert in sorted position (by attenuation, strongest first)
+		bool bInserted = false;
+		for (int32 i = 0; i < PathsArr.Num(); ++i)
+		{
+			const TSharedPtr<FJsonObject>* ExistingObj;
+			if (PathsArr[i]->TryGetObject(ExistingObj))
+			{
+				double ExistingAtten = 0.0;
+				(*ExistingObj)->TryGetNumberField(TEXT("attenuation_factor"), ExistingAtten);
+				if (IndirectResult.AttenuationFactor > ExistingAtten)
+				{
+					PathsArr.Insert(MakeShared<FJsonValueObject>(IndirectObj), i);
+					bInserted = true;
+					break;
+				}
+			}
+		}
+		if (!bInserted)
+		{
+			PathsArr.Add(MakeShared<FJsonValueObject>(IndirectObj));
+		}
+	}
+
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetArrayField(TEXT("paths"), PathsArr);
 	Result->SetNumberField(TEXT("path_count"), PathsArr.Num());
+
+	if (!IndirectResult.bNavmeshAvailable && !IndirectResult.bFound)
+	{
+		Result->SetStringField(TEXT("navmesh_note"), IndirectResult.Note);
+	}
 
 	return FMonolithActionResult::Success(Result);
 }
@@ -1021,41 +1128,124 @@ FMonolithActionResult FMonolithMeshAudioActions::CanAiHearFrom(const TSharedPtr<
 	}
 
 	// Compute detection
-	float Distance = FVector::Dist(AiLocation, PlayerLocation);
+	float DirectDistance = FVector::Dist(AiLocation, PlayerLocation);
 
 	// Effective sound radius = hearing_range * footstep_loudness
 	float EffectiveRadius = AiHearingRange * FloorProps.FootstepLoudness;
 
-	// Wall occlusion
+	// === Direct path: wall occlusion ===
 	int32 WallCount;
 	float TotalLossdB;
 	float OcclusionFactor = MonolithMeshAcoustics::TraceOcclusion(World, PlayerLocation, AiLocation, WallCount, TotalLossdB);
 
-	// Effective hearing distance with occlusion
-	float EffectiveRadiusWithOcclusion = EffectiveRadius * OcclusionFactor;
+	float DirectEffectiveRadius = EffectiveRadius * OcclusionFactor;
 
-	// Determine audibility
-	FString Audibility;
-	if (Distance <= EffectiveRadiusWithOcclusion)
+	FString DirectAudibility;
+	if (DirectDistance <= DirectEffectiveRadius)
 	{
-		Audibility = TEXT("yes");
+		DirectAudibility = TEXT("yes");
 	}
-	else if (Distance <= EffectiveRadiusWithOcclusion * 1.5f)
+	else if (DirectDistance <= DirectEffectiveRadius * 1.5f)
 	{
-		Audibility = TEXT("faintly");
+		DirectAudibility = TEXT("faintly");
 	}
 	else
 	{
-		Audibility = TEXT("no");
+		DirectAudibility = TEXT("no");
+	}
+
+	// === Indirect path: navmesh doorway propagation ===
+	FString IndirectAudibility = TEXT("no");
+	float IndirectDistance = 0.0f;
+	float IndirectAttenuation = 0.0f;
+	bool bIndirectFound = false;
+	FString IndirectNote;
+
+	auto IndirectResult = MonolithMeshAcoustics::FindIndirectNavmeshPath(World, PlayerLocation, AiLocation);
+	if (IndirectResult.bFound)
+	{
+		bIndirectFound = true;
+		IndirectDistance = IndirectResult.PathDistance;
+		IndirectAttenuation = IndirectResult.AttenuationFactor;
+
+		// For indirect path: effective radius uses distance-only attenuation (no wall occlusion)
+		// Check if the AI is within hearing range along the navmesh path distance
+		if (IndirectDistance <= EffectiveRadius)
+		{
+			IndirectAudibility = TEXT("yes");
+		}
+		else if (IndirectDistance <= EffectiveRadius * 1.5f)
+		{
+			IndirectAudibility = TEXT("faintly");
+		}
+		else
+		{
+			IndirectAudibility = TEXT("no");
+		}
+	}
+	else
+	{
+		IndirectNote = IndirectResult.Note;
+	}
+
+	// === Pick the best path ===
+	// Rank: yes > faintly > no
+	auto AudibilityRank = [](const FString& A) -> int32
+	{
+		if (A == TEXT("yes")) return 2;
+		if (A == TEXT("faintly")) return 1;
+		return 0;
+	};
+
+	FString BestPath = TEXT("direct");
+	FString BestAudibility = DirectAudibility;
+	float BestEffectiveRadius = DirectEffectiveRadius;
+
+	if (bIndirectFound && AudibilityRank(IndirectAudibility) > AudibilityRank(DirectAudibility))
+	{
+		BestPath = TEXT("indirect");
+		BestAudibility = IndirectAudibility;
+		// For indirect, effective radius is just the base radius (no wall penalty)
+		BestEffectiveRadius = EffectiveRadius;
 	}
 
 	auto Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("can_hear"), Audibility);
+
+	// Direct path details
+	auto DirectPathObj = MakeShared<FJsonObject>();
+	DirectPathObj->SetNumberField(TEXT("wall_count"), WallCount);
+	DirectPathObj->SetNumberField(TEXT("occlusion_factor"), OcclusionFactor);
+	DirectPathObj->SetStringField(TEXT("can_hear"), DirectAudibility);
+	DirectPathObj->SetNumberField(TEXT("effective_radius_cm"), DirectEffectiveRadius);
+	Result->SetObjectField(TEXT("direct_path"), DirectPathObj);
+
+	// Indirect path details
+	if (bIndirectFound)
+	{
+		auto IndirectPathObj = MakeShared<FJsonObject>();
+		IndirectPathObj->SetStringField(TEXT("via"), TEXT("navmesh"));
+		IndirectPathObj->SetNumberField(TEXT("distance_cm"), IndirectDistance);
+		IndirectPathObj->SetNumberField(TEXT("attenuation"), IndirectAttenuation);
+		IndirectPathObj->SetStringField(TEXT("can_hear"), IndirectAudibility);
+		Result->SetObjectField(TEXT("indirect_path"), IndirectPathObj);
+	}
+	else if (!IndirectResult.bNavmeshAvailable)
+	{
+		auto IndirectPathObj = MakeShared<FJsonObject>();
+		IndirectPathObj->SetStringField(TEXT("note"), IndirectNote);
+		Result->SetObjectField(TEXT("indirect_path"), IndirectPathObj);
+	}
+
+	// Best path selection
+	Result->SetStringField(TEXT("best_path"), BestPath);
+	Result->SetStringField(TEXT("can_hear"), BestAudibility);
 	Result->SetStringField(TEXT("floor_surface"), FloorProps.SurfaceName);
 	Result->SetNumberField(TEXT("footstep_loudness"), FloorProps.FootstepLoudness);
-	Result->SetNumberField(TEXT("distance_cm"), Distance);
-	Result->SetNumberField(TEXT("effective_hearing_radius_cm"), EffectiveRadiusWithOcclusion);
-	Result->SetNumberField(TEXT("detection_radius_cm"), EffectiveRadiusWithOcclusion);
+	Result->SetNumberField(TEXT("distance_cm"), DirectDistance);
+	Result->SetNumberField(TEXT("effective_hearing_radius_cm"), BestEffectiveRadius);
+	Result->SetNumberField(TEXT("detection_radius_cm"), BestEffectiveRadius);
+
+	// Backward compat fields
 	Result->SetNumberField(TEXT("wall_count"), WallCount);
 	Result->SetNumberField(TEXT("occlusion_factor"), OcclusionFactor);
 

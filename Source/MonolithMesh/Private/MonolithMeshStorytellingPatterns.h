@@ -42,6 +42,9 @@ struct FStorytellingElement
 
 	/** Scale variance (multiplied: 1.0 +/- this value) */
 	float ScaleVariance = 0.1f;
+
+	/** If true, this element should be placed on walls (horizontal trace outward) rather than floors (vertical trace down) */
+	bool bWallElement = false;
 };
 
 /** A complete storytelling pattern */
@@ -159,7 +162,7 @@ namespace StorytellingPatterns
 			  true, 50.0f, 300.0f, 3, 10, 360.0f, 0.2f },
 			// Wall discoloration (higher on Z)
 			{ TEXT("wall_discolor"), TEXT("decal"), FVector(0, 0, 80), FVector(20, 100, 100),
-			  true, 30.0f, 200.0f, 1, 5, 360.0f, 0.3f },
+			  true, 30.0f, 200.0f, 1, 5, 360.0f, 0.3f, /*bWallElement=*/ true },
 			// Small organic spots
 			{ TEXT("organic_spot"), TEXT("decal"), FVector::ZeroVector, FVector(10, 25, 25),
 			  true, 20.0f, 350.0f, 4, 15, 360.0f, 0.35f },

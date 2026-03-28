@@ -6,6 +6,8 @@
 #include "CollisionQueryParams.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "PhysicsEngine/PhysicsSettings.h"
+#include "NavigationSystem.h"
+#include "NavigationData.h"
 
 // ============================================================================
 // Hardcoded acoustic defaults (calibrated from Steam Audio reference)
@@ -503,4 +505,75 @@ MonolithMeshAcoustics::FReverbSuggestion MonolithMeshAcoustics::SuggestReverbSet
 	}
 
 	return Suggestion;
+}
+
+// ============================================================================
+// Navmesh Indirect Path (doorway propagation)
+// ============================================================================
+
+MonolithMeshAcoustics::FIndirectPathResult MonolithMeshAcoustics::FindIndirectNavmeshPath(
+	UWorld* World, const FVector& From, const FVector& To)
+{
+	FIndirectPathResult Result;
+
+	if (!World)
+	{
+		Result.Note = TEXT("No world available");
+		return Result;
+	}
+
+	UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
+	if (!NavSys)
+	{
+		Result.Note = TEXT("Navigation system not available");
+		return Result;
+	}
+
+	ANavigationData* NavData = NavSys->GetDefaultNavDataInstance(FNavigationSystem::DontCreate);
+	if (!NavData)
+	{
+		Result.Note = TEXT("Navmesh not built — indirect path check skipped");
+		return Result;
+	}
+
+	Result.bNavmeshAvailable = true;
+
+	// Use default agent properties
+	FNavAgentProperties AgentProps;
+	AgentProps.AgentRadius = 42.0f;
+	AgentProps.AgentHeight = 192.0f;
+
+	FPathFindingQuery Query(nullptr, *NavData, From, To);
+	Query.SetAllowPartialPaths(false); // We need a complete path to be useful
+
+	FPathFindingResult PathResult = NavSys->FindPathSync(AgentProps, Query);
+
+	if (!PathResult.IsSuccessful() || !PathResult.Path.IsValid() || PathResult.Path->IsPartial())
+	{
+		Result.Note = TEXT("No complete navmesh path between points");
+		return Result;
+	}
+
+	const TArray<FNavPathPoint>& NavPoints = PathResult.Path->GetPathPoints();
+	if (NavPoints.Num() < 2)
+	{
+		Result.Note = TEXT("Degenerate navmesh path");
+		return Result;
+	}
+
+	// Compute total path distance
+	float TotalDist = 0.0f;
+	for (int32 i = 1; i < NavPoints.Num(); ++i)
+	{
+		TotalDist += FVector::Dist(NavPoints[i - 1].Location, NavPoints[i].Location);
+		Result.PathPoints.Add(NavPoints[i - 1].Location);
+	}
+	Result.PathPoints.Add(NavPoints.Last().Location);
+	Result.PathDistance = TotalDist;
+
+	// Distance-only attenuation (no wall occlusion — sound travels through open air)
+	Result.AttenuationFactor = ComputeDistanceAttenuation(TotalDist);
+	Result.bFound = true;
+
+	return Result;
 }

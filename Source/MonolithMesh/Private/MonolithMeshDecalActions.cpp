@@ -105,9 +105,11 @@ ADecalActor* FMonolithMeshDecalActions::SpawnAlignedDecal(
 	float RandomYaw,
 	const FCollisionQueryParams& TraceParams)
 {
-	// Trace downward to find surface
-	FVector TraceStart = Location + FVector(0, 0, 500.0f);
-	FVector TraceEnd = Location - FVector(0, 0, 1000.0f);
+	// Trace downward to find surface. Start just above the provided location (50cm)
+	// rather than far above (500cm) to avoid hitting ceilings or upper floors in
+	// multi-story environments. The caller's Z should already be near the target surface.
+	FVector TraceStart = Location + FVector(0, 0, 50.0f);
+	FVector TraceEnd = Location - FVector(0, 0, 500.0f);
 
 	FHitResult Hit;
 	bool bHit = World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, TraceParams);
@@ -775,9 +777,9 @@ FMonolithActionResult FMonolithMeshDecalActions::PlaceAlongPath(const TSharedPtr
 		}
 		else
 		{
-			// Spawn static mesh prop
-			FVector TraceStart = Pt + FVector(0, 0, 500.0f);
-			FVector TraceEnd = Pt - FVector(0, 0, 1000.0f);
+			// Spawn static mesh prop — trace from near the path point, not far above
+			FVector TraceStart = Pt + FVector(0, 0, 50.0f);
+			FVector TraceEnd = Pt - FVector(0, 0, 500.0f);
 			FHitResult Hit;
 			bool bHit = World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, TraceParams);
 
@@ -1147,8 +1149,11 @@ FMonolithActionResult FMonolithMeshDecalActions::PlaceStorytellingScene(const TS
 				Offset = DirRotation.RotateVector(Offset);
 			}
 
-			// Add Z offset from element definition
-			Offset.Z += Elem.RelativeOffset.Z;
+			// Add Z offset from element definition (only for radial — fixed offsets already include it)
+			if (Elem.bRadial)
+			{
+				Offset.Z += Elem.RelativeOffset.Z;
+			}
 
 			FVector PlaceLocation = Location + Offset;
 
@@ -1162,18 +1167,55 @@ FMonolithActionResult FMonolithMeshDecalActions::PlaceStorytellingScene(const TS
 			// Rotation
 			float RotYaw = RandStream.FRandRange(-Elem.RotationVariance * 0.5f, Elem.RotationVariance * 0.5f);
 
-			// Spawn as decal actor (storytelling scenes are primarily decal-based)
-			// The agent assigns actual materials after seeing the placed actor names
-			FVector TraceStart = PlaceLocation + FVector(0, 0, 500.0f);
-			FVector TraceEnd = PlaceLocation - FVector(0, 0, 1000.0f);
+			FVector SpawnLoc;
+			FVector ProjectionDir;
 
-			FHitResult Hit;
-			bool bHit = World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, TraceParams);
+			if (Elem.bWallElement)
+			{
+				// Wall elements: trace horizontally from scene center outward to find a wall
+				FVector HorizDir = FVector(PlaceLocation.X - Location.X, PlaceLocation.Y - Location.Y, 0.0f);
+				if (HorizDir.IsNearlyZero())
+				{
+					HorizDir = FVector(1, 0, 0); // fallback direction
+				}
+				HorizDir.Normalize();
 
-			FVector SpawnLoc = bHit ? Hit.ImpactPoint : PlaceLocation;
+				// Trace from center outward, at the desired wall height
+				float WallTraceZ = Location.Z + Elem.RelativeOffset.Z;
+				FVector WallTraceStart = FVector(Location.X, Location.Y, WallTraceZ);
+				FVector WallTraceEnd = WallTraceStart + HorizDir * 1000.0f;
 
-			// Orientation: project into surface
-			FVector ProjectionDir = bHit ? -Hit.ImpactNormal : FVector(0, 0, -1);
+				FHitResult WallHit;
+				bool bWallHit = World->LineTraceSingleByChannel(WallHit, WallTraceStart, WallTraceEnd, ECC_Visibility, TraceParams);
+
+				if (bWallHit)
+				{
+					// Place on the wall surface, pulled back slightly to avoid z-fighting
+					SpawnLoc = WallHit.ImpactPoint - HorizDir * 0.5f;
+					ProjectionDir = -WallHit.ImpactNormal;
+				}
+				else
+				{
+					// No wall found — place at computed position, project into the horizontal direction
+					SpawnLoc = PlaceLocation;
+					ProjectionDir = HorizDir;
+				}
+			}
+			else
+			{
+				// Ground elements: trace downward from near the known floor level (Location.Z)
+				// Starting from Location.Z + 50 avoids hitting ceilings/upper floors that a +500 offset would hit
+				FVector TraceStart = FVector(PlaceLocation.X, PlaceLocation.Y, Location.Z + 50.0f);
+				FVector TraceEnd = FVector(PlaceLocation.X, PlaceLocation.Y, Location.Z - 500.0f);
+
+				FHitResult Hit;
+				bool bHit = World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, TraceParams);
+
+				SpawnLoc = bHit ? Hit.ImpactPoint : FVector(PlaceLocation.X, PlaceLocation.Y, Location.Z);
+				ProjectionDir = bHit ? -Hit.ImpactNormal : FVector(0, 0, -1);
+			}
+
+			// Orientation: project along the determined direction
 			FRotator SpawnRot = FRotationMatrix::MakeFromX(ProjectionDir).Rotator();
 			SpawnRot.Roll += RotYaw;
 

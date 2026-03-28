@@ -328,11 +328,19 @@ FMonolithActionResult FMonolithMeshLightingActions::SampleLightLevels(const TSha
 			if (DominantIdx >= 0 && DominantIdx < Lights.Num())
 			{
 				Sample->SetStringField(TEXT("dominant_light"), Lights[DominantIdx].Name);
+				int32 DomDummy;
 				Sample->SetNumberField(TEXT("dominant_light_contribution"),
 					MonolithLightingCapture::ComputeAnalyticLuminance(World, Points[i],
-						TArray<MonolithLightingCapture::FLightInfo>{Lights[DominantIdx]}, DominantIdx));
-				Sample->SetBoolField(TEXT("in_shadow"),
-					MonolithLightingCapture::IsInShadow(World, Points[i], Lights[DominantIdx].Location));
+						TArray<MonolithLightingCapture::FLightInfo>{Lights[DominantIdx]}, DomDummy));
+
+				// Derive in_shadow from whether majority of light is blocked:
+				// compare shadowed luminance to unshadowed luminance
+				int32 UnshadowedDummy;
+				float UnshadowedLum = MonolithLightingCapture::ComputeAnalyticLuminance(
+					World, Points[i], Lights, UnshadowedDummy, /*bTraceShadows=*/ false);
+				bool bInShadow = (UnshadowedLum > 0.0f) && (AnalyticLum < UnshadowedLum * 0.5f);
+				Sample->SetBoolField(TEXT("in_shadow"), bInShadow);
+
 				Sample->SetNumberField(TEXT("dominant_color_temperature"), Lights[DominantIdx].ColorTemperature);
 			}
 			else

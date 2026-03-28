@@ -55,13 +55,13 @@ void FMonolithMeshModule::StartupModule()
 void FMonolithMeshModule::ShutdownModule()
 {
 #if WITH_GEOMETRYSCRIPT
-	if (HandlePool)
+	if (IsValid(HandlePool))
 	{
 		HandlePool->Teardown();
 		HandlePool->RemoveFromRoot();
-		HandlePool = nullptr;
 		FMonolithMeshOperationActions::SetHandlePool(nullptr);
 	}
+	HandlePool = nullptr;
 #endif
 
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("mesh"));

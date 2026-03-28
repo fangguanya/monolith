@@ -106,10 +106,12 @@ namespace MonolithLightingCapture
 	TArray<FLightInfo> GatherLightsInRegion(UWorld* World, const FBox& Region);
 
 	/** Compute analytic illumination at a point from all lights (inverse-square, no bounces).
+	 *  Shadow traces reduce blocked light contributions to a 5% ambient fraction.
 	 *  @param OutDominantLight  Index into Lights of the strongest contributor (-1 if none)
+	 *  @param bTraceShadows    If true, line-trace to each light and attenuate blocked ones
 	 *  @return Total analytic luminance estimate */
 	float ComputeAnalyticLuminance(UWorld* World, const FVector& Point, const TArray<FLightInfo>& Lights,
-		int32& OutDominantLight);
+		int32& OutDominantLight, bool bTraceShadows = true);
 
 	/** Check if a point is in shadow from a light (line trace) */
 	bool IsInShadow(UWorld* World, const FVector& Point, const FVector& LightLocation);

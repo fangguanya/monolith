@@ -153,6 +153,34 @@ namespace MonolithMeshAcoustics
 		int32 MaxBounces = 2, int32 CandidateSurfaces = 16);
 
 	// ========================================================================
+	// Navmesh Indirect Path (doorway propagation)
+	// ========================================================================
+
+	/** Result of an indirect navmesh path check */
+	struct FIndirectPathResult
+	{
+		bool bFound = false;                // Was a navmesh path found?
+		bool bNavmeshAvailable = false;     // Is navmesh built at all?
+		float PathDistance = 0.0f;           // Total navmesh path length in cm
+		float AttenuationFactor = 0.0f;     // Distance-only attenuation (no wall occlusion)
+		TArray<FVector> PathPoints;         // Navmesh path waypoints
+		FString Note;                       // Diagnostic note (e.g. "navmesh not built")
+	};
+
+	/**
+	 * Find an indirect sound path via navmesh (through doorways/openings).
+	 * When direct line trace is blocked by walls, sound can still travel through
+	 * open air paths (doorways, corridors) — the navmesh approximates these routes.
+	 * Attenuation uses distance only (no wall occlusion — the path goes through open air).
+	 *
+	 * @param World   Editor world
+	 * @param From    Sound source position
+	 * @param To      Listener position
+	 * @return Indirect path result (check bFound)
+	 */
+	FIndirectPathResult FindIndirectNavmeshPath(UWorld* World, const FVector& From, const FVector& To);
+
+	// ========================================================================
 	// Reverb Suggestion
 	// ========================================================================
 

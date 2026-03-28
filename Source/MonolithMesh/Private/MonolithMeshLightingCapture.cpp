@@ -296,11 +296,17 @@ TArray<MonolithLightingCapture::FLightInfo> MonolithLightingCapture::GatherLight
 }
 
 float MonolithLightingCapture::ComputeAnalyticLuminance(UWorld* World, const FVector& Point,
-	const TArray<FLightInfo>& Lights, int32& OutDominantLight)
+	const TArray<FLightInfo>& Lights, int32& OutDominantLight, bool bTraceShadows)
 {
+	// Ambient fraction for shadowed lights — a small amount leaks through
+	// to approximate indirect bounce even in full shadow
+	constexpr float ShadowAmbientFraction = 0.05f;
+
 	OutDominantLight = -1;
 	float TotalLuminance = 0.0f;
 	float MaxContribution = 0.0f;
+
+	FCollisionQueryParams ShadowTraceParams(SCENE_QUERY_STAT(MonolithAnalyticShadow), true);
 
 	for (int32 i = 0; i < Lights.Num(); ++i)
 	{
@@ -351,6 +357,29 @@ float MonolithLightingCapture::ComputeAnalyticLuminance(UWorld* World, const FVe
 		// Weight by light color luminance
 		float ColorLum = ComputeLuminance(L.Color);
 		Contribution *= FMath::Max(ColorLum, 0.01f);
+
+		// Shadow trace: if geometry blocks the path from point to light, reduce
+		// contribution to a small ambient fraction instead of full value
+		if (bTraceShadows && World && Contribution > 0.0f)
+		{
+			FVector LightPos;
+			if (L.Type == TEXT("Directional"))
+			{
+				// Trace in the reverse of the light direction, far enough to catch occluders
+				LightPos = Point - L.Rotation.Vector() * 50000.0f;
+			}
+			else
+			{
+				LightPos = L.Location;
+			}
+
+			FHitResult ShadowHit;
+			if (World->LineTraceSingleByChannel(ShadowHit, Point, LightPos, ECC_Visibility, ShadowTraceParams))
+			{
+				// Light is blocked — reduce to ambient leak
+				Contribution *= ShadowAmbientFraction;
+			}
+		}
 
 		TotalLuminance += Contribution;
 		if (Contribution > MaxContribution)
