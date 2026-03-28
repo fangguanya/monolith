@@ -53,6 +53,7 @@
 #include "SparseVolumeTexture/SparseVolumeTexture.h"
 #include "Materials/MaterialParameterCollection.h"
 #include "MaterialGraph/MaterialGraphNode.h"
+#include "IMonolithGraphFormatter.h"
 
 // ============================================================================
 // Pin name normalization — UE's GetShortenPinName converts raw names to
@@ -350,6 +351,10 @@ void FMonolithMaterialActions::RegisterActions(FMonolithToolRegistry& Registry)
 		FMonolithActionHandler::CreateStatic(&FMonolithMaterialActions::AutoLayout),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Material or material function asset path"))
+			.Optional(TEXT("formatter"), TEXT("string"),
+				TEXT("Formatter: 'auto' (default, prefers Blueprint Assist if available), "
+					 "'blueprint_assist' (requires asset open in editor), or 'monolith' (UE built-in layout)"),
+				TEXT("auto"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("material"), TEXT("duplicate_expression"),
@@ -3686,6 +3691,73 @@ FMonolithActionResult FMonolithMaterialActions::AutoLayout(const TSharedPtr<FJso
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset at '%s'"), *AssetPath));
 	}
 
+	FString Formatter = TEXT("auto");
+	if (Params->HasField(TEXT("formatter")))
+	{
+		Formatter = Params->GetStringField(TEXT("formatter"));
+	}
+
+	// Validate formatter
+	if (Formatter != TEXT("auto") && Formatter != TEXT("blueprint_assist") && Formatter != TEXT("monolith"))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Unknown formatter '%s'. Valid: 'auto', 'blueprint_assist', 'monolith'"), *Formatter));
+	}
+
+	// --- BA formatter path (UMaterial only — MaterialFunctions have no MaterialGraph) ---
+	if (Formatter == TEXT("auto") || Formatter == TEXT("blueprint_assist"))
+	{
+		bool bExplicitBA = (Formatter == TEXT("blueprint_assist"));
+
+		UMaterial* Mat = Cast<UMaterial>(LoadedAsset);
+		UEdGraph* MaterialGraph = (Mat && Mat->MaterialGraph) ? Mat->MaterialGraph : nullptr;
+
+		bool bBAAvailable = MaterialGraph
+			&& IMonolithGraphFormatter::IsAvailable()
+			&& IMonolithGraphFormatter::Get().SupportsGraph(MaterialGraph);
+
+		if (bBAAvailable)
+		{
+			int32 NodesFormatted = 0;
+			FString ErrorMessage;
+			if (IMonolithGraphFormatter::Get().FormatGraph(MaterialGraph, NodesFormatted, ErrorMessage))
+			{
+				auto Result = MakeShared<FJsonObject>();
+				Result->SetStringField(TEXT("asset_path"), AssetPath);
+				Result->SetStringField(TEXT("type"), TEXT("Material"));
+				Result->SetStringField(TEXT("formatter_used"), TEXT("blueprint_assist"));
+				Result->SetNumberField(TEXT("nodes_formatted"), NodesFormatted);
+				Result->SetBoolField(TEXT("positions_changed"), true);
+
+				FMonolithFormatterInfo Info = IMonolithGraphFormatter::Get().GetFormatterInfo(MaterialGraph);
+				Result->SetStringField(TEXT("formatter_type"), Info.FormatterType);
+				Result->SetStringField(TEXT("graph_class"), Info.GraphClassName);
+				return FMonolithActionResult::Success(Result);
+			}
+
+			if (bExplicitBA)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Blueprint Assist formatter failed: %s"), *ErrorMessage));
+			}
+			// auto mode: fall through to built-in
+		}
+		else if (bExplicitBA)
+		{
+			if (!MaterialGraph)
+			{
+				return FMonolithActionResult::Error(
+					TEXT("Blueprint Assist formatting is only supported for UMaterial assets (not MaterialFunctions). "
+						 "Use formatter='monolith' for MaterialFunction layout."));
+			}
+			return FMonolithActionResult::Error(
+				TEXT("Blueprint Assist formatter is not available. "
+					 "Install Blueprint Assist and restart the editor, or ensure the material is open in an editor tab."));
+		}
+	}
+
+	// --- Built-in UMaterialEditingLibrary path ---
+
 	auto ResultJson = MakeShared<FJsonObject>();
 	ResultJson->SetStringField(TEXT("asset_path"), AssetPath);
 
@@ -3697,7 +3769,8 @@ FMonolithActionResult FMonolithMaterialActions::AutoLayout(const TSharedPtr<FJso
 		UMaterialEditingLibrary::LayoutMaterialFunctionExpressions(MatFunc);
 		ResultJson->SetStringField(TEXT("type"), TEXT("MaterialFunction"));
 		ResultJson->SetNumberField(TEXT("expression_count"), ExprCount);
-		ResultJson->SetBoolField(TEXT("positions_changed"), true);  // UX #3
+		ResultJson->SetBoolField(TEXT("positions_changed"), true);
+		ResultJson->SetStringField(TEXT("formatter_used"), TEXT("monolith"));
 		return FMonolithActionResult::Success(ResultJson);
 	}
 
@@ -3709,7 +3782,8 @@ FMonolithActionResult FMonolithMaterialActions::AutoLayout(const TSharedPtr<FJso
 		UMaterialEditingLibrary::LayoutMaterialExpressions(Mat);
 		ResultJson->SetStringField(TEXT("type"), TEXT("Material"));
 		ResultJson->SetNumberField(TEXT("expression_count"), ExprCount);
-		ResultJson->SetBoolField(TEXT("positions_changed"), true);  // UX #3
+		ResultJson->SetBoolField(TEXT("positions_changed"), true);
+		ResultJson->SetStringField(TEXT("formatter_used"), TEXT("monolith"));
 		return FMonolithActionResult::Success(ResultJson);
 	}
 

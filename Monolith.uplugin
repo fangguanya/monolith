@@ -51,6 +51,11 @@
 			"Name": "GeometryScripting",
 			"Enabled": true,
 			"Optional": true
+		},
+		{
+			"Name": "BlueprintAssist",
+			"Enabled": true,
+			"Optional": true
 		}
 	],
 	"Modules": [
@@ -58,6 +63,11 @@
 			"Name": "MonolithCore",
 			"Type": "Editor",
 			"LoadingPhase": "PostEngineInit"
+		},
+		{
+			"Name": "MonolithBABridge",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		},
 		{
 			"Name": "MonolithBlueprint",

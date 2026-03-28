@@ -45,6 +45,7 @@ Monolith.uplugin
   MonolithSource        — Engine source + API lookup (11 actions)
   MonolithUI            — Widget blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility (42 actions)
   MonolithMesh          — Mesh inspection, scene manipulation, spatial queries, level blockout, GeometryScript ops, horror/accessibility, lighting, audio/acoustics, performance, decals, level design, tech art, context props, procedural geometry (sweep walls, auto-collision, proc mesh caching, blueprint prefabs), genre presets, encounter design, hospice reports, procedural town generator (240 actions)
+  MonolithBABridge      — Optional IModularFeatures bridge for Blueprint Assist integration. Exposes IMonolithGraphFormatter; enables BA-powered auto_layout across blueprint, material, animation, and niagara modules when Blueprint Assist is present (0 MCP actions — integration only)
 ```
 
 ### Discovery/Dispatch Pattern
@@ -66,6 +67,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 |--------|--------------|------|
 | MonolithCore | PostEngineInit | Editor |
 | All others (10) | Default | Editor |
+| MonolithBABridge | Default | Editor (optional) |
 
 ### Plugin Dependencies
 
@@ -195,6 +197,11 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | `duplicate_blueprint` | `asset_path`, `new_path` | Duplicate a Blueprint asset to a new path |
 | `get_dependencies` | `asset_path` | List all hard and soft asset dependencies |
 
+**Layout (1)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `auto_layout` | `asset_path`, `graph_name`?, `formatter`? | Auto-arrange nodes in a Blueprint graph. `formatter`: `"auto"` (default) — uses Blueprint Assist if available, falls back to built-in hierarchical layout; `"blueprint_assist"` — requires BA, errors if not present; `"builtin"` — built-in layout only |
+
 ---
 
 ### 3.3 MonolithMaterial
@@ -255,6 +262,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | `get_function_instance_info` | Read MFI parent chain and all parameter overrides (11 types: scalar, vector, texture, font, static switch, static component mask, and more) |
 | `layout_function_expressions` | Auto-arrange material function graph layout |
 | `rename_function_parameter_group` | Rename a parameter group across all parameters in a material function |
+| `auto_layout` | Auto-arrange expression nodes in a material graph. `formatter`: `"auto"` (default) — uses Blueprint Assist if available, falls back to built-in layout; `"blueprint_assist"` — requires BA; `"builtin"` — built-in only |
 
 **Extended Actions (1)**
 | Action | Change |
@@ -389,6 +397,11 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | `add_database_sequence` | Add an animation sequence to a PoseSearch database |
 | `remove_database_sequence` | Remove a sequence from a PoseSearch database by index |
 | `get_database_stats` | Get PoseSearch database statistics (pose count, search mode, costs) |
+
+**Layout (1)**
+| Action | Description |
+|--------|-------------|
+| `auto_layout` | Auto-arrange nodes in an Animation Blueprint graph. `formatter`: `"auto"` (default) — uses Blueprint Assist if available, falls back to built-in hierarchical layout; `"blueprint_assist"` — requires BA; `"builtin"` — built-in only. Optional `graph_name` to target a specific graph |
 
 ---
 
@@ -557,7 +570,7 @@ These exist because Epic's `FNiagaraStackGraphUtilities` functions lack `NIAGARA
 | `get_effect_type` | Get effect type settings (scalability, significance, budget) |
 | `set_effect_type_property` | Set a property on an effect type |
 
-**Utilities (4)**
+**Utilities (5)**
 | Action | Description |
 |--------|-------------|
 | `get_available_parameters` | List available parameters that can be bound to inputs |
@@ -565,6 +578,7 @@ These exist because Epic's `FNiagaraStackGraphUtilities` functions lack `NIAGARA
 | `diff_systems` | Compare two Niagara systems and return structural differences |
 | `save_emitter_as_template` | Save an emitter as a reusable template asset |
 | `clone_module_overrides` | Clone input overrides from one module to another |
+| `auto_layout` | Auto-arrange nodes in a Niagara module script graph. `formatter`: `"auto"` (default) — uses Blueprint Assist if available, falls back to built-in layout; `"blueprint_assist"` — requires BA; `"builtin"` — built-in only |
 
 #### UE 5.7 Compatibility Fixes (6 sites)
 
@@ -1094,6 +1108,73 @@ SP1's `create_building_from_grid` returns a JSON descriptor consumed by all down
 
 ---
 
+### 3.12 MonolithBABridge
+
+**Dependencies:** Core, CoreUObject, Engine, MonolithCore (optional — loads only when both Monolith and Blueprint Assist are present)
+
+MonolithBABridge is an **optional** editor module that bridges Blueprint Assist's graph formatter into Monolith's `auto_layout` actions. It registers no MCP actions of its own. Its sole job is to expose BA's layout logic via `IModularFeatures` so that blueprint, material, animation, and niagara modules can consume it without a hard dependency on Blueprint Assist.
+
+#### Classes
+
+| Class | Responsibility |
+|-------|---------------|
+| `FMonolithBABridgeModule` | IModuleInterface. On startup, checks for Blueprint Assist via `FModuleManager::IsModuleLoaded("BlueprintAssist")` and registers `IMonolithGraphFormatter` impl via `IModularFeatures::Get().RegisterFeature()` |
+| `FMonolithBAGraphFormatter` | Concrete `IMonolithGraphFormatter` impl. Delegates to BA's `FBAFormatterUtils` / `FBANodePositioner`. Reads cached node sizes from `FBACache` when available |
+
+#### IMonolithGraphFormatter Interface
+
+```cpp
+class IMonolithGraphFormatter
+{
+public:
+    virtual ~IMonolithGraphFormatter() = default;
+
+    /** Feature name used with IModularFeatures */
+    static const FName FeatureName;
+
+    /**
+     * Format a graph using the registered formatter.
+     * @param Graph  Target graph to layout
+     * @return true if layout was applied
+     */
+    virtual bool FormatGraph(UEdGraph* Graph) = 0;
+};
+```
+
+Consumer pattern used by `auto_layout` actions in each domain module:
+
+```cpp
+// Check at call time — BA may not be loaded
+if (IModularFeatures::Get().IsFeatureAvailable(IMonolithGraphFormatter::FeatureName))
+{
+    auto& Formatter = IModularFeatures::Get().GetFeature<IMonolithGraphFormatter>(
+        IMonolithGraphFormatter::FeatureName);
+    Formatter.FormatGraph(Graph);
+}
+```
+
+#### `formatter` Parameter (three-mode behavior)
+
+All four `auto_layout` actions accept an optional `formatter` param:
+
+| Value | Behavior |
+|-------|----------|
+| `"auto"` (default) | Uses Blueprint Assist formatter if `IMonolithGraphFormatter` is registered; otherwise falls back to built-in hierarchical layout. Never errors |
+| `"blueprint_assist"` | Forces BA formatter. Returns an error if MonolithBABridge is not loaded or BA is not present |
+| `"builtin"` | Forces built-in layout regardless of BA presence |
+
+#### `bEnableBlueprintAssist` Setting
+
+`UMonolithSettings` exposes a toggle that controls whether MonolithBABridge attempts registration on startup:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `bEnableBlueprintAssist` | True | When false, MonolithBABridge skips `IModularFeatures` registration even if Blueprint Assist is present. `formatter: "auto"` will fall back to built-in; `formatter: "blueprint_assist"` will error |
+
+**Config key:** `bEnableBlueprintAssist` in `[/Script/MonolithCore.MonolithSettings]`
+
+---
+
 ## 4. Source Indexer
 
 ### 4.1 C++ Indexer (current)
@@ -1250,6 +1331,7 @@ All skills follow a common structure: YAML frontmatter, Discovery section, Asset
 | bIndexEnabled | True | Enable Index module |
 | bSourceEnabled | True | Enable Source module |
 | bUIEnabled | True | Enable UI module |
+| bEnableBlueprintAssist | True | Allow MonolithBABridge to register IMonolithGraphFormatter when Blueprint Assist is present. Set false to force built-in layout for all auto_layout calls |
 | LogVerbosity | 3 (Log) | 0=Silent, 1=Error, 2=Warning, 3=Log, 4=Verbose |
 
 **Note:** Module enable toggles are functional — each module checks its toggle at registration time and skips action registration if disabled.
@@ -1392,6 +1474,7 @@ See `TODO.md` for the full list. Key architectural constraints:
 | MonolithIndex | project | 7 |
 | MonolithSource | source | 11 |
 | MonolithUI | ui | 42 |
+| MonolithBABridge | — | 0 (integration only) |
 | **Total** | | **683** |
 
-**Note:** MonolithMesh includes all 22 expansion phases (195 original actions) plus 45 Procedural Town Generator actions (SP1-SP10). The original Python server had higher tool counts (~231 tools) due to fragmented action design — Monolith consolidates these into 14 MCP tools with namespaced actions.
+**Note:** MonolithMesh includes all 22 expansion phases (195 original actions) plus 45 Procedural Town Generator actions (SP1-SP10). MonolithBABridge registers no MCP actions — it only provides the `IMonolithGraphFormatter` IModularFeatures bridge consumed by `auto_layout` in the blueprint, material, animation, and niagara modules. The original Python server had higher tool counts (~231 tools) due to fragmented action design — Monolith consolidates these into 14 MCP tools with namespaced actions.

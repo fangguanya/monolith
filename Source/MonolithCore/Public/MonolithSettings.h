@@ -153,6 +153,13 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Modules", DisplayName="Enable Mesh Module")
 	bool bEnableMesh = true;
 
+	// --- Optional Module Toggles ---
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Blueprint Assist Integration",
+			  ToolTip="When enabled and Blueprint Assist is installed, provides enhanced graph formatting via the IMonolithGraphFormatter bridge."))
+	bool bEnableBlueprintAssist = true;
+
 	// --- Modules|Mesh ---
 
 	UPROPERTY(config, EditAnywhere, Category="Modules|Mesh", DisplayName="Handle Pool Timeout (seconds)",
