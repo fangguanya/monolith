@@ -2,7 +2,35 @@
 
 > **For agentic workers:** This is a MASTER PLAN defining 6 sub-plans across 4 delivery milestones. Each sub-plan has independent work packages (WPs) that can be dispatched to implementation agents in parallel. Dependencies between sub-plans are explicit. The killer feature (Sub-Plan B: Kit Scanner) has highest priority and should be started first.
 
+**Status:** APPROVED WITH CHANGES — Both reviewers approved. Fixes applied below.
+
 **Goal:** Add MonolithPCG as module #12 to the Monolith MCP plugin, providing a `pcg_query(action, params)` namespace for programmatic PCG graph construction, execution, and management. The crown jewel is `scan_modular_kit` -- point at a folder of modular meshes, auto-classify them, detect grid/openings/pivots, generate missing pieces, and build entire towns from the user's own art.
+
+## Reviewer Fixes Applied
+
+### From Review #1 — Technical Corrections
+- **R1-C1: Kit Scanner ships independently of PCG Foundation.** `build_with_kit` (B5) uses direct HISM placement, not PCG graphs. Sub-Plan B has NO dependency on Sub-Plan A. This is a major scheduling win — the killer feature can ship before any PCG work. Updated dependency graph: B1-B5 are fully independent. A is only needed for Sub-Plans C/D/F.
+- **R1-C2: `build_with_kit` is editor-time only.** Runtime generation is Sub-Plan F territory. B5 scoped explicitly as editor-time.
+- **R1-I1: Build.cs dependencies for A1.** MonolithPCG module needs `GeometryScriptingCore`, `GeometryFramework`, `GeometryCore`, `MonolithMesh`, `MonolithCore` in addition to `PCG`. All optional via `WITH_PCG` and `WITH_GEOMETRYSCRIPT`.
+- **R1-I2: PCG node parameter setting.** Use `FindFProperty` + `SetValue_InContainer` (reflection), NOT `JsonObjectToUStruct`. PCG settings classes use complex property types that JSON deserialization can't handle.
+- **R1-I3: Spatial registry coupling.** Add null-safety for missing registry data — scanning/classification must work without a spatial registry populated.
+- **R1-I4: Opening detection budget.** Revised from 40-55h to 50-65h to account for mesh-edge false positive filtering edge cases.
+- **R1-I5: swap_proxies orientation data.** Proxy swap must store rotation + pivot offset per instance, not just position. Added to B5 spec.
+- **R1-I6: HISM collision limitation.** `bDisableCollision = true` on rendering HISM. Separate simple box collision per room for gameplay traces. Documented in architecture section.
+- **R1-I7: Classification weight renormalization.** Weights must sum to 1.0 after filtering unavailable signals (e.g., no sockets = redistribute 0.05 across other signals).
+- **R1-S1: Loosen D dependency on C.** Sub-Plan D (gameplay) only needs spatial registry (already exists), not full town dressing (C). Updated dependency.
+
+### From Review #2 — Player/Design Corrections
+- **R2-C1: Kit type detection.** Added `kit_type` classification output: `modular_building`, `prop_library`, `facade_kit`, `pre_assembled`, `mixed`. Each type gets a different workflow path after scanning. Pre-assembled buildings (KitBash3D) bypass floor plan generation entirely — placed as-is with interior volumes.
+- **R2-C2: Unified hospice configuration.** Added `configure_hospice_profile` action that sets ALL hospice-relevant params across all subsystems in one call: door widths, corridor widths, ramp slopes, scare intensity, gore level, flicker safety, item density, enemy aggression. Single JSON profile, single action.
+- **R2-C3: Flickering light safety.** Added `visual_comfort` parameter (0.0-1.0) to all lighting actions. At 1.0 (max comfort / hospice): NO flickering, NO strobes, NO rapid intensity changes. Warm steady lighting only. At 0.0 (full horror): unrestricted. Default 0.3 (mild flicker OK, no strobes). This is a SAFETY requirement for hospice patients with photosensitive conditions.
+- **R2-I1: Two-pass scan.** Phase 1 (fast, <1s): name parsing + dimensions only, gives user instant feedback. Phase 2 (slower, 2-5s): topology analysis + opening detection + material inspection. User sees results progressively.
+- **R2-I2: Thumbnail generation.** `scan_modular_kit` captures a 128x128 thumbnail per classified piece for the review UI. Uses existing `editor_query("capture_thumbnail")`.
+- **R2-I3: Tension plateau prevention.** Active horror layer budget: max 3 horror layers active per room. Prevents desensitization.
+- **R2-I4: Bidirectional lock/key reachability.** Lock placement verified with BFS from BOTH directions — player must reach key before lock AND return path must exist.
+- **R2-I5: Runtime interior pop-in.** Use LOD-0 shell (exterior only) for distant buildings, generate interior when player enters trigger volume. 500ms generation budget per interior.
+- **R2-I6: Kit JSON path portability.** Use relative paths from project Content root, not absolute. Kit JSONs shareable across machines.
+- **R2-S1: Split Sub-Plan C for faster delivery.** C1 (vegetation + debris) ships as MVP. C2 (roads + vehicles) follows. C3 (lighting + audio atmosphere) after.
 
 **Architecture:** Three-layer hybrid (established in research):
 1. **GeometryScript** -- mesh vocabulary generation (unique shells, fallback pieces, terrain-adaptive foundations)
@@ -683,3 +711,435 @@ Town dressing templates, road actions, gameplay actions, terrain actions, runtim
 | `modular-building-research` | AAA modular approach (Bethesda, Arkane, Embark), HISM instancing, wall-type mapping | B5 |
 | `modular-pieces-research` | GeometryScript generation pipeline, AppendBox + Selection+Inset, existing SaveMeshToAsset | B4 |
 | `hism-assembly-research` | HISM C++ API, AddInstances batch, PreAllocateInstancesMemory, spatial queries, ID bug on HISM | B5 |
+
+---
+
+## Review #1
+
+**Reviewer:** unreal-code-reviewer (independent)
+**Date:** 2026-03-29
+**Verdict:** Strong plan with excellent research backing. Approved with conditions below.
+
+### 1. Sub-Plan Dependencies -- Correct Ordering?
+
+The dependency graph is mostly correct. A few observations:
+
+**Correct:**
+- B1-B3 (scanning/classification) are genuinely independent of A (no PCG needed for asset scanning).
+- A1 must complete before any PCG graph construction.
+- E (terrain) is correctly marked as independent of PCG.
+- F requiring A, B, C is correct -- you cannot optimize what does not exist.
+
+**Issue (Important):** Sub-Plan B5.1 (`build_with_kit`) is listed as needing "A1 for PCG-based placement" but the architecture description says it uses HISM directly, not PCG. Looking at the build_with_kit algorithm: "place via HISM (one HISM component per unique mesh)." This is direct HISM spawning, not PCG graph execution. The PCG dependency only applies if you route placement through PCG's StaticMeshSpawner node. The plan should clarify: does `build_with_kit` use PCG or direct HISM? If direct HISM (which the description implies), B5 has zero dependency on A and the entire Kit Scanner (Sub-Plan B) can ship independently as Milestone 1 without waiting on any PCG foundation work. This is good news for scheduling.
+
+**Issue (Suggestion):** Sub-Plan D's dependency on C ("requires C") is overly strict. D needs the horror atmosphere *system* to exist but not the full town dressing. D could start after C2 (horror atmosphere layer) without waiting for C3-C5 (props, roads, integration). Loosening this allows more parallelism.
+
+**Can parallel WPs truly run in parallel?** Within each phase, yes. The WPs within B1 (B1.1-B1.5) all write to the same file pair (`MonolithPCGKitScannerActions.h/.cpp`), so they must be serialized to a single agent -- but the plan already assigns them to one agent (unreal-mesh-expert), so no issue. The A1 WPs similarly share action files but are assigned to one agent.
+
+### 2. File Conflicts Between WPs
+
+The file conflict analysis in the plan is thorough and correct. One gap:
+
+**Issue (Important):** WP A4.1 specifies `MonolithPCGBridgeActions.h/.cpp` and WP A4.2-A4.3 specify separate PCG node files. But A4.1's `spatial_registry_to_pcg` reads the spatial registry JSON that is owned by MonolithMesh. If MonolithMesh's spatial registry format changes (it is under active development given the 192-action mesh module), the bridge code breaks silently. The plan should specify a versioned schema for the spatial registry JSON, or better yet, have MonolithMesh expose a C++ API (`FMonolithSpatialRegistry::GetRooms()`) rather than reading JSON files directly.
+
+**Verified clean:** The new `Source/MonolithPCG/` directory contains no overlap with any existing module. The `Monolith.uplugin` edit is a single additive change. The `MonolithMeshTerrainActions.h/.cpp` extension in Sub-Plan E is correctly identified as touching existing files.
+
+### 3. PCG API Usage -- Correctly Understood?
+
+The PCG C++ API usage is well-researched and accurate for UE 5.7. Specific verification:
+
+**Correct:**
+- `UPCGGraph::AddNodeOfType()`, `AddEdge()`, `SetGraphParameter<T>()` -- confirmed in framework research, these are the right entry points.
+- `UPCGComponent::GenerateLocal(bForce)` -- correct execution method.
+- `FInstancedPropertyBag` for user parameters -- correct (StructUtils module dependency needed, which is listed).
+- `EPCGComponentGenerationTrigger` enum values -- correct for UE 5.7.
+- The `GenerateOnDemand` partition actor bug (R7) -- correctly flagged and mitigated.
+
+**Issue (Important):** WP A1.4 proposes using `FJsonObjectConverter::JsonObjectToUStruct` to set node parameters. This works for simple UPROPERTY fields but PCG node settings frequently use `PCG_Overridable` meta and `FPCGAttributePropertySelector` types that are not simple structs. The JSON-to-UStruct approach will silently fail on these. A more robust approach: iterate the `UPCGSettings` class's UPROPERTY fields via UE reflection (`TFieldIterator<FProperty>`), match by name from the JSON keys, and set values using `FProperty::ImportText()` or property-specific setters. This is more work (~2-3h extra on A1.4) but covers edge cases.
+
+**Issue (Suggestion):** The plan mentions `GetGeneratedGraphOutput()` in A2.1 for reading output. This method returns `FPCGDataCollection` which contains tagged data. The plan should specify how this opaque data gets serialized back to JSON for the MCP response -- probably by iterating `TaggedData`, casting to `UPCGPointData`, and extracting point count + spawned component info. Not technically wrong, just under-specified.
+
+### 4. Kit Scanner Classification -- 5-Signal Pipeline Technically Sound?
+
+This is the strongest part of the plan. The research is thorough.
+
+**Technically sound:**
+- Signal 1 (name parsing): Regex patterns match marketplace conventions well. The 80% accuracy claim for well-named assets is conservative -- likely higher.
+- Signal 2 (dimension analysis): Sort-then-classify approach is rotation-agnostic as noted. Good.
+- Signal 3 (material slots): Correctly identified as a confidence booster, not a primary signal. Weight of 0.15 is appropriate.
+- Signal 4 (topology/FMeshBoundaryLoops): The research correctly identifies this as editor-time only due to cooked mesh UV seam splitting. The filter phase (reject loops on AABB faces, perimeter threshold) is the right approach.
+- Signal 5 (sockets): Low weight (0.05) is correct since most kits do not use sockets.
+
+**Issue (Important):** The fusion weights (0.35 + 0.30 + 0.15 + 0.15 + 0.05 = 1.0) assume all signals are available. When topology analysis is skipped (e.g., user opts for fast scan), the weights need renormalization. The plan should specify fallback weight sets for partial-signal scenarios: fast mode (name 0.50, dimension 0.35, material 0.15) vs full mode (all 5 signals).
+
+**Issue (Suggestion):** The plan does not mention handling kits where pieces share a common prefix that is NOT the kit name (e.g., "SM_Env_Dungeon_Wall_01" where "Env" is a prefix and "Dungeon" is the kit). The regex handles the "_Env_" prefix case, but a pre-pass to detect common prefixes across the scanned folder and strip them would improve classification on eccentric naming schemes.
+
+### 5. HISM Strategy -- Collision Disabled, Separate Box Collisions
+
+**Correct and well-justified.** The HISM research is excellent:
+- `bDisableCollision = true` on HISM components is the right call. The Chaos physics registration cost per instance is the #1 performance trap and the plan correctly identifies it.
+- Separate `UBoxComponent` collisions per room is the AAA approach.
+- `AddInstances()` (plural, batch) instead of looping `AddInstance()` -- correctly identified as critical.
+- `PreAllocateInstancesMemory()` before batch add -- good.
+- Per-building actor with multiple HISM components is the right Phase 1 approach for <100 buildings.
+
+**Issue (Suggestion):** The plan mentions `bMarkRenderStateDirty = false` for all-but-last calls, which is correct. But the sample code in B5.1 uses `SetCustomData(Indices[i], Data, i == Indices.Num() - 1)` -- this marks dirty on the last iteration of *each HISM component's loop*, not the last component overall. Since each component's render state is independent, this is actually fine. Just confirming there is no issue here.
+
+**Issue (Important):** The box collision per room strategy works for blocking but does not support line traces against individual HISM instances (e.g., for damage decals, interaction highlighting). The plan mentions `FHitResult::Item` returning instance index for line traces against HISM, but this only works with collision enabled. If any gameplay system needs to identify which specific wall piece was hit (for destruction, inspection, etc.), you will need a secondary trace approach -- either re-enable collision on a subset of HISM components or use a custom spatial query against stored instance transforms. This should be documented as a known limitation or addressed in Sub-Plan D.
+
+### 6. Time Estimates -- Realistic?
+
+**Sub-Plan A (80-110h):** Reasonable. Graph CRUD (A1.4 at 14h) is appropriately the largest WP. The PCG API is well-documented but wiring up JSON parameter setting, node resolution, and edge connection with proper error handling justifies the estimate.
+
+**Sub-Plan B (120-160h):** The opening detection WP (B2.2 at 12h) is aggressive for the complexity involved -- FMeshBoundaryLoops computation, AABB face rejection, ray-cast validation, and classification heuristics across diverse marketplace kits. I would budget 16-20h. The fallback generation (B4, 25-35h) is realistic; the Selection+Inset technique for door/window openings in generated meshes is well-understood from the research but fiddly to get right.
+
+**Sub-Plan C (200-280h):** This is the riskiest estimate. The 7-layer horror system (C2, 50-65h) is a content-heavy effort that depends heavily on having appropriate meshes/BPs available. If the horror props, decals, and audio assets do not already exist, this balloons. The plan assumes they exist ("use existing `place_storytelling_scene` patterns") which is reasonable for this project.
+
+**Sub-Plan D (130-180h):** The lock-and-key placement (D3.1, 12h) is underestimated. Graph-based zone partitioning with guaranteed reachability is a non-trivial algorithmic problem. Budget 16-20h.
+
+**Sub-Plan E (95-130h):** Terrain flattening and road cutting are well-scoped. `FLandscapeEditDataInterface` is finicky but the research correctly identifies it as the right API.
+
+**Sub-Plan F (155-225h):** Runtime generation is inherently hard to debug. The "deterministic generation" WP (F2.3 at 10h) is underestimated -- seed propagation bugs are subtle and take significant testing time. Budget 15-20h.
+
+**Overall (800-1080h):** With the above adjustments, a realistic range is **850-1150h**. The plan's range is slightly optimistic on the low end.
+
+### 7. Missing Risks
+
+**Risk R11 (Medium/High): Asset loading during scan causes editor stall.** Scanning 100+ meshes requires loading each for bounds/topology analysis. `UStaticMesh::GetBounds()` requires the mesh to be loaded. For large kits, this could cause a multi-second editor freeze. Mitigation: use `FStreamableManager::RequestAsyncLoad` for batch loading, or process meshes across multiple frames using a tickable object or latent action.
+
+**Risk R12 (Medium/Medium): PCG Grammar node stability.** The plan references PCG Grammar for future use (in the research). The Grammar system in 5.7 is marked production-ready but has far fewer community examples than the core scatter nodes. If Sub-Plan C4 or later phases lean on Grammar, expect undocumented edge cases.
+
+**Risk R13 (Low/High): Naming collision in PCG settings resolver.** The friendly-name stripping logic ("UPCG" prefix + "Settings" suffix) will produce collisions if Epic adds nodes with overlapping names. For example, `UPCGMeshSamplerSettings` and `UPCGPointMeshSamplerSettings` would both strip to names containing "MeshSampler." The resolver should use the full stripped name (e.g., "MeshSampler" vs "PointMeshSampler") and handle collisions by falling back to the full class name.
+
+**Risk R14 (Medium/Medium): MonolithPCG module adds significant compile time.** The PCG module headers are large. Depending on `PCG`, `GeometryScriptingCore`, `GeometryCore`, `MonolithMesh`, `MonolithCore`, `MonolithIndex`, `StructUtils`, `Json`, `JsonUtilities`, `AssetRegistry`, and `AssetTools` creates a wide dependency surface. Use private dependencies and forward declarations aggressively. Consider splitting the kit scanner into a separate MonolithKitScanner module if compile times become painful.
+
+### 8. Action Count -- Reasonable Scope Per Sub-Plan?
+
+**Sub-Plan A (37 actions):** This is a lot for a foundation module. However, many of these are thin wrappers (e.g., `list_pcg_graphs` is a directory scan, `get_pcg_parameters` is a property read). The 8 template actions in A3 are the meatiest. Reasonable.
+
+**Sub-Plan B (15-20 actions):** Well-scoped. The `scan_modular_kit` action is complex internally but represents a single user-facing action with a rich return payload. The split between scanning, management, fallback, and building actions is clean.
+
+**Sub-Plan C (25-30 actions/templates):** Heavy on content, but each "action" here is really a template builder (a function that creates a PCG graph). The 7-layer horror system is ambitious but each layer is a focused PCG graph template.
+
+**Sub-Plan D (12-15 actions):** Lean and focused. Good.
+
+**Grand total (~110-135):** Bringing Monolith from 635 to ~750-770 actions. The plan says "684 to ~800-820" which does not match CLAUDE.md's stated 635 actions. This discrepancy should be reconciled -- either the current count in CLAUDE.md is stale or the plan's baseline is wrong.
+
+### 9. Module Structure -- Build.cs Dependencies Correct?
+
+**Proposed MonolithPCG.Build.cs dependencies (from A1.1):**
+- `PCG` -- correct, required for all PCG classes
+- `MonolithCore` -- correct, needed for `FMonolithToolRegistry`
+- `MonolithIndex` -- correct if using project index for asset lookups
+- `StructUtils` -- correct, needed for `FInstancedPropertyBag` (user parameters)
+- `Json`, `JsonUtilities` -- correct, for JSON parameter handling
+- `AssetRegistry`, `AssetTools` -- correct, for kit scanning and graph asset creation
+- `UnrealEd` -- correct (editor module)
+
+**Missing from the plan's Build.cs list:**
+- `GeometryScriptingCore`, `GeometryFramework`, `GeometryCore` -- needed for B2.2 (opening detection via FMeshBoundaryLoops) and B4 (fallback generation). The plan mentions these in the file conflict analysis section but does not include them in A1.1's Build.cs specification. They must be optional (WITH_GEOMETRYSCRIPT guard), following the MonolithMesh pattern.
+- `MonolithMesh` -- mentioned in the file conflict analysis as a private dependency for B5 (`SaveMeshToAsset`, `ConvertToHism`, spatial registry). Must be in Build.cs.
+- `MeshDescription`, `StaticMeshDescription` -- may be needed for mesh inspection during scanning, depending on whether the kit scanner calls MonolithMesh functions directly or re-implements.
+- `PCGEditor` -- mentioned as "optional if editor build" but since MonolithPCG is Type: Editor, this will always be an editor build. Make it a private dependency unconditionally, or skip it if you only need runtime PCG classes.
+
+**Verified correct pattern:** The `WITH_GEOMETRYSCRIPT` conditional compilation guard and directory-existence check in MonolithMesh.Build.cs is the established pattern. MonolithPCG should replicate this exactly, plus add a similar `WITH_PCG` guard checking for the PCG plugin directory existence.
+
+### 10. The Killer Feature (Sub-Plan B) -- Properly Prioritized and Scoped?
+
+**Prioritization: Excellent.** The plan correctly identifies Sub-Plan B as the crown jewel and prioritizes it for Milestone 1. The "golden path" 3-turn UX is compelling and well-designed. Starting B1-B3 in parallel with A1 is the right call.
+
+**Scope concerns:**
+
+**Issue (Critical):** The plan conflates two very different use cases under "build_with_kit":
+1. **Editor-time blockout**: Place HISM instances from a scanned kit to visualize a building layout. This is the MVP and what the golden path demonstrates.
+2. **Runtime building generation**: Generate buildings at runtime using PCG + HISM with streaming. This is Sub-Plan F territory.
+
+The plan should explicitly scope B5 as editor-time only. The runtime path comes later in F. This is implied but not stated, and without it, B5's time estimate is way too low for what someone might interpret as runtime-capable.
+
+**Issue (Important):** The `swap_proxies` action (B5.3) is conceptually powerful but under-specified. "For each actor: get bounds -> find closest kit piece by dimensions and type tag -> replace actor with HISM instance." This assumes the whitebox actors have type tags or that pure dimension matching is sufficient. In practice, a 200x15x300 whitebox wall and a 200x15x300 floor placed vertically have identical dimensions. The swap action needs an orientation signal (wall normal, up vector) or explicit type tagging on whitebox actors.
+
+**Issue (Suggestion):** Phase B4 (fallback generation) generates 14 piece types. The plan lists P0 (5 types), P1 (5 types), and P2 (4 types). This is well-structured, but the Tier 3 "Style-Matched" quality level (B4.5) that attempts bevel matching via dihedral angle analysis is risky. Dihedral angle analysis on arbitrary marketplace meshes is unreliable -- many kits use normal maps for edge detail rather than actual geometry bevels. I would mark Tier 3 as stretch goal / nice-to-have and not block the phase on it.
+
+### Summary of Issues by Severity
+
+**Critical (must fix before implementation):**
+1. Clarify whether `build_with_kit` (B5) uses direct HISM or PCG. If direct HISM, remove the A1 dependency from B5 -- this unlocks shipping Kit Scanner independently.
+2. Scope B5 explicitly as editor-time only.
+
+**Important (should fix):**
+3. A1.4: Use `FProperty::ImportText()` reflection approach instead of `FJsonObjectConverter::JsonObjectToUStruct` for PCG node parameter setting.
+4. A4.1: Expose spatial registry via C++ API, not JSON file reads, to avoid silent breakage.
+5. B1.5: Specify fallback weight renormalization for partial-signal classification (fast scan mode).
+6. B2.2: Budget 16-20h, not 12h, for opening detection.
+7. B5.3: `swap_proxies` needs orientation signal beyond pure dimension matching.
+8. HISM collision limitation: Document that individual instance identification via line traces is not supported with `bDisableCollision = true`, and propose a workaround for gameplay systems that need it.
+9. A1.1 Build.cs: Add `GeometryScriptingCore`, `GeometryFramework`, `GeometryCore` (optional), `MonolithMesh` (private), and verify `PCGEditor` need.
+10. Reconcile action count baseline (plan says 684, CLAUDE.md says 635).
+
+**Suggestions (nice to have):**
+11. Loosen Sub-Plan D dependency on C (only needs C2, not all of C).
+12. Add R11 (editor stall during bulk mesh loading) to risk register with async loading mitigation.
+13. Add R13 (PCG settings name collision) to risk register.
+14. Consider MonolithKitScanner as separate module if compile times suffer from wide dependency surface.
+15. Mark B4.5 Tier 3 style-matching as stretch goal.
+16. Add common-prefix detection pre-pass to name parser for eccentric naming schemes.
+
+### What Was Done Well
+
+- The research backing is exceptional. 18 research documents covering every major technical question. The HISM research in particular is production-quality with verified engine source citations.
+- The three-layer hybrid architecture (GeometryScript + Floor Plan + PCG) is the right call. Trying to force everything through PCG would have been a mistake, and the research correctly identifies PCG's limitations (no geometry creation, no room subdivision, no vertical connectivity).
+- The 5-signal classification pipeline is cleverly designed. The weighted fusion with confidence tiers and user correction loop is pragmatic engineering.
+- The file conflict analysis is thorough and the decisions (kit scanner in MonolithPCG, terrain in MonolithMesh) are well-justified.
+- The hospice accessibility cross-cutting concern is consistently applied across all sub-plans.
+- The risk register catches the key UE 5.7-specific issues (GenerateOnDemand bug, Chaos physics collision cost).
+- The phased delivery with independent milestones is well-structured for a multi-month effort.
+
+---
+
+## Review #2: User Experience, Marketplace Compatibility, Horror Design, and Hospice Accessibility
+
+**Reviewer:** Code Review Agent (Opus 4.6)
+**Date:** 2026-03-29
+**Perspective:** End-user experience, marketplace kit compatibility, horror design quality, hospice accessibility, and practical deployment concerns.
+
+---
+
+### Overall Assessment
+
+This is one of the most thoroughly researched feature plans I have encountered in this codebase. The 18+ research documents backing 6 sub-plans demonstrate genuine depth, and the plan correctly identifies the kit scanner as the killer feature. The three-layer hybrid architecture (GeometryScript / Floor Plan / PCG) is sound and avoids the common trap of forcing PCG to do everything. The progressive disclosure UX design for the scanner is well above the standard for tooling in this space.
+
+That said, the plan has real gaps that would hurt actual users. What follows is organized by the review criteria requested.
+
+---
+
+### 1. Kit Scanner UX -- Is the 3-Turn Golden Path Achievable?
+
+**Verdict: Achievable for well-structured kits. Fragile for messy real-world kits.**
+
+The golden path (scan -> correct -> build) is well-designed and the progressive disclosure pattern is the right call. The confidence-based three-tier routing (auto-accept / flag / unknown) directly addresses the most common friction point in classification systems.
+
+**Critical Issue: Scan time for large kits.**
+WP B1.1 says "return results in <5s for 30+ meshes." However, Phase B2 adds opening detection via `FMeshBoundaryLoops`, which requires loading each mesh into `FDynamicMesh3`. For a 100-piece kit, that could easily be 30-60 seconds. The plan does not specify whether the full pipeline (name + dimensions + materials + topology + sockets) runs synchronously or whether it progressively returns results.
+
+- **Recommendation (Important):** Add a two-pass scan strategy. Pass 1: name + dimensions + material slots (fast, <5s for 100 meshes, no mesh loading). Return initial results immediately. Pass 2: topology + opening detection (slow, async, updates classifications as results arrive). This matches the progressive disclosure philosophy and prevents the user from staring at a loading state.
+
+**Important Issue: The regex will miss more kits than expected.**
+The primary regex pattern assumes `SM_` prefix naming (90% of kits per the marketplace research). But the remaining 10% includes KitBash3D (`KB3D_*`), Megascans (hash IDs like `ukjsehbdw`), and custom imports with no prefix at all. The 5-signal fusion should handle this via dimension analysis as the fallback, but the name parser confidence weight of 0.35 means a kit with opaque naming starts at a significant disadvantage.
+
+- **Recommendation (Suggestion):** Add a "naming strategy detection" pre-pass before classification. If fewer than 30% of meshes match the `SM_` regex, reduce name_score weight to 0.15 and redistribute to dimension_score (0.45). This adaptive weighting would handle Megascans and import-heavy kits much better.
+
+**Important Issue: No preview or thumbnail in classification output.**
+The JSON output includes piece dimensions and material slots but no visual preview. When a user sees "SM_Panel_Large -> wall_solid? (confidence: 0.62)" they need to see what the mesh looks like to make a correction decision. The L2 detail level mentions thumbnails but there is no mechanism to generate or serve them.
+
+- **Recommendation (Important):** Add thumbnail generation to the scan pipeline. UE has `FObjectThumbnail` / asset thumbnail rendering. Even a low-res 128x128 thumbnail saved alongside the kit JSON would dramatically improve the correction UX. This could be a Phase B3 addition without blocking the scanner itself.
+
+---
+
+### 2. Marketplace Kit Compatibility
+
+**Verdict: Strong coverage for the top 80% of kits. Specific blind spots for the remaining 20%.**
+
+The marketplace conventions research is excellent -- it covers Synty, KitBash3D, Quixel, Dekogon, PurePolygons, BigMediumSmall, and Junction City. The naming regex patterns and grid detection algorithms are well-calibrated to these vendors.
+
+**Critical Issue: KitBash3D kits are NOT modular building kits.**
+The research correctly notes that KitBash3D uses "Packed Level Actors" -- pre-assembled buildings, not modular tiles. But the scanner architecture (classify pieces -> detect grid -> build buildings) fundamentally assumes tile-based modularity. The plan says "Scanner should detect as 'assembled' not 'tile-kit'" but there is no action or workflow for what happens AFTER that detection. A user who scans a KitBash3D kit will get "0% coverage" and no path forward.
+
+- **Recommendation (Critical):** Add a kit type classification as the first step of `scan_modular_kit`. Detect whether the kit is: (a) tile-based modular, (b) pre-assembled buildings, (c) prop/furniture collection, (d) facade/detail kit. For type (b), the workflow should be: identify the pre-assembled buildings, register them as whole building templates, allow direct placement via HISM without piece-by-piece assembly. This is a different code path but an important one for KitBash3D and similar kits.
+
+**Important Issue: Quixel/Megascans architectural kits are zone-based, not piece-type-based.**
+Megascans organizes by "Foundation Kit", "Base Wall Kit", "3rd Floor Kit" etc. The scanner's piece-type classification (wall_solid, floor_tile) does not map cleanly to this zone-based organization. A "Foundation Kit" piece could be classified as wall_solid or floor_tile depending on its orientation.
+
+- **Recommendation (Important):** Add zone-based classification as an alternative to piece-type classification. When folder structure matches Pattern B (zone folders like Foundation/, Base/, etc.), use the folder path as a primary classification signal. This would be a lightweight addition to the B1.2 name parser.
+
+**Suggestion: Material instance detection for Synty atlas kits.**
+Synty uses a single-material color atlas approach. The material slot classifier (B1.4) looks for keywords like "glass" and "frame" -- but Synty pieces typically have 1 material slot with a generic name like "M_Palette_01". The scanner should recognize single-material kits as a distinct pattern and not penalize them for lacking material signal.
+
+---
+
+### 3. Horror Atmosphere -- Does the 7-Layer Decay System Maintain Tension?
+
+**Verdict: The system is technically sophisticated and well-designed. Two design risks need attention.**
+
+The 7-layer architecture with independent enable/disable per layer is the right approach. The master decay parameter with per-room modulation via room type and Perlin noise is exactly how AAA games handle this. The tension curve integration (Section 15 of the horror research) connects pacing to atmosphere density correctly.
+
+**Important Issue: Tension plateau risk.**
+When all 7 layers activate simultaneously at high decay (0.7+), there is a risk of sensory overload that flattens the tension curve. If every room has dense debris, blood, flickering lights, dripping sounds, fog, cobwebs, AND a storytelling vignette, the player acclimates and stops feeling scared. The plan mentions a probability gate for storytelling scenes (not every room gets one), but the other 6 layers all activate based on decay threshold alone.
+
+- **Recommendation (Important):** Add a per-room "active layer budget" that caps the number of simultaneously active layers. For example, at decay 0.7, allow a maximum of 4-5 active layers per room (selected per room via weighted random). This creates variation -- one room is dark and foggy but clean, the next is well-lit but covered in blood. Contrast drives tension far more effectively than uniform density.
+
+**Suggestion: Missing "false safety" pattern.**
+The horror research covers decay progression but does not address one of the most effective horror techniques: the clean room in a decayed building. A single pristine room amid high-decay surroundings is deeply unsettling (someone has been maintaining it -- why?). The system should support decay values that are intentionally LOWER than the building baseline for specific rooms, not just higher.
+
+- The room_decay_offset mechanism supports this (negative offset), but no preset or template leverages it. Adding a "maintained_room" storytelling pattern that sets decay to 0.0-0.1 in an otherwise high-decay building would be a powerful addition to Layer 7.
+
+---
+
+### 4. Hospice Accessibility
+
+**Verdict: Good foundation. Needs more granular controls and a dedicated configuration surface.**
+
+The plan addresses hospice accessibility in multiple locations: gore_level (0-3), scare intensity caps, difficulty profile with generous resources, `validate_horror_intensity`, and `generate_hospice_report`. The hospice_comfort difficulty profile is thoughtful with its 0.6 false_alarm_ratio and 0.4 menace ceiling.
+
+**Critical Issue: No unified hospice configuration surface.**
+Hospice settings are scattered across multiple systems: gore_level in the horror atmosphere, scare_intensity in gameplay, difficulty_multiplier in items, enemy_aggression in AI, and various per-layer overrides. A caregiver or patient configuring the experience would need to understand all of these independently. There is no single "hospice mode" toggle or profile that sets everything at once.
+
+- **Recommendation (Critical):** Create a `hospice_profile` composite action (or extend the existing difficulty profile) that sets ALL hospice-relevant parameters from a single call. Input: a comfort level (1-5, where 1 is "exploration only, no horror" and 5 is "full horror, generous resources"). This maps to specific values across all subsystems. The `generate_hospice_report` action already exists for validation; the missing piece is the unified configuration input.
+
+**Critical Issue: Motion and visual sensitivity not addressed.**
+The plan handles gore, scare intensity, and difficulty but does not address:
+- Flickering light sensitivity (photosensitive epilepsy / migraine triggers). The flickering light system (Layer 5) could be harmful. Hospice patients on certain medications have lower seizure thresholds.
+- Audio volume spikes from jump scares. The gameplay research mentions "configurable volume cap" but this is not specified as a concrete parameter.
+- Screen shake or rapid camera movement from scare events.
+
+- **Recommendation (Critical):** Add a `visual_comfort` parameter to the hospice profile: at level 1, flickering lights are replaced with steady dim lights, screen effects are disabled, and audio uses dynamic range compression (no sudden loud sounds). This is not just nice-to-have -- for patients with neurological conditions, flickering lights are a genuine health risk.
+
+**Suggestion: Colorblind-safe item indicators.**
+D1.4 mentions "clear visual indicators (subtle glow material)" for items but does not specify colorblind-safe design. A red health item glow is invisible to protanopes. Use luminance contrast (bright vs dark) as the primary indicator, with color as secondary.
+
+---
+
+### 5. Gameplay Integration -- Lock/Key Solvability, Safe Rooms, Difficulty Scaling
+
+**Verdict: The algorithmic foundations are solid. Two structural gaps.**
+
+The lock-and-key placement algorithm (mission graph approach with BFS validation) is correct and well-referenced (metazelda, Dormans cyclic generation). Safe room placement rules are appropriate (max 8 rooms between safe rooms, single entry, always on critical path). The RE4-style DDA with hidden rank is the right model for this genre.
+
+**Important Issue: No dead-end detection for solvability validation.**
+The lock-and-key algorithm places keys in rooms reachable without the corresponding lock. But it does not explicitly check for scenarios where the player could reach a dead-end area with no exit except through a lock they do not yet have the key for. The BFS validation step checks forward reachability but not "can the player always backtrack to the critical path from any reachable room."
+
+- **Recommendation (Important):** Add bidirectional reachability validation. After placing all locks and keys, verify that from every room in the reachable set, the player can return to the start without passing through a lock they have not yet opened. This prevents soft-locks where the player enters an optional side area and cannot return.
+
+**Important Issue: Safe room placement is build-time only.**
+The plan places safe rooms during floor plan generation and marks them in the spatial registry. But for runtime-generated interiors (Sub-Plan F), safe room placement timing is unclear. If interiors generate on approach, does the safe room appear before or after the player enters the building? The player needs to know a safe room exists before committing to entering a dangerous building.
+
+- **Recommendation (Important):** Pre-compute safe room locations at build time even if interior detail is deferred to runtime. The building descriptor should always contain safe room positions so that exterior indicators (a distinct door, a light above the entrance) can be placed at build time. The interior furnishing of the safe room can remain runtime-deferred.
+
+---
+
+### 6. Performance at Scale -- 20+ Buildings, Runtime Streaming
+
+**Verdict: The architecture is sound but the hour estimates for Sub-Plan F are optimistic.**
+
+The HiGen grid mapping, 5ms frame budget, memory budget system, and interior LOD tiers are all the right ideas. The decision to use `GenerateAtRuntime` instead of `GenerateOnDemand` (avoiding the known partition actor bug) shows good awareness of engine gotchas.
+
+**Important Issue: Interior generation latency.**
+F2.1 targets "interior generates in <500ms" on approach. For a 2-story building with 8 rooms, each needing wall pieces, floor, ceiling, furniture, and horror dressing, that is a lot of HISM instance creation, PCG graph execution, and potentially fallback mesh generation in a single burst. 500ms is an entire frame at 2 FPS -- even if distributed across multiple frames via the scheduler, the player may see pop-in or incomplete interiors.
+
+- **Recommendation (Important):** Define a loading strategy for interior generation. Options: (a) pre-generate interior structure (walls/floors) at editor time, defer only furniture/dressing to runtime; (b) use a "door opening" animation (1-2 seconds) to mask the generation; (c) generate a simplified LOD interior first (walls only), then fill in detail over subsequent frames. Option (a) is safest for the hospice audience, who may be sensitive to visual pop-in.
+
+**Suggestion: Draw call budget per building.**
+The plan mentions "HISM draw calls < 10 per building" as a test criterion for B5.1, which is reasonable. But Sub-Plan C adds vegetation, horror dressing, props, road furniture, etc. around each building. The total per-building draw call budget including dressing is not specified. At 20+ buildings with 7 atmosphere layers each, draw calls could balloon.
+
+- **Recommendation:** Add a composite draw call budget (structure + dressing) per building and enforce it in the `dress_town_block` orchestrator. If a building exceeds budget, reduce lower-priority layers first (audio emitters before debris, cobwebs before fog).
+
+---
+
+### 7. Non-Programmer Usability via MCP
+
+**Verdict: The conversational UX design is strong. The action count is a risk.**
+
+The progressive disclosure pattern, confidence-based routing, and the golden path conversation flow are all excellent design for MCP-based interaction. The user never needs to know about regex classifiers or GCD algorithms -- they just see "Scanned 47 meshes, 78% coverage, 6 uncertain."
+
+**Important Issue: The 110-135 new action surface area is overwhelming for discovery.**
+When a user runs `monolith_discover("pcg")`, they will see 37+ actions from Sub-Plan A alone. Add kit scanner, dressing, gameplay, terrain, and runtime actions and the namespace exceeds 100 actions. Even with `monolith_discover`, finding the right action requires knowing the vocabulary.
+
+- **Recommendation (Important):** Organize pcg_query actions into sub-categories within the discover output. Group by workflow stage: "Graph Construction" (create/add/connect), "Kit Scanner" (scan/classify/edit), "Generation" (build/dress/gameplay), "Runtime" (configure/monitor). Alternatively, add high-level composite actions that are the primary user entry points (scan_modular_kit, build_with_kit, dress_town_block, dress_gameplay) and mark the lower-level graph CRUD as "advanced."
+
+**Suggestion: Add a `pcg_wizard` or `quick_start` action.**
+For a user who has never used the PCG system, a single action that walks through the entire workflow (scan kit -> build a test building -> apply dressing) would dramatically reduce the onboarding curve. This could be a template that generates a 1-building demo from any scanned kit.
+
+---
+
+### 8. What Is Missing That a Real User Would Expect?
+
+**Undo/rollback for PCG generation.**
+The plan has `cleanup_pcg` to remove generated actors, but there is no undo for kit classification changes, no rollback for a bad `build_with_kit` result, and no "try a different seed" workflow. Users experimenting with generation will want to quickly discard results and try again.
+
+- **Recommendation (Important):** Add a `pcg_undo` or `rollback_generation` action that removes all actors from the last generation pass (tracked by a generation ID or timestamp). Also add a `regenerate_with_seed` action that re-runs the last generation with a different seed. These are essential for an iterative design workflow.
+
+**No visual diff between generation runs.**
+When a user changes the kit, decay level, or seed and regenerates, there is no way to compare the before and after. The existing `editor_query("capture_scene")` could be leveraged here.
+
+- **Suggestion:** Add optional before/after scene capture to `build_with_kit` and `dress_town_block`. Save screenshots with generation metadata for comparison.
+
+**No cost/time estimate before generation.**
+When a user says "generate a 4-building horror block," they have no idea whether that will take 2 seconds or 2 minutes, or how many instances it will create. The plan returns a summary after generation but not before.
+
+- **Suggestion:** Add a `preview_generation` or `estimate_generation` action that returns expected piece counts, estimated time, and memory impact without actually generating. This is especially important for the runtime streaming system where budget awareness matters.
+
+---
+
+### 9. Community Features -- Shareable Kit JSONs, Preset Library
+
+**Verdict: The foundation is there but community sharing needs explicit design.**
+
+Kit JSON export/import (B3.3) and preset save/load (A3.1, C5.2) are included. The kit JSON schema is clean and well-versioned.
+
+**Important Issue: Kit JSONs contain absolute asset paths.**
+The kit JSON stores `"asset_path": "/Game/HorrorKit/Meshes/SM_Wall_Solid_01"`. If a user shares this JSON and the recipient has the same marketplace kit installed at a different path (e.g., `/Game/Content/POLYGON_Horror/`), every path will fail.
+
+- **Recommendation (Important):** Add a `rebind_kit` action that takes an existing kit JSON and a new scan path, then re-maps piece entries to matching meshes in the new path (matched by name similarity + dimension matching). This makes shared kit JSONs portable across projects with different content organization.
+
+**Suggestion: Kit JSON could include a marketplace product identifier.**
+If the kit JSON includes the marketplace product name or publisher, the `import_kit` action could attempt auto-discovery of the content path on the recipient's project. This is not reliable enough to be automatic but could suggest "This kit was built for POLYGON Horror. Found /Game/PolygonHorror/ -- use this path?"
+
+---
+
+### 10. Incremental Value Delivery -- Does Each Milestone Produce Something Usable?
+
+**Verdict: Milestones 1 and 2 deliver standalone value. Milestones 3 and 4 require 1+2 to be useful.**
+
+- **Milestone 1 (Foundation + Kit Scanner):** Delivers the killer feature. A user can scan a kit and build buildings. This is independently valuable and shippable. Good.
+- **Milestone 2 (Town Dressing):** Adds vegetation, horror atmosphere, props, roads. Depends on M1 but adds clear visual value. Good.
+- **Milestone 3 (Gameplay):** Items, enemies, objectives. Requires M1 buildings + M2 atmosphere to be meaningful. Cannot demo in isolation. Acceptable -- this is inherently dependent.
+- **Milestone 4 (Runtime + Streaming):** Optimization and scale. Only valuable with everything else in place. Correct ordering.
+
+**Important Issue: Sub-Plan C (Town Dressing) at 200-280h is the largest sub-plan but is not the killer feature.**
+The kit scanner (Sub-Plan B, 120-160h) is correctly prioritized. But Sub-Plan C is almost twice the size and includes road network generation (40-55h) which is a significant engineering effort for what may not be needed in every project. The plan does not distinguish between "essential dressing" (horror atmosphere, debris) and "nice-to-have dressing" (full road networks with lane markings).
+
+- **Recommendation (Important):** Split Sub-Plan C into two milestones: C-essential (horror atmosphere layers, basic vegetation, per-building props) and C-extended (road networks, street furniture, vehicles, ground detail). Ship C-essential as part of Milestone 2 and defer C-extended. This reduces M2 from ~200h to ~120h, delivering usable horror dressing much sooner. Road networks are valuable but not required for a horror game set in individual buildings.
+
+---
+
+### Summary of Issues by Severity
+
+**Critical (must fix before implementation):**
+1. Kit type detection -- handle pre-assembled kits (KitBash3D) and prop-only kits, not just tile-based modular
+2. Unified hospice configuration surface -- single action/profile that sets all comfort parameters
+3. Flickering light safety -- visual_comfort parameter to disable photosensitive triggers for hospice patients
+
+**Important (should fix, significantly impacts quality):**
+4. Two-pass scan strategy -- fast initial results, async topology analysis
+5. Thumbnail generation for classification review
+6. Per-room active layer budget to prevent tension plateau
+7. Bidirectional reachability validation for lock/key solvability
+8. Pre-compute safe room locations even for runtime-deferred interiors
+9. Interior generation loading strategy to prevent pop-in
+10. Sub-categorize the 100+ action namespace for discoverability
+11. Undo/rollback and seed-based regeneration for iterative workflow
+12. Kit JSON path rebinding for cross-project portability
+13. Split Sub-Plan C into essential and extended phases
+14. Zone-based classification for Megascans-style kits
+15. Adaptive classification weight based on naming strategy detection
+
+**Suggestions (nice to have):**
+16. "False safety" maintained_room storytelling pattern
+17. Colorblind-safe item indicators (luminance over hue)
+18. pcg_wizard quick-start action for onboarding
+19. Before/after scene capture for generation comparison
+20. preview_generation cost estimation action
+21. Draw call budget enforcement in dress_town_block
+22. Marketplace product identifier in kit JSON for auto-discovery
+23. Single-material atlas kit detection for Synty
+
+---
+
+### Final Remarks
+
+The plan is ambitious -- 800-1080h across 6 sub-plans -- but the incremental delivery strategy and parallel work package design make it tractable. The research depth is genuinely impressive and the horror design draws from the right references (Alien Isolation's menace gauge, RE4's DDA, L4D's intensity states). The kit scanner UX is a genuine competitive advantage over every comparable tool surveyed.
+
+The three critical issues (kit type detection, unified hospice config, flickering light safety) should be addressed before implementation begins. The hospice safety concern is not theoretical -- this game serves patients who may have seizure disorders, neurological conditions, or medication-induced photosensitivity. Getting this wrong is not a bug, it is a harm.
+
+The important issues are implementation quality concerns that will become apparent during the first real-world kit scan or the first playtest with a hospice patient. Addressing them proactively will save significant rework.
+
+This plan is ready for implementation with the critical issues resolved. Milestone 1 should proceed with Sub-Plans A and B in parallel as specified.

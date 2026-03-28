@@ -17,6 +17,8 @@
 #include "GeometryScript/MeshBasicEditFunctions.h"
 #include "GeometryScript/MeshTransformFunctions.h"
 #include "GeometryScript/MeshUVFunctions.h"
+#include "GeometryScript/MeshSelectionFunctions.h"
+#include "GeometryScript/MeshModelingFunctions.h"
 
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
@@ -376,6 +378,222 @@ void FMonolithMeshFacadeActions::CutOpenings(UDynamicMesh* Mesh,
 			EGeometryScriptBooleanOperation::Subtract, BoolOpts);
 		bHadBooleans = true;
 	}
+}
+
+// ============================================================================
+// Selection+Inset Window Cutting — v3 Boolean Replacement
+// ============================================================================
+
+void FMonolithMeshFacadeActions::CutOpeningsSelectionInset(UDynamicMesh* Mesh,
+	const FExteriorFaceDef& Face, const TArray<FWindowPlacement>& Windows,
+	const TArray<FDoorPlacement>& Doors, float WallThickness, float FrameWidth,
+	bool bUseSelectionInset, bool& bHadBooleans)
+{
+	if (Windows.Num() == 0 && Doors.Num() == 0)
+	{
+		// No openings — just build a solid wall slab on the main mesh
+		BuildWallSlab(Mesh, Face, WallThickness, 0);
+		return;
+	}
+
+	// Fallback to boolean subtract if requested
+	if (!bUseSelectionInset)
+	{
+		BuildWallSlab(Mesh, Face, WallThickness, 0);
+		CutOpenings(Mesh, Face, Windows, Doors, WallThickness, bHadBooleans);
+		return;
+	}
+
+	// ---- CRITICAL: Build wall slab in an ISOLATED temp mesh ----
+	// PlaneSlice operates on ALL geometry in a mesh. Since the main building mesh
+	// already contains interior walls, floors, stairs, etc., we must isolate the
+	// wall slab so plane cuts only subdivide THIS wall, not the whole building.
+	// After all cuts + insets + deletions, AppendMesh merges it into the main mesh.
+	UDynamicMesh* WallMesh = NewObject<UDynamicMesh>(Pool);
+
+	BuildWallSlab(WallMesh, Face, WallThickness, 0);
+
+	FVector WidthAxis = GetFaceWidthAxis(Face);
+	FVector Normal = Face.Normal.GetSafeNormal();
+	FVector FaceCenter = Face.WorldOrigin + WidthAxis * (Face.Width * 0.5f);
+	bool bNorthSouth = FMath::Abs(Normal.Y) > FMath::Abs(Normal.X);
+	FVector WallCenter = FaceCenter + Normal * (WallThickness * 0.5f);
+
+	// ---- Step 0: Pre-subdivide wall with PlaneSlice at opening boundaries ----
+	// AppendBox with 0 subdivisions produces 12 tris (2 per face).
+	// SelectMeshElementsInBox CANNOT isolate a window sub-region from a 2-tri face.
+	// PlaneSlice inserts edge loops at cut boundaries, creating the face subdivisions
+	// needed for Selection+Inset to target specific window regions.
+
+	FGeometryScriptMeshPlaneSliceOptions SliceOpts;
+	SliceOpts.bFillHoles = false;
+	SliceOpts.bFillSpans = false;
+
+	// Collect all cut lines from openings
+	TArray<float> VerticalCuts;
+	TArray<float> HorizontalCuts;
+
+	auto AddOpeningCuts = [&](float CenterX, float Width, float BottomZ, float Height)
+	{
+		VerticalCuts.AddUnique(CenterX - Width * 0.5f);
+		VerticalCuts.AddUnique(CenterX + Width * 0.5f);
+		HorizontalCuts.AddUnique(BottomZ);
+		HorizontalCuts.AddUnique(BottomZ + Height);
+	};
+
+	for (const FWindowPlacement& Win : Windows)
+	{
+		AddOpeningCuts(Win.CenterX, Win.Width, Win.SillZ, Win.Height);
+	}
+	for (const FDoorPlacement& Door : Doors)
+	{
+		AddOpeningCuts(Door.CenterX, Door.Width, 0.0f, Door.Height);
+	}
+
+	// Helper: build a CutFrame where the Z axis = PlaneNormal, located at CutPoint
+	auto MakeCutFrame = [](const FVector& CutPoint, const FVector& PlaneNormal) -> FTransform
+	{
+		// Build rotation that aligns Z with PlaneNormal
+		FQuat Rot = FQuat::FindBetweenNormals(FVector::UpVector, PlaneNormal);
+		return FTransform(Rot, CutPoint);
+	};
+
+	// Vertical plane cuts (perpendicular to wall width axis)
+	for (float CutX : VerticalCuts)
+	{
+		FVector CutPoint = FaceCenter + WidthAxis * CutX;
+		CutPoint.Z = Face.WorldOrigin.Z + Face.Height * 0.5f;
+
+		UGeometryScriptLibrary_MeshBooleanFunctions::ApplyMeshPlaneSlice(
+			WallMesh, MakeCutFrame(CutPoint, WidthAxis), SliceOpts);
+	}
+
+	// Horizontal plane cuts
+	for (float CutZ : HorizontalCuts)
+	{
+		FVector CutPoint = WallCenter;
+		CutPoint.Z = Face.WorldOrigin.Z + CutZ;
+
+		UGeometryScriptLibrary_MeshBooleanFunctions::ApplyMeshPlaneSlice(
+			WallMesh, MakeCutFrame(CutPoint, FVector::UpVector), SliceOpts);
+	}
+
+	// ---- Step 1: For each opening, select + inset + delete ----
+	auto CutOneOpening = [&](float CenterX, float Width, float BottomZ, float Height)
+	{
+		float HalfW = Width * 0.5f;
+		FVector OpeningCenter = FaceCenter + WidthAxis * CenterX;
+
+		// Build selection box tightly around the opening region of the wall
+		FVector BoxMin, BoxMax;
+		if (bNorthSouth)
+		{
+			BoxMin = FVector(
+				OpeningCenter.X - HalfW - 0.5f,
+				WallCenter.Y - WallThickness,
+				Face.WorldOrigin.Z + BottomZ - 0.5f);
+			BoxMax = FVector(
+				OpeningCenter.X + HalfW + 0.5f,
+				WallCenter.Y + WallThickness,
+				Face.WorldOrigin.Z + BottomZ + Height + 0.5f);
+		}
+		else
+		{
+			BoxMin = FVector(
+				WallCenter.X - WallThickness,
+				OpeningCenter.Y - HalfW - 0.5f,
+				Face.WorldOrigin.Z + BottomZ - 0.5f);
+			BoxMax = FVector(
+				WallCenter.X + WallThickness,
+				OpeningCenter.Y + HalfW + 0.5f,
+				Face.WorldOrigin.Z + BottomZ + Height + 0.5f);
+		}
+		FBox WindowBox(BoxMin, BoxMax);
+
+		// Select outward-facing tris in window region
+		FGeometryScriptMeshSelection BoxSel;
+		UGeometryScriptLibrary_MeshSelectionFunctions::SelectMeshElementsInBox(
+			WallMesh, BoxSel, WindowBox,
+			EGeometryScriptMeshSelectionType::Triangles, false, 2);
+
+		FGeometryScriptMeshSelection NormSel;
+		UGeometryScriptLibrary_MeshSelectionFunctions::SelectMeshElementsByNormalAngle(
+			WallMesh, NormSel, Normal, 30.0,
+			EGeometryScriptMeshSelectionType::Triangles, false, 1);
+
+		FGeometryScriptMeshSelection FrontSel;
+		UGeometryScriptLibrary_MeshSelectionFunctions::CombineMeshSelections(
+			BoxSel, NormSel, FrontSel,
+			EGeometryScriptCombineSelectionMode::Intersection);
+
+		// Inset to create frame border geometry
+		FGeometryScriptMeshInsetOutsetFacesOptions InsetOpts;
+		InsetOpts.Distance = FrameWidth;
+		InsetOpts.bReproject = true;
+		InsetOpts.bBoundaryOnly = false;
+		InsetOpts.Softness = 0.0f;
+
+		UGeometryScriptLibrary_MeshModelingFunctions::ApplyMeshInsetOutsetFaces(
+			WallMesh, InsetOpts, FrontSel);
+
+		// Select INNER faces (shrunk by inset distance) for deletion
+		float ShrinkDist = FrameWidth + 0.5f;
+		FBox ShrunkBox = WindowBox.ExpandBy(-ShrinkDist);
+
+		// Delete front-facing inner faces
+		FGeometryScriptMeshSelection InnerBoxSel;
+		UGeometryScriptLibrary_MeshSelectionFunctions::SelectMeshElementsInBox(
+			WallMesh, InnerBoxSel, ShrunkBox,
+			EGeometryScriptMeshSelectionType::Triangles, false, 3);
+
+		FGeometryScriptMeshSelection InnerNormSel;
+		UGeometryScriptLibrary_MeshSelectionFunctions::SelectMeshElementsByNormalAngle(
+			WallMesh, InnerNormSel, Normal, 30.0,
+			EGeometryScriptMeshSelectionType::Triangles, false, 1);
+
+		FGeometryScriptMeshSelection DeleteFrontSel;
+		UGeometryScriptLibrary_MeshSelectionFunctions::CombineMeshSelections(
+			InnerBoxSel, InnerNormSel, DeleteFrontSel,
+			EGeometryScriptCombineSelectionMode::Intersection);
+
+		int32 NumFrontDeleted = 0;
+		UGeometryScriptLibrary_MeshBasicEditFunctions::DeleteSelectedTrianglesFromMesh(
+			WallMesh, DeleteFrontSel, NumFrontDeleted);
+
+		// Delete back-facing inner faces (punch fully through the wall)
+		FGeometryScriptMeshSelection InnerBoxSel2;
+		UGeometryScriptLibrary_MeshSelectionFunctions::SelectMeshElementsInBox(
+			WallMesh, InnerBoxSel2, ShrunkBox,
+			EGeometryScriptMeshSelectionType::Triangles, false, 3);
+
+		FGeometryScriptMeshSelection BackNormSel;
+		UGeometryScriptLibrary_MeshSelectionFunctions::SelectMeshElementsByNormalAngle(
+			WallMesh, BackNormSel, -Normal, 30.0,
+			EGeometryScriptMeshSelectionType::Triangles, false, 1);
+
+		FGeometryScriptMeshSelection DeleteBackSel;
+		UGeometryScriptLibrary_MeshSelectionFunctions::CombineMeshSelections(
+			InnerBoxSel2, BackNormSel, DeleteBackSel,
+			EGeometryScriptCombineSelectionMode::Intersection);
+
+		int32 NumBackDeleted = 0;
+		UGeometryScriptLibrary_MeshBasicEditFunctions::DeleteSelectedTrianglesFromMesh(
+			WallMesh, DeleteBackSel, NumBackDeleted);
+	};
+
+	// Process all openings
+	for (const FWindowPlacement& Win : Windows)
+	{
+		CutOneOpening(Win.CenterX, Win.Width, Win.SillZ, Win.Height);
+	}
+	for (const FDoorPlacement& Door : Doors)
+	{
+		CutOneOpening(Door.CenterX, Door.Width, 0.0f, Door.Height);
+	}
+
+	// Merge the processed wall into the main building mesh
+	UGeometryScriptLibrary_MeshBasicEditFunctions::AppendMesh(
+		Mesh, WallMesh, FTransform::Identity);
 }
 
 void FMonolithMeshFacadeActions::AddWindowFrames(UDynamicMesh* Mesh,

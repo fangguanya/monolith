@@ -1,6 +1,7 @@
 #if WITH_GEOMETRYSCRIPT
 
 #include "MonolithMeshBuildingActions.h"
+#include "MonolithMeshFacadeActions.h"
 #include "MonolithMeshProceduralActions.h"
 #include "MonolithMeshHandlePool.h"
 #include "MonolithMeshUtils.h"
@@ -67,6 +68,8 @@ void FMonolithMeshBuildingActions::RegisterActions(FMonolithToolRegistry& Regist
 			.Optional(TEXT("folder"), TEXT("string"), TEXT("Outliner folder path"))
 			.Optional(TEXT("building_id"), TEXT("string"), TEXT("Building ID for the descriptor"))
 			.Optional(TEXT("omit_exterior_walls"), TEXT("boolean"), TEXT("Skip exterior wall geometry (use when facade will replace exterior walls). FExteriorFaceDef entries still emitted."), TEXT("false"))
+			.Optional(TEXT("facade_style"), TEXT("string"), TEXT("Facade style name (loads from FacadeStyles/ presets). When set, generates integrated facade with windows/doors/trim. Automatically enables omit_exterior_walls."))
+			.Optional(TEXT("facade_seed"), TEXT("integer"), TEXT("Random seed for facade variation (window placement, doors)"), TEXT("0"))
 			.Optional(TEXT("overwrite"), TEXT("boolean"), TEXT("Allow overwriting existing asset at save_path"), TEXT("false"))
 			.Build());
 
@@ -1149,6 +1152,164 @@ TArray<FVector2D> FMonolithMeshBuildingActions::ComputeFootprint(
 }
 
 // ============================================================================
+// Integrated Facade Generation — v3 Single-Pass Architecture
+// ============================================================================
+
+void FMonolithMeshBuildingActions::GenerateIntegratedFacade(UDynamicMesh* Mesh,
+	const TArray<FExteriorFaceDef>& ExteriorFaces, float WallThickness,
+	const FString& FacadeStyleName, int32 Seed, int32 MaxFloorIndex,
+	FBuildingDescriptor& Descriptor, bool& bHadBooleans)
+{
+	using FFacadeStyle = FMonolithMeshFacadeActions::FFacadeStyle;
+	using FWindowPlacement = FMonolithMeshFacadeActions::FWindowPlacement;
+	using FDoorPlacement = FMonolithMeshFacadeActions::FDoorPlacement;
+
+	// Load facade style
+	FFacadeStyle Style;
+	if (!FMonolithMeshFacadeActions::LoadFacadeStyle(FacadeStyleName, Style))
+	{
+		Style.Name = FacadeStyleName;
+		Style.Description = TEXT("Default (no preset file found)");
+	}
+
+	Descriptor.FacadeStyle = FacadeStyleName;
+
+	// Track ground floor window X positions per wall direction for vertical alignment
+	TMap<FString, TArray<float>> GroundFloorWindowX;
+
+	for (const FExteriorFaceDef& Face : ExteriorFaces)
+	{
+		bool bIsGroundFloor = (Face.FloorIndex == 0);
+		float MinSpacing = Style.WindowWidth * 0.6f;
+		float Margin = Style.FrameWidth + Style.CornerWidth;
+
+		// 1. Wall slab is built internally by CutOpeningsSelectionInset
+		//    (it needs an isolated mesh for plane slicing to not affect other geometry)
+
+		// 2. Compute window positions
+		TArray<float> WinXPositions;
+
+		if (bIsGroundFloor)
+		{
+			WinXPositions = FMonolithMeshFacadeActions::ComputeWindowPositions(
+				Face.Width, Style.WindowWidth, Margin, MinSpacing);
+			GroundFloorWindowX.FindOrAdd(Face.Wall) = WinXPositions;
+		}
+		else
+		{
+			// Upper floors: align with ground floor when possible
+			const TArray<float>* GroundPositions = GroundFloorWindowX.Find(Face.Wall);
+			if (GroundPositions && GroundPositions->Num() > 0)
+			{
+				WinXPositions = *GroundPositions;
+			}
+			else
+			{
+				WinXPositions = FMonolithMeshFacadeActions::ComputeWindowPositions(
+					Face.Width, Style.WindowWidth, Margin, MinSpacing);
+			}
+		}
+
+		// 3. Build window placements
+		TArray<FWindowPlacement> Windows;
+		for (float XPos : WinXPositions)
+		{
+			FWindowPlacement Win;
+			Win.CenterX = XPos;
+			Win.Width = Style.WindowWidth;
+			Win.Height = Style.WindowHeight;
+			Win.SillZ = Style.SillHeight;
+			Win.FloorIndex = Face.FloorIndex;
+			Win.bIsGroundFloor = bIsGroundFloor;
+			Windows.Add(Win);
+		}
+
+		// 4. Build door placements (ground floor only, if face is wide enough)
+		TArray<FDoorPlacement> Doors;
+		if (bIsGroundFloor && Face.Width >= Style.DoorWidth + 2.0f * Margin)
+		{
+			FRandomStream DoorRng(Seed + FCrc::StrCrc32(*Face.Wall));
+			if (DoorRng.FRand() < 0.4f)
+			{
+				FDoorPlacement Door;
+				Door.CenterX = 0.0f;
+				Door.Width = Style.DoorWidth;
+				Door.Height = Style.DoorHeight;
+				Door.bStorefront = false;
+				Doors.Add(Door);
+
+				// Remove windows that overlap with the door
+				float DoorHalfW = Style.DoorWidth * 0.5f + Style.FrameWidth;
+				Windows.RemoveAll([DoorHalfW](const FWindowPlacement& W)
+				{
+					return FMath::Abs(W.CenterX) < DoorHalfW;
+				});
+			}
+		}
+
+		// 5. Build wall slab + cut window/door openings via Selection+Inset
+		//    CutOpeningsSelectionInset builds the wall in an isolated temp mesh,
+		//    applies plane slices + selection + inset + deletion, then AppendMesh.
+		FMonolithMeshFacadeActions::CutOpeningsSelectionInset(
+			Mesh, Face, Windows, Doors, WallThickness, Style.FrameWidth,
+			/*bUseSelectionInset=*/true, bHadBooleans);
+
+		// 6. Add window frames
+		FMonolithMeshFacadeActions::AddWindowFrames(Mesh, Face, Windows, Style, WallThickness);
+
+		// 7. Add door frames
+		FMonolithMeshFacadeActions::AddDoorFrames(Mesh, Face, Doors, Style, WallThickness);
+
+		// 8. Add glass panes
+		FMonolithMeshFacadeActions::AddGlassPanes(Mesh, Face, Windows, Style.GlassMaterialId);
+
+		// 9. Belt course above ground floor
+		if (bIsGroundFloor && MaxFloorIndex > 0)
+		{
+			FMonolithMeshFacadeActions::AddBeltCourse(Mesh, Face, Face.Height, Style);
+		}
+
+		// 10. Cornice on top floor
+		if (Face.FloorIndex == MaxFloorIndex)
+		{
+			FMonolithMeshFacadeActions::AddCornice(Mesh, Face, Face.Height, Style);
+		}
+
+		// 11. Emit window metadata into descriptor
+		FVector WidthAxis = FMonolithMeshFacadeActions::GetFaceWidthAxis(Face);
+		FVector FaceCenter = Face.WorldOrigin + WidthAxis * (Face.Width * 0.5f);
+
+		for (const FWindowPlacement& W : Windows)
+		{
+			FFacadeWindowPlacement WP;
+			WP.CenterX = W.CenterX;
+			WP.SillZ = W.SillZ;
+			WP.Width = W.Width;
+			WP.Height = W.Height;
+			WP.FloorIndex = W.FloorIndex;
+			WP.bIsGroundFloor = W.bIsGroundFloor;
+			WP.Wall = Face.Wall;
+			WP.WorldCenter = FaceCenter + WidthAxis * W.CenterX;
+			WP.WorldCenter.Z = Face.WorldOrigin.Z + W.SillZ + W.Height * 0.5f;
+			Descriptor.Windows.Add(MoveTemp(WP));
+		}
+
+		for (const FDoorPlacement& D : Doors)
+		{
+			FFacadeDoorPlacement DP;
+			DP.CenterX = D.CenterX;
+			DP.Width = D.Width;
+			DP.Height = D.Height;
+			DP.bStorefront = D.bStorefront;
+			DP.Wall = Face.Wall;
+			DP.WorldCenter = FaceCenter + WidthAxis * D.CenterX;
+			DP.WorldCenter.Z = Face.WorldOrigin.Z + D.Height * 0.5f;
+			Descriptor.EntranceDoors.Add(MoveTemp(DP));
+		}
+	}
+}
+
+// ============================================================================
 // create_building_from_grid — The Main Action
 // ============================================================================
 
@@ -1236,6 +1397,20 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 	// ---- Parse optional flags ----
 	bool bOmitExteriorWalls = Params->HasField(TEXT("omit_exterior_walls"))
 		? Params->GetBoolField(TEXT("omit_exterior_walls")) : false;
+
+	// ---- Facade style (v3 integrated facade) ----
+	FString FacadeStyleName;
+	Params->TryGetStringField(TEXT("facade_style"), FacadeStyleName);
+	bool bHasFacadeStyle = !FacadeStyleName.IsEmpty();
+	int32 FacadeSeed = Params->HasField(TEXT("facade_seed"))
+		? static_cast<int32>(Params->GetNumberField(TEXT("facade_seed"))) : 0;
+
+	// When facade_style is provided, automatically omit exterior walls from the base generator
+	// because the facade functions will generate the exterior walls WITH openings
+	if (bHasFacadeStyle)
+	{
+		bOmitExteriorWalls = true;
+	}
 
 	// ---- Build geometry ----
 	UDynamicMesh* Mesh = NewObject<UDynamicMesh>(Pool);
@@ -1349,6 +1524,15 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 		GenerateStairGeometry(Mesh, *FloorStairwells, CellSize, FloorHeight + FloorThick,
 			FloorZ + FloorThick, ActualStairWidth);
 
+		// 7.5 Generate integrated facade (walls + windows) for this floor's exterior faces
+		// This runs AFTER interior walls/slabs/doors and BEFORE Location offset is applied.
+		// ExteriorFaces are in local mesh space — facade geometry is appended in the same space.
+		if (bHasFacadeStyle && ExteriorFaces.Num() > 0)
+		{
+			GenerateIntegratedFacade(Mesh, ExteriorFaces, ExteriorT,
+				FacadeStyleName, FacadeSeed, NumFloors - 1, Descriptor, bHadBooleans);
+		}
+
 		// 8. Compute room bounds and door positions for descriptor
 		ComputeRoomBounds(*FloorRooms, CellSize, FloorHeight, FloorZ + FloorThick, Location);
 		ComputeDoorPositions(*FloorDoors, CellSize, FloorZ + FloorThick, Location,
@@ -1430,6 +1614,13 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 		Actor->Tags.Add(FName(TEXT("BuildingCeiling")));
 		Descriptor.TagsApplied.Add(TEXT("BuildingFloor"));
 		Descriptor.TagsApplied.Add(TEXT("BuildingCeiling"));
+
+		if (bHasFacadeStyle)
+		{
+			Actor->Tags.Add(FName(TEXT("BuildingFacade")));
+			Actor->Tags.Add(FName(TEXT("Monolith.Procedural")));
+			Descriptor.TagsApplied.Add(TEXT("BuildingFacade"));
+		}
 	}
 
 	// 15. Build result JSON with full Building Descriptor
@@ -1443,6 +1634,14 @@ FMonolithActionResult FMonolithMeshBuildingActions::CreateBuildingFromGrid(const
 	Result->SetNumberField(TEXT("grid_height"), GridH);
 	Result->SetBoolField(TEXT("had_booleans"), bHadBooleans);
 	Result->SetStringField(TEXT("save_path"), SavePath);
+
+	if (bHasFacadeStyle)
+	{
+		Result->SetStringField(TEXT("facade_style"), FacadeStyleName);
+		Result->SetNumberField(TEXT("window_count"), Descriptor.Windows.Num());
+		Result->SetNumberField(TEXT("entrance_door_count"), Descriptor.EntranceDoors.Num());
+		Result->SetBoolField(TEXT("integrated_facade"), true);
+	}
 
 	if (Actor)
 	{

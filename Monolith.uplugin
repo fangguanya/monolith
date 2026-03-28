@@ -56,6 +56,10 @@
 			"Name": "BlueprintAssist",
 			"Enabled": true,
 			"Optional": true
+		},
+		{
+			"Name": "GameplayAbilities",
+			"Enabled": true
 		}
 	],
 	"Modules": [
@@ -118,6 +122,12 @@
 			"Name": "MonolithMesh",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithGAS",
+			"Type": "Editor",
+			"LoadingPhase": "Default",
+			"bEnabled": false
 		}
 	]
 }

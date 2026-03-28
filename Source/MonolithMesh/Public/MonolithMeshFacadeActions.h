@@ -16,6 +16,9 @@ class UDynamicMesh;
  * even window placement and horror damage overlay.
  *
  * 3 actions: generate_facade, list_facade_styles, apply_horror_damage
+ *
+ * Public static utilities are shared with FMonolithMeshBuildingActions for integrated
+ * facade generation (v3 single-pass architecture).
  */
 class FMonolithMeshFacadeActions
 {
@@ -23,15 +26,7 @@ public:
 	static void RegisterActions(FMonolithToolRegistry& Registry);
 	static void SetHandlePool(UMonolithMeshHandlePool* InPool);
 
-private:
-	static UMonolithMeshHandlePool* Pool;
-
-	// ---- Action handlers ----
-	static FMonolithActionResult GenerateFacade(const TSharedPtr<FJsonObject>& Params);
-	static FMonolithActionResult ListFacadeStyles(const TSharedPtr<FJsonObject>& Params);
-	static FMonolithActionResult ApplyHorrorDamage(const TSharedPtr<FJsonObject>& Params);
-
-	// ---- Facade style loading ----
+	// ---- Public types (shared with building generator) ----
 
 	/** Facade style definition loaded from JSON presets */
 	struct FFacadeStyle
@@ -75,14 +70,6 @@ private:
 		int32 DoorMaterialId = 7;
 	};
 
-	/** Load a facade style from JSON preset file. Returns false if not found. */
-	static bool LoadFacadeStyle(const FString& StyleName, FFacadeStyle& OutStyle);
-
-	/** Get the directory path for facade style JSON files */
-	static FString GetFacadeStylesDir();
-
-	// ---- Window placement algorithm ----
-
 	struct FWindowPlacement
 	{
 		float CenterX;      // Center X position along wall face (local to face)
@@ -101,6 +88,14 @@ private:
 		bool bStorefront;
 	};
 
+	// ---- Public static utilities (callable from building generator) ----
+
+	/** Load a facade style from JSON preset file. Returns false if not found. */
+	static bool LoadFacadeStyle(const FString& StyleName, FFacadeStyle& OutStyle);
+
+	/** Get the directory path for facade style JSON files */
+	static FString GetFacadeStylesDir();
+
 	/**
 	 * Core window placement: evenly distribute N windows across a wall of given width.
 	 * Returns center-X positions relative to wall center (i.e., -W/2 to +W/2 range).
@@ -108,17 +103,30 @@ private:
 	static TArray<float> ComputeWindowPositions(float WallWidth, float WindowWidth,
 		float Margin, float MinSpacing);
 
-	// ---- Geometry builders ----
-
 	/** Build the base wall slab for a single exterior face */
 	static void BuildWallSlab(UDynamicMesh* Mesh, const FExteriorFaceDef& Face,
 		float WallThickness, int32 MaterialId);
 
 	/** Boolean-subtract all window and door openings from the wall mesh.
-	 *  Pre-insets cut regions by 0.5cm to avoid coplanar faces. */
+	 *  Pre-insets cut regions by 0.5cm to avoid coplanar faces.
+	 *  LEGACY: Use CutOpeningsSelectionInset for the v3 pipeline. */
 	static void CutOpenings(UDynamicMesh* Mesh, const FExteriorFaceDef& Face,
 		const TArray<FWindowPlacement>& Windows, const TArray<FDoorPlacement>& Doors,
 		float WallThickness, bool& bHadBooleans);
+
+	/**
+	 * Selection+Inset window/door openings — replaces boolean subtract.
+	 * Pre-subdivides the wall with plane cuts at window boundaries, then uses
+	 * SelectMeshElementsInBox + SelectMeshElementsByNormalAngle + ApplyMeshInsetOutsetFaces
+	 * + DeleteSelectedTrianglesFromMesh to create clean openings with frame geometry.
+	 *
+	 * ~20x faster than boolean subtract, no T-junctions or degenerate triangles.
+	 *
+	 * @param bUseSelectionInset  If false, falls back to CutOpenings (boolean subtract).
+	 */
+	static void CutOpeningsSelectionInset(UDynamicMesh* Mesh, const FExteriorFaceDef& Face,
+		const TArray<FWindowPlacement>& Windows, const TArray<FDoorPlacement>& Doors,
+		float WallThickness, float FrameWidth, bool bUseSelectionInset, bool& bHadBooleans);
 
 	/** Add window frame trim (jambs, lintel, sill) for all windows */
 	static void AddWindowFrames(UDynamicMesh* Mesh, const FExteriorFaceDef& Face,
@@ -140,6 +148,21 @@ private:
 	static void AddGlassPanes(UDynamicMesh* Mesh, const FExteriorFaceDef& Face,
 		const TArray<FWindowPlacement>& Windows, int32 GlassMaterialId);
 
+	/** Get the horizontal axis for a face (perpendicular to normal, in XY plane) */
+	static FVector GetFaceWidthAxis(const FExteriorFaceDef& Face);
+
+	/** Compute the transform that maps from face-local (width along X, height along Z)
+	 *  to world space, given the face's origin, normal, and wall direction. */
+	static FTransform ComputeFaceTransform(const FExteriorFaceDef& Face);
+
+private:
+	static UMonolithMeshHandlePool* Pool;
+
+	// ---- Action handlers ----
+	static FMonolithActionResult GenerateFacade(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult ListFacadeStyles(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult ApplyHorrorDamage(const TSharedPtr<FJsonObject>& Params);
+
 	// ---- Horror damage builders ----
 
 	/** Add boarding planks across window openings */
@@ -150,15 +173,6 @@ private:
 	/** Add crack line geometry on wall surface */
 	static void AddCrackGeometry(UDynamicMesh* Mesh, const FExteriorFaceDef& Face,
 		float DamageLevel, int32 Seed);
-
-	// ---- Coordinate helpers ----
-
-	/** Compute the transform that maps from face-local (width along X, height along Z)
-	 *  to world space, given the face's origin, normal, and wall direction. */
-	static FTransform ComputeFaceTransform(const FExteriorFaceDef& Face);
-
-	/** Get the horizontal axis for a face (perpendicular to normal, in XY plane) */
-	static FVector GetFaceWidthAxis(const FExteriorFaceDef& Face);
 };
 
 #endif // WITH_GEOMETRYSCRIPT

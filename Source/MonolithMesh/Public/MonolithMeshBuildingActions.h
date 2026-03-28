@@ -93,6 +93,13 @@ private:
 
 	/** Build footprint polygon from the outermost grid edges */
 	static TArray<FVector2D> ComputeFootprint(const TArray<TArray<int32>>& Grid, int32 GridW, int32 GridH, float CellSize);
+
+	/** Generate integrated facade (walls + windows) for one floor's exterior faces.
+	 *  Called from CreateBuildingFromGrid when facade_style is provided. */
+	static void GenerateIntegratedFacade(UDynamicMesh* Mesh,
+		const TArray<FExteriorFaceDef>& ExteriorFaces, float WallThickness,
+		const FString& FacadeStyleName, int32 Seed, int32 MaxFloorIndex,
+		FBuildingDescriptor& Descriptor, bool& bHadBooleans);
 };
 
 #endif // WITH_GEOMETRYSCRIPT
