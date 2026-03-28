@@ -1231,9 +1231,44 @@ FMonolithActionResult FMonolithMeshPresetActions::ExportGenrePreset(const TShare
 	TArray<TSharedPtr<FJsonValue>> PropKits = CollectFiles(GetPropKitsDirectory(), PropKitFilter);
 
 	int32 TotalItems = Patterns.Num() + AcousticProfiles.Num() + TensionProfiles.Num() + Templates.Num() + PropKits.Num();
+
+	// Warn about filtered names that weren't found (likely built-in items which can't be exported)
+	TArray<FString> ExportWarnings;
+	auto CheckMissing = [&](const TSet<FString>& Filter, const TArray<TSharedPtr<FJsonValue>>& Collected, const FString& Category)
+	{
+		if (Filter.Num() == 0) return;
+		TSet<FString> Found;
+		for (const auto& Item : Collected)
+		{
+			if (const TSharedPtr<FJsonObject>* Obj = nullptr; Item->TryGetObject(Obj) && Obj->IsValid())
+			{
+				FString ItemName;
+				(*Obj)->TryGetStringField(TEXT("name"), ItemName);
+				Found.Add(ItemName);
+			}
+		}
+		for (const FString& Requested : Filter)
+		{
+			if (!Found.Contains(Requested))
+			{
+				ExportWarnings.Add(FString::Printf(
+					TEXT("Requested %s '%s' not found in user files — built-in items cannot be exported (they ship with the plugin)."),
+					*Category, *Requested));
+			}
+		}
+	};
+	CheckMissing(PatternFilter, Patterns, TEXT("pattern"));
+	CheckMissing(AcousticFilter, AcousticProfiles, TEXT("acoustic profile"));
+	CheckMissing(TensionFilter, TensionProfiles, TEXT("tension profile"));
+
 	if (TotalItems == 0)
 	{
-		return FMonolithActionResult::Error(TEXT("No user-created presets found to export. Create patterns, acoustic profiles, tension profiles, templates, or prop kits first."));
+		FString Msg = TEXT("No user-created items found to export.");
+		if (ExportWarnings.Num() > 0)
+		{
+			Msg += TEXT(" ") + FString::Join(ExportWarnings, TEXT(" "));
+		}
+		return FMonolithActionResult::Error(Msg);
 	}
 
 	// Build the preset bundle
@@ -1273,6 +1308,16 @@ FMonolithActionResult FMonolithMeshPresetActions::ExportGenrePreset(const TShare
 	Summary->SetNumberField(TEXT("total_items"), TotalItems);
 	Result->SetObjectField(TEXT("content_summary"), Summary);
 	Result->SetStringField(TEXT("status"), bOverwrite ? TEXT("overwritten") : TEXT("created"));
+
+	if (ExportWarnings.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> WarnArr;
+		for (const FString& W : ExportWarnings)
+		{
+			WarnArr.Add(MakeShared<FJsonValueString>(W));
+		}
+		Result->SetArrayField(TEXT("warnings"), WarnArr);
+	}
 
 	return FMonolithActionResult::Success(Result);
 }

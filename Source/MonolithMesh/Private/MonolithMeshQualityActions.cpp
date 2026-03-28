@@ -310,6 +310,14 @@ FMonolithActionResult FMonolithMeshQualityActions::BatchRenameAssets(const TShar
 			return FMonolithActionResult::Error(TEXT("Each entry in asset_paths must be a non-empty string"));
 		}
 
+		// Normalize: if path lacks object name (Package.AssetName), append it
+		// e.g. "/Game/Foo/Bar" → "/Game/Foo/Bar.Bar"
+		if (!AssetPath.Contains(TEXT(".")))
+		{
+			FString BaseName = FPaths::GetBaseFilename(AssetPath);
+			AssetPath = AssetPath + TEXT(".") + BaseName;
+		}
+
 		FAssetData AssetData = AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(AssetPath));
 		if (!AssetData.IsValid())
 		{
