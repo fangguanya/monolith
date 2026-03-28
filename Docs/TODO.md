@@ -4,29 +4,138 @@ Last updated: 2026-03-27
 
 ---
 
-### MonolithMesh Module — 46 Actions, Phases 0-4 Complete (2026-03-27)
+### MonolithMesh Module — 111 Actions, ALL 12 PHASES COMPLETE (2026-03-28)
 
-- [x] **Phase 0 — Module scaffold:** MonolithMesh module, Build.cs, uplugin entry, MeshCatalogIndexer
-- [x] **Phase 1 — Mesh Inspection (12):** `get_mesh_info`, `get_mesh_bounds`, `get_mesh_materials`, `get_mesh_lods`, `get_mesh_collision`, `get_mesh_uvs`, `analyze_skeletal_mesh`, `analyze_mesh_quality`, `compare_meshes`, `get_vertex_data`, `search_meshes_by_size`, `get_mesh_catalog_stats`
-- [x] **Phase 2 — Scene Manipulation (8):** `get_actor_info`, `spawn_actor`, `move_actor`, `duplicate_actor`, `delete_actors`, `group_actors`, `set_actor_properties`, `batch_execute`
-- [x] **Phase 3 — Spatial Queries (11):** `query_raycast`, `query_multi_raycast`, `query_radial_sweep`, `query_overlap`, `query_nearest`, `query_line_of_sight`, `get_actors_in_volume`, `get_scene_bounds`, `get_scene_statistics`, `get_spatial_relationships`, `query_navmesh`
-- [x] **Phase 4 — Level Blockout (15):** `get_blockout_volumes`, `get_blockout_volume_info`, `setup_blockout_volume`, `create_blockout_primitive`, `create_blockout_primitives_batch`, `create_blockout_grid`, `match_asset_to_blockout`, `match_all_in_volume`, `apply_replacement`, `set_actor_tags`, `clear_blockout`, `export_blockout_layout`, `import_blockout_layout`, `scan_volume`, `scatter_props`
+- [x] Phase 0-12 — ALL COMPLETE. 111 actions compiled and tested.
 
-#### MonolithMesh — Known Issues / Improvements
+#### MonolithMesh — Known Issues / Polish
 
-- [ ] **Placement collision avoidance:** `scatter_props`, `create_blockout_primitives_batch`, `import_blockout_layout`, and `apply_replacement` should check for overlap with EXISTING actors in the volume before placing. Currently primitives can clip into existing furniture/geometry. Fix: before placing each actor, run `OverlapMultiByChannel` at the target location with the prop's bounds. If overlapping an existing non-blockout actor, either offset, skip, or warn. `scan_volume` already detects existing actors — cross-reference that data during placement.
-- [ ] **BP_MonolithBlockoutVolume** — Construction Script for per-RoomType wireframe colors (polish pass)
+- [x] **Placement overlap warnings:** DONE — `create_primitive`, `_batch`, `import_layout`, `scatter_props` warn when overlapping existing actors
+- [ ] **BP_MonolithBlockoutVolume** — Construction Script for per-RoomType wireframe colors (cosmetic polish)
+- [ ] **Discover workflow hints** — Add workflow metadata to `monolith_discover("mesh")` response
+- [ ] **Tier-based discover filtering** — `monolith_discover("mesh", {"tier": "audio"})` to reduce token usage
 
-#### MonolithMesh — Remaining Phases (from locked spec)
+#### MonolithMesh — Context-Aware Prop Placement (NEW)
 
-- [ ] **Phase 5 — Mesh Operations (12 actions, optional GeometryScript):** `create_handle`, `release_handle`, `list_handles`, `save_handle`, `mesh_boolean`, `mesh_simplify`, `mesh_remesh`, `generate_collision`, `generate_lods`, `fill_holes`, `compute_uvs`, `mirror_mesh`. Behind `#if WITH_GEOMETRYSCRIPT`.
-- [ ] **Phase 6 — Horror & Accessibility (14 actions):** `analyze_sightlines`, `find_hiding_spots`, `find_ambush_points`, `analyze_choke_points`, `analyze_escape_routes`, `classify_zone_tension`, `analyze_pacing_curve`, `find_dead_ends`, `validate_path_width`, `validate_navigation_complexity`, `analyze_visual_contrast`, `find_rest_points`, `validate_interactive_reach`, `generate_accessibility_report`
-- [ ] **Phase 7 — Lighting Analysis (5 actions):** `sample_light_levels`, `find_dark_corners`, `analyze_light_transitions`, `get_light_coverage`, `suggest_light_placement`. Hybrid scene capture + analytic.
-- [ ] **Phase 8 — Audio & Acoustics (14 actions):** Material-aware spatial audio. `get_audio_volumes`, `get_surface_materials`, `estimate_footstep_sound`, `analyze_room_acoustics`, `analyze_sound_propagation`, `find_loud_surfaces`, `find_sound_paths`, `can_ai_hear_from`, `get_stealth_map`, `find_quiet_path`, `suggest_audio_volumes`, `create_audio_volume`, `set_surface_type`, `create_surface_datatable`
-- [ ] **Phase 9 — Performance Analysis (5 actions):** `get_region_performance`, `estimate_placement_cost`, `find_overdraw_hotspots`, `analyze_shadow_cost`, `get_triangle_budget`
-- [ ] **Phase 10 — Decal & Detail Placement (4 actions):** `place_decals`, `place_along_path`, `analyze_prop_density`, `place_storytelling_scene`. Poisson disk, Catmull-Rom, 5 horror patterns.
-- [ ] **Phase 11 — Room Templates & Mesh Validation (8 actions):** `list_room_templates`, `get_room_template`, `apply_room_template`, `create_room_template`, `validate_game_ready`, `suggest_lod_strategy`, `batch_validate`, `compare_lod_chain`
-- [ ] **Phase 12 — Polish:** `align_actors`, `snap_to_floor`, discover workflow hints, tier filtering, integration testing, doc sync.
+- [ ] **Surface-aware scatter (`scatter_on_surface`)** — Place props ON specific surfaces, not just floors. Detect shelf tops, table tops, cabinet interiors, wall surfaces via downward/directional traces from the surface actor's bounds. "Place 5 books on this shelf" should work.
+- [ ] **Disturbance levels (`set_room_disturbance`)** — Apply a disturbance level to placed props in a volume:
+  - `"orderly"` — aligned, evenly spaced, upright
+  - `"slightly_messy"` — small random offsets, some tilted 5-15 degrees
+  - `"ransacked"` — large random offsets, many tipped over (60-90 degree rotations), some on floor
+  - `"abandoned"` — like ransacked + props pushed to edges (simulating years of settling)
+  Implementation: iterate placed actors in volume, apply progressive random transforms based on disturbance level. Single undo transaction.
+- [ ] **Physics prop sleep state (`configure_physics_props`)** — Set SimulatePhysics=true + bStartAwake=false on designated actors. They sit in their placed position until bumped by player or woken by gameplay event. Essential for interactive horror (knock over a stack of cans, send bottles rolling).
+- [ ] **Gravity-settle placement (`settle_props`)** — For each prop: enable physics, simulate for N frames (or until velocity < threshold), capture settled transform, disable physics. Gives organic "someone dropped this here" look. UE5 has `UPhysicsSimulationComponent` or we can use `FPhysicsInterface::Simulate()`.
+- [ ] **Themed prop kits** — JSON definitions like room templates but for prop sets: "office_desk_clutter" (papers, pens, mug, monitor, keyboard), "hospital_tray" (syringe, bandages, clipboard). Each kit defines items with relative positions to an anchor point. `place_prop_kit` action.
+- [ ] **Wall/ceiling scatter** — Extend `scatter_props` with `surface` param: "floor" (current), "wall" (horizontal trace outward, align to wall normal), "ceiling" (upward trace), "shelf" (trace to named actor's top surface). Paintings, clocks, chains, cables.
+
+#### MonolithMesh — Procedural Geometry (Future)
+
+See `Docs/plans/2026-03-28-procedural-geometry-wishlist.md` for full details:
+- [ ] `create_parametric_mesh` — chair, table, shelf, door_frame, stairs, etc. (~15 types)
+- [ ] `create_structure` — room, corridor, L-corridor, T-junction, stairwell
+- [ ] `create_building_shell` — multi-story from 2D footprint polygon
+- [ ] `create_maze` — recursive backtracker, Prim's, Eller's, binary tree
+- [ ] `create_pipe_network` — sweep circle along path with elbow joints
+- [ ] `create_fragments` — Voronoi fracture for destruction
+- [ ] `create_terrain_patch` — Perlin/simplex noise heightmap
+- [ ] `create_horror_prop` — barricade, debris pile, cage, coffin, broken wall
+
+#### MonolithMesh — Unified Wishlist from 3 Perspectives (Level Design + Horror + Tech Art)
+
+**P0 — Would use EVERY session (~15 actions, ~80 hours)**
+
+Level Design:
+- [ ] `place_light` / `set_light_properties` — spawn + modify lights directly. Lighting IS horror. `suggest_light_placement` advises but can't act
+- [ ] `find_replace_mesh` — swap every instance of mesh X with mesh Y across level. Blockout→art pass essential
+- [ ] `spawn_volume` — trigger/kill/pain/blocking/nav_modifier/audio/post_process volumes. Can't build a functional level without these
+- [ ] `get_actor_properties` / `copy_actor_properties` — read arbitrary component properties, copy settings between actors
+
+Horror Design:
+- [ ] `predict_player_paths` — THE multiplier. Auto-generate weighted paths (shortest/safest/curious/cautious) so every horror action works without manual path input
+- [ ] `evaluate_spawn_point` — composite score: visibility delay, audio cover, lighting, escape proximity, path commitment
+- [ ] `suggest_scare_positions` — optimal locations for scripted events along a path. Scores anticipation, visibility, timing, player agency
+- [ ] `evaluate_encounter_pacing` — check spacing/intensity across multiple encounters. Flag back-to-back with no breather
+
+Tech Art:
+- [ ] `set_actor_material` / `swap_material_in_level` — assign materials to placed actors. Bridges mesh + material systems
+- [ ] `analyze_texel_density` / `compare_texel_density_in_region` — texels/cm consistency. #1 visual quality issue
+- [ ] `find_instancing_candidates` / `convert_to_hism` — "SM_Pipe appears 47 times, convert to HISM, save 46 draw calls"
+- [ ] `auto_generate_lods` + `set_lod_screen_sizes` — one-shot LOD pipeline for meshes
+
+**P1 — High value, weekly use (~20 actions, ~100 hours)**
+
+Level Design:
+- [ ] `build_navmesh` — horror analysis depends on navmesh but we can't trigger a rebuild
+- [ ] `manage_sublevel` — create/load/unload/move_actors_to. Horror streaming needs this
+- [ ] `place_blueprint_actor` — spawn BP actors with exposed properties ("locked door needing ward key")
+- [ ] `select_actors` — control editor selection, focus camera. AI↔human handoff
+- [ ] `snap_to_surface` — drop actors onto geometry with normal alignment
+
+Horror Design:
+- [ ] `design_encounter` — compose spawn + patrol + exits + sightline breaks + audio zones in one call
+- [ ] `suggest_patrol_route` — generate navmesh routes per AI archetype (stalker/patrol/ambusher)
+- [ ] `analyze_ai_territory` — score region as AI territory: hiding spots, patrol options, ambush positions
+- [ ] `evaluate_safe_room` — score a room: defensible entrance? good lighting? sound isolation?
+- [ ] `analyze_level_pacing_structure` — macro tension→release→tension rhythm across entire level
+
+Tech Art:
+- [ ] `import_mesh` — FBX/glTF import with settings. Every mesh enters the project here
+- [ ] `analyze_material_cost_in_region` — cross-module: mesh placement × material instruction counts
+- [ ] `fix_mesh_quality` — auto-fix: remove degenerate tris, weld verts, fix normals (extends analyze_mesh_quality)
+- [ ] `set_mesh_collision` / `auto_collision` — write collision back to assets
+- [ ] `analyze_lightmap_density` — lightmap texel density + resolution management
+
+**P2 — Workflow accelerators (~15 actions, ~60 hours)**
+
+- [ ] `randomize_transforms` — variation pass on rotation/scale/offset for organic feel
+- [ ] `place_spline` — mesh/cable splines for pipes, cables, railings
+- [ ] `get_level_actors` — filtered enumeration (class, tag, sublevel, mesh wildcard)
+- [ ] `measure_distance` — quick measurement between actors or points
+- [ ] `create_prefab` / `spawn_prefab` — reusable actor groups (Level Instance backed)
+- [ ] `generate_scare_sequence` — procedural scare events with variety + escalation
+- [ ] `analyze_framing` — camera composition scoring (leading lines, focal points)
+- [ ] `evaluate_monster_reveal` — score reveal quality: silhouette, backlight, distance, partial visibility
+- [ ] `validate_horror_intensity` — cap tension for hospice mode, remove jump scares
+- [ ] `generate_hospice_report` — full level audit: intensity caps, rest spacing, cognitive load, one-handed play
+
+**P3 — Quality of life + future (~10 actions)**
+
+- [ ] `validate_naming_conventions` / `batch_rename_assets`
+- [ ] `generate_proxy_mesh` / `setup_hlod`
+- [ ] `analyze_texture_budget` — texture streaming pool analysis
+- [ ] GeometryScript expansions: `mesh_extrude`, `mesh_subdivide`, `mesh_combine`, `mesh_separate_by_material`, `compute_ao`
+- [ ] Integration hooks: AI Director data feed, GAS tension effects, telemetry feedback loop
+
+#### MonolithMesh — Genre Preset System (NEW — Extensibility)
+
+The mesh module ships horror defaults (storytelling patterns, room templates, acoustic profiles, tension scoring). But the SYSTEMS are genre-agnostic. Other LLMs or users should be able to create their own presets for fantasy, sci-fi, detective noir, cozy sim, etc.
+
+**Authoring actions:**
+- [ ] `list_storytelling_patterns` — List all available patterns (built-in + user-created)
+- [ ] `create_storytelling_pattern` — Author a new pattern JSON: element types, radial distribution, size ranges, spawn chance. Save to `Saved/Monolith/Patterns/`. Example: fantasy "tavern_brawl" (overturned chairs, spilled mead puddles, broken mug fragments)
+- [ ] `list_acoustic_profiles` — List available surface acoustic profiles
+- [ ] `create_acoustic_profile` — Author a new acoustic property set for a genre. Fantasy: stone_dungeon, wooden_tavern, crystal_cave. Sci-fi: metal_hull, glass_viewport, organic_hive
+- [ ] `create_tension_profile` — Define what tension factors mean for a genre. Horror: short sightlines = dread. Fantasy: open vistas = wonder, narrow caves = claustrophobia. Different scoring weights per genre
+- [ ] `list_prop_kits` — List available themed prop kits
+- [ ] `create_prop_kit` — Author a themed prop kit JSON: items with relative positions, size ranges, spawn chances. "tavern_table_setting" (plates, mugs, candles, food), "sci-fi_console" (screens, buttons, cables)
+
+**Preset packs (JSON bundles in Saved/Monolith/Presets/):**
+- [ ] `export_genre_preset` — Bundle all templates + patterns + acoustic profiles + tension config + prop kits into a single distributable JSON/ZIP
+- [ ] `import_genre_preset` — Load a genre preset pack, merging with existing presets
+- [ ] Ship starter packs: `horror_default` (current), document format for community presets
+
+**Documentation for preset authors:**
+- [ ] Write a `PRESET_AUTHORING.md` guide explaining:
+  - Room template JSON format (furniture entries, position_pct, size_range)
+  - Storytelling pattern JSON format (elements, radial distribution, intensity scaling)
+  - Acoustic profile JSON format (surface types, absorption, transmission, loudness)
+  - Tension profile JSON format (factor weights, threshold mappings)
+  - Prop kit JSON format (items, relative positions, spawn_chance)
+  - How to test presets via MCP before distributing
+  - Examples for fantasy, sci-fi, detective, cozy genres
+
+**Why this matters:** Monolith becomes not just a tool but a PLATFORM. Horror is Leviathan's genre, but the open-source plugin serves everyone. LLMs working on fantasy games load a fantasy preset pack and immediately have genre-appropriate spatial awareness, environmental storytelling, and room templates. Community-driven expansion without touching C++.
 
 ---
 
