@@ -28,4 +28,5 @@ private:
 	static FMonolithActionResult BatchExecute(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult AlignActors(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult SnapToFloor(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult ManageFolders(const TSharedPtr<FJsonObject>& Params);
 };

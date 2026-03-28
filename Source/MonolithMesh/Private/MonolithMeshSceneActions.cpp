@@ -192,6 +192,16 @@ void FMonolithMeshSceneActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("actor_names"), TEXT("array"), TEXT("Array of actor names or labels to snap"))
 			.Optional(TEXT("trace_distance"), TEXT("number"), TEXT("Maximum downward trace distance"), TEXT("10000"))
 			.Build());
+
+	Registry.RegisterAction(TEXT("mesh"), TEXT("manage_folders"),
+		TEXT("Manage World Outliner folders: list, delete (move actors to root), rename, or move folders."),
+		FMonolithActionHandler::CreateStatic(&FMonolithMeshSceneActions::ManageFolders),
+		FParamSchemaBuilder()
+			.Required(TEXT("sub_action"), TEXT("string"), TEXT("Action: list, delete, rename, move"))
+			.Optional(TEXT("folder"), TEXT("string"), TEXT("Target folder path (for delete/rename/move)"))
+			.Optional(TEXT("new_folder"), TEXT("string"), TEXT("New folder path (for rename/move destination)"))
+			.Optional(TEXT("include_subfolders"), TEXT("boolean"), TEXT("Include actors in subfolders"), TEXT("true"))
+			.Build());
 }
 
 // ============================================================================
@@ -1165,4 +1175,160 @@ FMonolithActionResult FMonolithMeshSceneActions::SnapToFloor(const TSharedPtr<FJ
 	Result->SetArrayField(TEXT("actors"), ResultArr);
 
 	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// manage_folders
+// ============================================================================
+
+FMonolithActionResult FMonolithMeshSceneActions::ManageFolders(const TSharedPtr<FJsonObject>& Params)
+{
+	FString SubAction;
+	if (!Params->TryGetStringField(TEXT("sub_action"), SubAction))
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required param: sub_action (list, delete, rename, move)"));
+	}
+	SubAction = SubAction.ToLower();
+
+	UWorld* World = MonolithMeshUtils::GetEditorWorld();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("No editor world available"));
+	}
+
+	// ---- LIST: enumerate all folder paths in use ----
+	if (SubAction == TEXT("list"))
+	{
+		TMap<FString, int32> FolderCounts;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			FName FolderPath = It->GetFolderPath();
+			if (!FolderPath.IsNone())
+			{
+				FolderCounts.FindOrAdd(FolderPath.ToString())++;
+			}
+		}
+
+		TArray<TSharedPtr<FJsonValue>> FolderArr;
+		FolderCounts.KeySort([](const FString& A, const FString& B) { return A < B; });
+		for (const auto& Pair : FolderCounts)
+		{
+			auto Obj = MakeShared<FJsonObject>();
+			Obj->SetStringField(TEXT("folder"), Pair.Key);
+			Obj->SetNumberField(TEXT("actor_count"), Pair.Value);
+			FolderArr.Add(MakeShared<FJsonValueObject>(Obj));
+		}
+
+		auto Result = MakeShared<FJsonObject>();
+		Result->SetArrayField(TEXT("folders"), FolderArr);
+		Result->SetNumberField(TEXT("total_folders"), FolderArr.Num());
+		return FMonolithActionResult::Success(Result);
+	}
+
+	// ---- Remaining sub-actions need a folder param ----
+	FString Folder;
+	if (!Params->TryGetStringField(TEXT("folder"), Folder) || Folder.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required param: folder (for delete/rename/move)"));
+	}
+
+	bool bIncludeSubfolders = true;
+	Params->TryGetBoolField(TEXT("include_subfolders"), bIncludeSubfolders);
+
+	// Collect actors in the target folder
+	TArray<AActor*> FolderActors;
+	FName FolderFName(*Folder);
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		FName ActorFolder = It->GetFolderPath();
+		if (ActorFolder == FolderFName)
+		{
+			FolderActors.Add(*It);
+		}
+		else if (bIncludeSubfolders && !ActorFolder.IsNone())
+		{
+			FString ActorFolderStr = ActorFolder.ToString();
+			if (ActorFolderStr.StartsWith(Folder + TEXT("/")))
+			{
+				FolderActors.Add(*It);
+			}
+		}
+	}
+
+	// ---- DELETE: move all actors to root (folder vanishes when empty) ----
+	if (SubAction == TEXT("delete"))
+	{
+		SceneActionHelpers::FScopedMeshTransaction Transaction(FText::FromString(TEXT("Monolith: Delete Folder")));
+
+		for (AActor* Actor : FolderActors)
+		{
+			Actor->SetFolderPath(NAME_None);
+		}
+
+		auto Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("deleted_folder"), Folder);
+		Result->SetNumberField(TEXT("actors_moved_to_root"), FolderActors.Num());
+		return FMonolithActionResult::Success(Result);
+	}
+
+	// ---- RENAME: change folder path for all actors ----
+	if (SubAction == TEXT("rename"))
+	{
+		FString NewFolder;
+		if (!Params->TryGetStringField(TEXT("new_folder"), NewFolder) || NewFolder.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("Missing required param: new_folder (for rename)"));
+		}
+
+		SceneActionHelpers::FScopedMeshTransaction Transaction(FText::FromString(TEXT("Monolith: Rename Folder")));
+
+		int32 Renamed = 0;
+		for (AActor* Actor : FolderActors)
+		{
+			FString ActorFolderStr = Actor->GetFolderPath().ToString();
+			if (ActorFolderStr == Folder)
+			{
+				Actor->SetFolderPath(FName(*NewFolder));
+			}
+			else if (bIncludeSubfolders)
+			{
+				// Preserve subfolder structure: "OldFolder/Sub" -> "NewFolder/Sub"
+				FString Remainder = ActorFolderStr.Mid(Folder.Len());
+				Actor->SetFolderPath(FName(*(NewFolder + Remainder)));
+			}
+			Renamed++;
+		}
+
+		auto Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("old_folder"), Folder);
+		Result->SetStringField(TEXT("new_folder"), NewFolder);
+		Result->SetNumberField(TEXT("actors_renamed"), Renamed);
+		return FMonolithActionResult::Success(Result);
+	}
+
+	// ---- MOVE: move all actors into a different folder ----
+	if (SubAction == TEXT("move"))
+	{
+		FString NewFolder;
+		if (!Params->TryGetStringField(TEXT("new_folder"), NewFolder) || NewFolder.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("Missing required param: new_folder (for move destination)"));
+		}
+
+		SceneActionHelpers::FScopedMeshTransaction Transaction(FText::FromString(TEXT("Monolith: Move Folder")));
+
+		for (AActor* Actor : FolderActors)
+		{
+			Actor->SetFolderPath(FName(*NewFolder));
+		}
+
+		auto Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("source_folder"), Folder);
+		Result->SetStringField(TEXT("destination_folder"), NewFolder);
+		Result->SetNumberField(TEXT("actors_moved"), FolderActors.Num());
+		return FMonolithActionResult::Success(Result);
+	}
+
+	return FMonolithActionResult::Error(FString::Printf(
+		TEXT("Unknown sub_action: '%s'. Valid: list, delete, rename, move"), *SubAction));
 }
