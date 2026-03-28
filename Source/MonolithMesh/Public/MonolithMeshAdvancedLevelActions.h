@@ -29,6 +29,9 @@ private:
 	/** Create a Level Instance (prefab) from selected actors */
 	static FMonolithActionResult CreatePrefab(const TSharedPtr<FJsonObject>& Params);
 
+	/** Create a Blueprint prefab from world actors (dialog-free, MCP-safe) */
+	static FMonolithActionResult CreateBlueprintPrefab(const TSharedPtr<FJsonObject>& Params);
+
 	/** Spawn a copy of a saved Level Instance prefab */
 	static FMonolithActionResult SpawnPrefab(const TSharedPtr<FJsonObject>& Params);
 

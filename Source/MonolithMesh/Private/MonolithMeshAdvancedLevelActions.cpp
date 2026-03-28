@@ -25,7 +25,13 @@
 #include "LevelInstance/LevelInstanceInterface.h"
 #include "LevelInstance/LevelInstanceActor.h"
 #include "UObject/UnrealType.h"
+#include "UObject/SavePackage.h"
+#include "UObject/Package.h"
 #include "Misc/PackageName.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "Engine/SimpleConstructionScript.h"
+#include "Engine/SCS_Node.h"
 
 // ============================================================================
 // Helpers
@@ -185,12 +191,25 @@ void FMonolithMeshAdvancedLevelActions::RegisterActions(FMonolithToolRegistry& R
 
 	// 4. create_prefab
 	Registry.RegisterAction(TEXT("mesh"), TEXT("create_prefab"),
-		TEXT("Create a Level Instance (prefab) from existing actors. WARNING: Source actors are MOVED into the new level."),
+		TEXT("Create a Level Instance (prefab) from existing actors. WARNING: Source actors are MOVED into the new level. "
+			 "NOTE: This action triggers a Save As dialog which blocks MCP calls. For dialog-free prefab creation, use create_blueprint_prefab instead."),
 		FMonolithActionHandler::CreateStatic(&FMonolithMeshAdvancedLevelActions::CreatePrefab),
 		FParamSchemaBuilder()
 			.Required(TEXT("actor_names"), TEXT("array"), TEXT("Actor names to include in the prefab"))
 			.Required(TEXT("save_path"), TEXT("string"), TEXT("Save path for the level (e.g. /Game/Prefabs/PF_DoorFrame)"))
 			.Optional(TEXT("type"), TEXT("string"), TEXT("Level instance type: LevelInstance or PackedLevelActor"), TEXT("LevelInstance"))
+			.Build());
+
+	// 4b. create_blueprint_prefab (dialog-free alternative)
+	Registry.RegisterAction(TEXT("mesh"), TEXT("create_blueprint_prefab"),
+		TEXT("Create a Blueprint prefab from existing world actors. Harvests all components into a new Actor Blueprint's SCS. "
+			 "Dialog-free — safe for MCP/automation. Use place_blueprint_actor to spawn instances."),
+		FMonolithActionHandler::CreateStatic(&FMonolithMeshAdvancedLevelActions::CreateBlueprintPrefab),
+		FParamSchemaBuilder()
+			.Required(TEXT("actor_names"), TEXT("array"), TEXT("Actor names to include in the prefab"))
+			.Required(TEXT("save_path"), TEXT("string"), TEXT("Blueprint save path (e.g. /Game/Prefabs/BP_FurnitureSet)"))
+			.Optional(TEXT("center_pivot"), TEXT("boolean"), TEXT("Recenter components to group centroid"), TEXT("true"))
+			.Optional(TEXT("keep_source_actors"), TEXT("boolean"), TEXT("Keep original actors (don't delete)"), TEXT("true"))
 			.Build());
 
 	// 5. spawn_prefab
@@ -1331,6 +1350,140 @@ FMonolithActionResult FMonolithMeshAdvancedLevelActions::MeasureDistance(const T
 			Result->SetStringField(TEXT("navmesh_note"), TEXT("No editor world available for navmesh query"));
 		}
 	}
+
+	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// 9. create_blueprint_prefab (dialog-free)
+// ============================================================================
+
+FMonolithActionResult FMonolithMeshAdvancedLevelActions::CreateBlueprintPrefab(const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* ActorNamesJson = nullptr;
+	if (!Params->TryGetArrayField(TEXT("actor_names"), ActorNamesJson) || !ActorNamesJson || ActorNamesJson->Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("Missing or empty required param: actor_names"));
+	}
+
+	FString SavePath;
+	if (!Params->TryGetStringField(TEXT("save_path"), SavePath))
+	{
+		return FMonolithActionResult::Error(TEXT("Missing required param: save_path"));
+	}
+
+	bool bCenterPivot = true;
+	Params->TryGetBoolField(TEXT("center_pivot"), bCenterPivot);
+
+	bool bKeepSourceActors = true;
+	Params->TryGetBoolField(TEXT("keep_source_actors"), bKeepSourceActors);
+
+	UWorld* World = MonolithMeshUtils::GetEditorWorld();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("No editor world available"));
+	}
+
+	// Resolve actors
+	TArray<AActor*> Actors;
+	FString ResolveError;
+	if (!AdvancedLevelHelpers::ResolveActors(*ActorNamesJson, Actors, ResolveError))
+	{
+		return FMonolithActionResult::Error(ResolveError);
+	}
+
+	if (Actors.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("No valid actors resolved from actor_names"));
+	}
+
+	AdvancedLevelHelpers::FScopedMeshTransaction Transaction(
+		NSLOCTEXT("Monolith", "CreateBlueprintPrefab", "Monolith: Create Blueprint Prefab"));
+
+	// Create package (no dialog)
+	UPackage* Package = CreatePackage(*SavePath);
+	if (!Package)
+	{
+		Transaction.Cancel();
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create package at: %s"), *SavePath));
+	}
+	Package->FullyLoad();
+
+	FString AssetName = FPaths::GetBaseFilename(SavePath);
+
+	// Configure harvest params — dialog-free overload
+	FKismetEditorUtilities::FHarvestBlueprintFromActorsParams HarvestParams;
+	HarvestParams.bReplaceActors = !bKeepSourceActors;
+	HarvestParams.bOpenBlueprint = false;
+	HarvestParams.ParentClass = AActor::StaticClass();
+
+	// Harvest — FName/UPackage* overload is completely dialog-free
+	UBlueprint* BP = FKismetEditorUtilities::HarvestBlueprintFromActors(
+		FName(*AssetName), Package, Actors, HarvestParams);
+
+	if (!BP)
+	{
+		Transaction.Cancel();
+		return FMonolithActionResult::Error(TEXT("HarvestBlueprintFromActors failed — could not create Blueprint from the given actors"));
+	}
+
+	// Center pivot: offset all SCS component templates by -centroid
+	int32 ComponentCount = 0;
+	if (bCenterPivot && BP->SimpleConstructionScript)
+	{
+		// Compute centroid from actor world locations
+		FVector Centroid = FVector::ZeroVector;
+		for (AActor* A : Actors)
+		{
+			Centroid += A->GetActorLocation();
+		}
+		Centroid /= Actors.Num();
+
+		USimpleConstructionScript* SCS = BP->SimpleConstructionScript;
+		ComponentCount = SCS->GetAllNodes().Num();
+
+		// Only offset root-level nodes — child nodes already have correct
+		// relative transforms to their parent component
+		const TArray<USCS_Node*>& RootNodes = SCS->GetRootNodes();
+		for (USCS_Node* Node : RootNodes)
+		{
+			if (!Node || !Node->ComponentTemplate) continue;
+
+			USceneComponent* Template = Cast<USceneComponent>(Node->ComponentTemplate);
+			if (Template)
+			{
+				Template->SetRelativeLocation_Direct(
+					Template->GetRelativeLocation() - Centroid);
+			}
+		}
+	}
+	else if (BP->SimpleConstructionScript)
+	{
+		ComponentCount = BP->SimpleConstructionScript->GetAllNodes().Num();
+	}
+
+	// Compile the blueprint
+	FKismetEditorUtilities::CompileBlueprint(BP);
+
+	// Register with asset registry and save
+	FAssetRegistryModule::AssetCreated(BP);
+	Package->MarkPackageDirty();
+
+	FString PackageFilename = FPackageName::LongPackageNameToFilename(
+		SavePath, FPackageName::GetAssetPackageExtension());
+	FSavePackageArgs SaveArgs;
+	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+	UPackage::SavePackage(Package, BP, *PackageFilename, SaveArgs);
+
+	// Build result
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("blueprint_path"), SavePath);
+	Result->SetStringField(TEXT("asset_name"), AssetName);
+	Result->SetNumberField(TEXT("source_actor_count"), Actors.Num());
+	Result->SetNumberField(TEXT("component_count"), ComponentCount);
+	Result->SetBoolField(TEXT("center_pivot"), bCenterPivot);
+	Result->SetBoolField(TEXT("keep_source_actors"), bKeepSourceActors);
+	Result->SetStringField(TEXT("spawn_with"), TEXT("mesh_query(\"place_blueprint_actor\", {blueprint: \"") + SavePath + TEXT("\", location: [x,y,z]})"));
 
 	return FMonolithActionResult::Success(Result);
 }
