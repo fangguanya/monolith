@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 14 MCP tools (544 total actions across 11 domains), cutting AI assistant context consumption by ~95%.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 14 MCP tools (635 total actions across 11 domains), cutting AI assistant context consumption by ~95%.
 
 ### What It Replaces
 
@@ -44,7 +44,7 @@ Monolith.uplugin
   MonolithIndex         — SQLite FTS5 deep project indexer, 14 internal indexers (7 MCP actions)
   MonolithSource        — Engine source + API lookup (11 actions)
   MonolithUI            — Widget blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility (42 actions)
-  MonolithMesh          — Mesh inspection, scene manipulation, spatial queries, level blockout, GeometryScript ops, horror/accessibility, lighting, audio/acoustics, performance, decals (101 actions)
+  MonolithMesh          — Mesh inspection, scene manipulation, spatial queries, level blockout, GeometryScript ops, horror/accessibility, lighting, audio/acoustics, performance, decals, level design, tech art, context props, procedural geometry (sweep walls, auto-collision, proc mesh caching, blueprint prefabs), genre presets, encounter design, hospice reports (192 actions)
 ```
 
 ### Discovery/Dispatch Pattern
@@ -825,11 +825,14 @@ All marked with "UE 5.7 FIX" comments:
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithMeshModule` | Registers 101 mesh actions across 10 action classes (+ GeometryScript ops conditional) |
+| `FMonolithMeshModule` | Registers 192 mesh actions across 22 action classes (+ GeometryScript ops conditional) |
 | `FMonolithMeshInspectionActions` | Mesh asset inspection: geometry stats, LODs, UVs, materials, collision, quality analysis, catalog (12 actions) |
 | `FMonolithMeshSceneActions` | Scene actor manipulation: spawn, move, duplicate, delete, group, batch execute (8 actions) |
 | `FMonolithMeshSpatialActions` | Spatial queries: raycasts, sweeps, overlaps, nearest, line of sight, navmesh, scene bounds/stats (11 actions) |
 | `FMonolithMeshBlockoutActions` | Level blockout: volumes, primitives, grids, asset matching, replacement, layout import/export, prop scatter (15 actions) |
+| `FMonolithMeshProceduralActions` | Procedural geometry: parametric furniture, structures, mazes, pipes, terrain, horror props, sweep-based walls, auto-collision, human-scale defaults, door/window trim frames (8 actions) |
+| `FMonolithMeshCacheActions` | Procedural mesh caching: hash-based manifest, list/clear/validate/stats (4 actions) |
+| `FMonolithMeshPrefabActions` | Blueprint prefabs: dialog-free HarvestBlueprintFromActors (1 action) |
 | `FMonolithMeshCatalog` | Mesh catalog database for search_meshes_by_size and get_mesh_catalog_stats |
 | `FMonolithMeshUtils` | Shared helpers for mesh loading, bounds calculation, actor queries |
 
@@ -896,6 +899,21 @@ All marked with "UE 5.7 FIX" comments:
 | `import_blockout_layout` | `file_path` | Import a blockout layout from JSON |
 | `scan_volume` | `volume_name` | Scan a volume and report contents |
 | `scatter_props` | `volume_name`, `asset_paths`, `density`, `seed` | Scatter props randomly within a volume |
+
+**Procedural Mesh Caching (4)** — Hash-based manifest at `Saved/Monolith/ProceduralCache/manifest.json`
+| Action | Params | Description |
+|--------|--------|-------------|
+| `list_cached_meshes` | `type_filter`?, `limit`? (default 100) | List cached procedural mesh entries with asset_path, action, type, dimensions, triangle_count, created_utc |
+| `clear_cache` | `type_filter`? | Clear cached meshes — all or filtered by type. Returns cleared_count |
+| `validate_cache` | none | Remove stale cache entries where the asset no longer exists on disk. Returns removed_count |
+| `get_cache_stats` | none | Cache statistics: total_entries and per-type breakdown |
+
+**Blueprint Prefabs (1)** — Dialog-free blueprint creation from placed actors
+| Action | Params | Description |
+|--------|--------|-------------|
+| `create_blueprint_prefab` | `*actor_names`, `*save_path`, `center_pivot`? (default true), `keep_source_actors`? (default true) | Create a Blueprint from selected actors via HarvestBlueprintFromActors. Returns blueprint_path, asset_name, source_actor_count, component_count |
+
+> **Procedural Geometry Overhaul (2026-03-28):** The proc gen actions (`create_parametric_mesh`, `create_structure`, `create_horror_prop`, etc.) now feature sweep-based thin walls (`wall_mode: "sweep"` default), auto snap-to-floor (`snap_to_floor` param), auto-collision on all saved meshes (`collision: auto/box/convex/complex_as_simple/none`), human-scale defaults (stairs 90/28/18cm, doors 90cm, floor 3cm), door/window/vent trim frames (`add_trim` param), and vent openings via `create_structure`. Collision-aware prop placement uses `collision_mode: none/warn/reject/adjust` on scatter actions with SweepSingle box traces for floor finding. All proc gen actions support `use_cache` and `auto_save` params for the caching system.
 
 ---
 
@@ -1187,15 +1205,16 @@ See `TODO.md` for the full list. Key architectural constraints:
 | Module | Namespace | Actions |
 |--------|-----------|---------|
 | MonolithCore | monolith | 4 |
-| MonolithBlueprint | blueprint | 66 |
+| MonolithBlueprint | blueprint | 86 |
 | MonolithMaterial | material | 57 |
-| MonolithAnimation | animation | 74 |
-| MonolithNiagara | niagara | 65 |
+| MonolithAnimation | animation | 115 |
+| MonolithNiagara | niagara | 96 |
+| MonolithMesh | mesh | 192 |
 | MonolithEditor | editor | 19 |
 | MonolithConfig | config | 6 |
-| MonolithIndex | project | 5 |
+| MonolithIndex | project | 7 |
 | MonolithSource | source | 11 |
 | MonolithUI | ui | 42 |
-| **Total** | | **349** |
+| **Total** | | **635** |
 
-**Note:** PoseSearch's 5 actions are included in Animation's 74 — they are not additive. The original Python server had higher counts (~231 tools) due to fragmented action design.
+**Note:** MonolithMesh includes all 22 expansion phases (192 actions). The original Python server had higher tool counts (~231 tools) due to fragmented action design — Monolith consolidates these into 14 MCP tools with namespaced actions.

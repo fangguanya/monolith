@@ -1,17 +1,18 @@
 # Monolith — TODO
 
-Last updated: 2026-03-27
+Last updated: 2026-03-28
 
 ---
 
-### MonolithMesh Module — 187 Actions, ALL 22 PHASES COMPLETE (2026-03-28)
+### MonolithMesh Module — 192 Actions, ALL 22 PHASES COMPLETE + Proc Geo Overhaul (2026-03-28)
 
 - [x] Phase 0-12 — Original 111 actions compiled and tested.
 - [x] Phase 13-22 — Expansion 76 actions compiled (lights, volumes, horror intel, tech art, sublevels, context props, proc geo, presets, encounters, polish).
+- [x] Proc Geo Overhaul — 5 new actions (list_cached_meshes, clear_cache, validate_cache, get_cache_stats, create_blueprint_prefab). Sweep-based thin walls, auto-collision, collision-aware prop placement, proc mesh caching, blueprint prefabs, door trim frames, floor-aware spawning, human-scale defaults. 187 → 192 actions.
 
 #### MonolithMesh — Release / Wiki TODO
 
-- [ ] **Wiki major update** — All 187 mesh actions need wiki documentation. Current wiki covers original modules only.
+- [ ] **Wiki major update** — All 192 mesh actions need wiki documentation. Current wiki covers original modules only.
 - [ ] **Genre Preset Authoring Guide** — Dedicated wiki page (or `PRESET_AUTHORING.md`) explaining how LLMs/users create presets for OTHER genres (fantasy, sci-fi, detective, cozy). Include:
   - Room template JSON format with examples
   - Storytelling pattern format (element types, radial distribution)
@@ -21,7 +22,7 @@ Last updated: 2026-03-27
   - Step-by-step: "How to create a Fantasy Dungeon preset pack"
   - How to test presets via MCP before distributing
   - How to export/import/share preset packs
-- [ ] **SPEC.md MonolithMesh section** — Full 187-action reference with param schemas (currently only has Phase 1-4 section)
+- [ ] **SPEC.md MonolithMesh section** — Full 192-action reference with param schemas (currently only has Phase 1-4 section + proc geo overhaul additions)
 - [ ] **MCP.md mesh_query docs** — Tool reference for mesh_query namespace
 - [ ] **README update** — Feature highlight for MonolithMesh in the plugin README
 
@@ -46,17 +47,22 @@ Last updated: 2026-03-27
 - [ ] **Themed prop kits** — JSON definitions like room templates but for prop sets: "office_desk_clutter" (papers, pens, mug, monitor, keyboard), "hospital_tray" (syringe, bandages, clipboard). Each kit defines items with relative positions to an anchor point. `place_prop_kit` action.
 - [ ] **Wall/ceiling scatter** — Extend `scatter_props` with `surface` param: "floor" (current), "wall" (horizontal trace outward, align to wall normal), "ceiling" (upward trace), "shelf" (trace to named actor's top surface). Paintings, clocks, chains, cables.
 
-#### MonolithMesh — Procedural Geometry (Future)
+#### MonolithMesh — Procedural Geometry (Overhaul COMPLETE 2026-03-28)
 
-See `Docs/plans/2026-03-28-procedural-geometry-wishlist.md` for full details:
-- [ ] `create_parametric_mesh` — chair, table, shelf, door_frame, stairs, etc. (~15 types)
-- [ ] `create_structure` — room, corridor, L-corridor, T-junction, stairwell
-- [ ] `create_building_shell` — multi-story from 2D footprint polygon
-- [ ] `create_maze` — recursive backtracker, Prim's, Eller's, binary tree
-- [ ] `create_pipe_network` — sweep circle along path with elbow joints
-- [ ] `create_fragments` — Voronoi fracture for destruction
-- [ ] `create_terrain_patch` — Perlin/simplex noise heightmap
-- [ ] `create_horror_prop` — barricade, debris pile, cage, coffin, broken wall
+See `Docs/plans/2026-03-28-procedural-geometry-wishlist.md` for original wishlist.
+- [x] `create_parametric_mesh` — chair, table, shelf, door_frame, stairs, etc. (~15 types). Human-scale defaults (stairs 90/28/18cm, doors 90cm, floor 3cm)
+- [x] `create_structure` — room, corridor, L-corridor, T-junction, stairwell, vent. Sweep-based thin walls, door/window/vent trim frames
+- [x] `create_building_shell` — multi-story from 2D footprint polygon
+- [x] `create_maze` — recursive backtracker, Prim's, Eller's, binary tree
+- [x] `create_pipe_network` — sweep circle along path with elbow joints
+- [x] `create_fragments` — Voronoi fracture for destruction
+- [x] `create_terrain_patch` — Perlin/simplex noise heightmap
+- [x] `create_horror_prop` — barricade, debris pile, cage, coffin, broken wall
+- [x] Proc mesh caching system — hash-based manifest, `use_cache`/`auto_save` on all proc gen actions, 4 cache management actions (list_cached_meshes, clear_cache, validate_cache, get_cache_stats)
+- [x] `create_blueprint_prefab` — dialog-free Blueprint creation from placed actors (replaces create_prefab for MCP workflows)
+- [x] Auto-collision on all saved meshes (collision param: auto/box/convex/complex_as_simple/none)
+- [x] Collision-aware prop placement (collision_mode: none/warn/reject/adjust on scatter actions)
+- [x] Floor-aware spawning (snap_to_floor param, SweepSingle box traces)
 
 #### MonolithMesh — Unified Wishlist from 3 Perspectives (Level Design + Horror + Tech Art)
 
@@ -109,7 +115,7 @@ Tech Art:
 - [ ] `place_spline` — mesh/cable splines for pipes, cables, railings
 - [ ] `get_level_actors` — filtered enumeration (class, tag, sublevel, mesh wildcard)
 - [ ] `measure_distance` — quick measurement between actors or points
-- [ ] `create_prefab` / `spawn_prefab` — reusable actor groups (Level Instance backed)
+- [x] `create_blueprint_prefab` — replaces `create_prefab` for MCP workflows (dialog-free via HarvestBlueprintFromActors). DONE 2026-03-28
 - [ ] `generate_scare_sequence` — procedural scare events with variety + escalation
 - [ ] `analyze_framing` — camera composition scoring (leading lines, focal points)
 - [ ] `evaluate_monster_reveal` — score reveal quality: silhouette, backlight, distance, partial visibility
