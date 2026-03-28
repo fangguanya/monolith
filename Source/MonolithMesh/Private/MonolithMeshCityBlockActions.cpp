@@ -1339,7 +1339,8 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 			BuildingGridParams->SetArrayField(TEXT("location"), BuildingLoc);
 			BuildingGridParams->SetStringField(TEXT("folder"), Folder + TEXT("/Buildings"));
 			BuildingGridParams->SetBoolField(TEXT("overwrite"), true);
-			BuildingGridParams->SetBoolField(TEXT("omit_exterior_walls"), true); // Facade replaces exterior walls
+			// NOTE: omit_exterior_walls disabled until facade alignment is fixed
+			// BuildingGridParams->SetBoolField(TEXT("omit_exterior_walls"), true);
 		}
 		else
 		{
@@ -1430,7 +1431,8 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 			BuildingGridParams->SetArrayField(TEXT("location"), BuildingLoc);
 			BuildingGridParams->SetStringField(TEXT("folder"), Folder + TEXT("/Buildings"));
 			BuildingGridParams->SetBoolField(TEXT("overwrite"), true);
-			BuildingGridParams->SetBoolField(TEXT("omit_exterior_walls"), true); // Facade replaces exterior walls
+			// NOTE: omit_exterior_walls disabled until facade alignment is fixed
+			// BuildingGridParams->SetBoolField(TEXT("omit_exterior_walls"), true);
 		}
 
 		// Execute SP1: create_building_from_grid
@@ -1452,7 +1454,10 @@ FMonolithActionResult FMonolithMeshCityBlockActions::CreateCityBlock(const TShar
 		UE_LOG(LogMonolithCityBlock, Log, TEXT("    Building %d geometry: OK"), i);
 
 		// Step 4: Generate facade via SP3 (if not skipped)
-		if (!bSkipFacades)
+		// TODO: Facade alignment needs rework — facade mesh is a separate actor whose wall geometry
+		// doesn't align with the building mesh. Needs either: (a) facade operates on building mesh directly,
+		// or (b) facade shares exact transform with building. Disabled until fixed.
+		if (false && !bSkipFacades)
 		{
 			auto FacadeParams = MakeShared<FJsonObject>();
 
