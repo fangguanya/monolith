@@ -1018,8 +1018,9 @@ FMonolithActionResult FMonolithGASScaffoldActions::HandleScaffoldDamagePipeline(
 		FString GEName = FString::Printf(TEXT("GE_Damage_%s"), *DmgType);
 		FString GEPath = SavePath / GEName;
 
-		// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
-		if (StaticFindObject(UObject::StaticClass(), nullptr, *GEPath))
+		// Check for existing asset (AssetRegistry + in-memory multi-tier check)
+		FString ExistError;
+		if (!MonolithGAS::EnsureAssetPathFree(GEPath, GEName, ExistError))
 		{
 			TSharedPtr<FJsonObject> Info = MakeShared<FJsonObject>();
 			Info->SetStringField(TEXT("asset_path"), GEPath);
@@ -1181,11 +1182,11 @@ FMonolithActionResult FMonolithGASScaffoldActions::HandleScaffoldStatusEffect(co
 	}
 	FString AssetName = SavePath.Mid(LastSlash + 1);
 
-	// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
-	if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
+	// Check for existing asset (AssetRegistry + in-memory multi-tier check)
+	FString ExistError;
+	if (!MonolithGAS::EnsureAssetPathFree(SavePath, AssetName, ExistError))
 	{
-		return FMonolithActionResult::Error(
-			FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
+		return FMonolithActionResult::Error(ExistError);
 	}
 
 	UPackage* Package = CreatePackage(*SavePath);
@@ -1404,11 +1405,11 @@ FMonolithActionResult FMonolithGASScaffoldActions::HandleScaffoldWeaponAbility(c
 	}
 	FString AssetName = SavePath.Mid(LastSlash + 1);
 
-	// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
-	if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
+	// Check for existing asset (AssetRegistry + in-memory multi-tier check)
+	FString ExistError;
+	if (!MonolithGAS::EnsureAssetPathFree(SavePath, AssetName, ExistError))
 	{
-		return FMonolithActionResult::Error(
-			FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
+		return FMonolithActionResult::Error(ExistError);
 	}
 
 	UPackage* Package = CreatePackage(*SavePath);
