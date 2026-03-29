@@ -590,13 +590,6 @@ FMonolithActionResult FMonolithGASAbilityActions::HandleCreateAbility(const TSha
 			FString::Printf(TEXT("Parent class '%s' is not a GameplayAbility subclass"), *ParentClassName));
 	}
 
-	// Check if asset already exists (in-memory check — faster and safer than StaticLoadObject)
-	if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
-	{
-		return FMonolithActionResult::Error(
-			FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
-	}
-
 	// Extract asset name from the save path
 	FString AssetName = FPackageName::GetLongPackageAssetName(SavePath);
 	if (AssetName.IsEmpty())
@@ -611,6 +604,13 @@ FMonolithActionResult FMonolithGASAbilityActions::HandleCreateAbility(const TSha
 		{
 			AssetName = SavePath;
 		}
+	}
+
+	// Check if asset already exists (AssetRegistry + in-memory multi-tier check)
+	FString ExistError;
+	if (!MonolithGAS::EnsureAssetPathFree(SavePath, AssetName, ExistError))
+	{
+		return FMonolithActionResult::Error(ExistError);
 	}
 
 	// Create package

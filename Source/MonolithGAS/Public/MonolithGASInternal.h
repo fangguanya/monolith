@@ -65,6 +65,17 @@ namespace MonolithGAS
 	bool RequireStringParam(const TSharedPtr<FJsonObject>& Params, const FString& ParamName, FString& OutValue, FMonolithActionResult& OutError);
 
 	// ---------------------------------------------------------------------------
+	// Asset Existence Guard (robust pre-check for create actions)
+	// ---------------------------------------------------------------------------
+
+	/**
+	 * Check that no asset exists at the given path (on disk or in memory).
+	 * Uses AssetRegistry (disk check) + FindObject (memory check).
+	 * Returns true if path is free. Sets OutError if blocked.
+	 */
+	bool EnsureAssetPathFree(const FString& PackagePath, const FString& AssetName, FString& OutError);
+
+	// ---------------------------------------------------------------------------
 	// PIE Runtime Helpers (A2)
 	// ---------------------------------------------------------------------------
 

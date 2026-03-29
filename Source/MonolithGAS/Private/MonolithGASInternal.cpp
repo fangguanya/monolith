@@ -184,6 +184,41 @@ bool RequireStringParam(const TSharedPtr<FJsonObject>& Params, const FString& Pa
 }
 
 // ---------------------------------------------------------------------------
+// Asset Existence Guard
+// ---------------------------------------------------------------------------
+
+bool EnsureAssetPathFree(const FString& PackagePath, const FString& AssetName, FString& OutError)
+{
+	FString FullObjectPath = PackagePath + TEXT(".") + AssetName;
+
+	// Tier 1: Asset Registry (catches on-disk assets without loading them)
+	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	FAssetData ExistingAsset = AR.GetAssetByObjectPath(FSoftObjectPath(FullObjectPath));
+	if (ExistingAsset.IsValid())
+	{
+		OutError = FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *PackagePath);
+		return false;
+	}
+
+	// Tier 2: FindObject global (catches in-memory assets not yet in AR)
+	if (FindObject<UObject>(nullptr, *FullObjectPath))
+	{
+		OutError = FString::Printf(TEXT("Asset already exists in memory at '%s'. Delete it first or use a different path."), *PackagePath);
+		return false;
+	}
+
+	// Tier 3: FindPackage + FindObject scoped (edge case: package loaded but object path didn't match)
+	UPackage* ExistingPkg = FindPackage(nullptr, *PackagePath);
+	if (ExistingPkg && FindObject<UObject>(ExistingPkg, *AssetName))
+	{
+		OutError = FString::Printf(TEXT("Asset already exists in package '%s'. Delete it first or use a different path."), *PackagePath);
+		return false;
+	}
+
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // PIE Runtime Helpers (A2)
 // ---------------------------------------------------------------------------
 

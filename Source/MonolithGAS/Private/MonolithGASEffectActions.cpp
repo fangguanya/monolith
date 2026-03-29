@@ -893,11 +893,11 @@ FMonolithActionResult FMonolithGASEffectActions::HandleCreateGameplayEffect(cons
 		return FMonolithActionResult::Error(TEXT("save_path must not end with '/'"));
 	}
 
-	// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
-	if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
+	// Check for existing asset (AssetRegistry + in-memory multi-tier check)
+	FString ExistError;
+	if (!MonolithGAS::EnsureAssetPathFree(SavePath, AssetName, ExistError))
 	{
-		return FMonolithActionResult::Error(
-			FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
+		return FMonolithActionResult::Error(ExistError);
 	}
 
 	// Create package
@@ -2104,11 +2104,11 @@ namespace
 			return nullptr;
 		}
 
-		// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
-		if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
+		// Check for existing asset (AssetRegistry + in-memory multi-tier check)
+		FString ExistError;
+		if (!MonolithGAS::EnsureAssetPathFree(SavePath, AssetName, ExistError))
 		{
-			OutError = FMonolithActionResult::Error(
-				FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
+			OutError = FMonolithActionResult::Error(ExistError);
 			return nullptr;
 		}
 
