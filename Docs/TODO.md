@@ -1,6 +1,27 @@
 # Monolith — TODO
 
-Last updated: 2026-03-28
+Last updated: 2026-03-29
+
+---
+
+### MonolithGAS Module — 130 Actions, Phases 1-4 COMPLETE (2026-03-29)
+
+- [x] Phase 1 — Abilities (28 actions): CRUD, grant, activate, cancel, spec handles, instancing, tags, costs, cooldowns.
+- [x] Phase 2 — Attributes (20) + Effects (26): Attribute sets, get/set values, derived attributes, init/clamping/replication. GE authoring, duration, modifiers, executions, stacking, period, conditional application.
+- [x] Phase 3 — ASC (14) + Tags (10) + Cues (10): ASC inspection/config, granted abilities, active effects, owned tags, replication mode. Tag hierarchy, matching, loose tags, containers, queries. Cue notify CRUD (static + actor), cue params, handler lookup.
+- [x] Phase 4 — Targets (5) + Input (5) + Inspect (6) + Scaffold (6): Target data handles, actor selection, confirmation. Enhanced Input binding, input tags. Runtime inspection (PIE-only). Common pattern scaffolding.
+- [x] Conditional compilation — `#if WITH_GBA` wraps entire module. Compiles clean with WITH_GBA=1 and WITH_GBA=0.
+- [x] Settings toggle — `bEnableGAS` in UMonolithSettings.
+
+#### MonolithGAS — Remaining Work (2026-03-29)
+
+- [ ] **Template gaps** — `init_player_stats` and `init_enemy_stats` scaffold templates not yet implemented. Should generate attribute sets + initialization GEs for common game archetypes.
+- [ ] **Helper deduplication** — Several helper functions are duplicated across action classes (tag container utilities, effect spec builders). Consolidate into shared `MonolithGASHelpers`.
+- [ ] **Type-safe reflection** — Attribute set property access uses string-based reflection. Investigate `FGameplayAttribute` direct property pointer for safer access.
+- [ ] **Discover enhancement** — `monolith_discover("gas")` should include GAS-specific workflow hints and category groupings in the response metadata.
+- [ ] **GAS deep indexer** — Add a `GASIndexer` to MonolithIndex for indexing GameplayAbility, GameplayEffect, and AttributeSet assets. Would enable `project_query("search")` to surface GAS assets with rich metadata.
+- [ ] **Skill file** — Create `unreal-gas` skill in `Skills/` for the `gas-expert` agent. Action table, workflow examples, GAS-specific rules.
+- [ ] **Functional testing** — Runtime actions (Inspect category) require PIE. Full MCP test pass pending editor validation.
 
 ---
 
@@ -458,3 +479,4 @@ Priority features identified for future waves:
 - [x] **Live AR callbacks** — IMPLEMENTED (2026-03-28). Batched Asset Registry delegates (OnAssetsAdded, OnAssetsRemoved, OnAssetRenamed, OnAssetsUpdatedOnDisk) drained on 2s timer with dedup and transactional apply.
 - [x] **Plugin content scope fix (bInstalled filter)** — FIXED (2026-03-28). Replaced `bInstalled` filter with explicit path enumeration. DrawCallReducer and NiagaraDestructionDriver now indexed. MeshCatalogIndexer paths corrected.
 - [x] **MCP reindex action (incremental default + force param)** — IMPLEMENTED (2026-03-28). `monolith_reindex()` defaults to incremental mode; `force=true` triggers full wipe-and-rebuild.
+- [x] **NEW: MonolithGAS module** — IMPLEMENTED (2026-03-29). New module at `Source/MonolithGAS/`. 130 actions in `gas` namespace (`gas_query` tool). 10 action categories: Abilities (28), Attributes (20), Effects (26), ASC (14), Tags (10), Cues (10), Targets (5), Input (5), Inspect (6), Scaffold (6). Conditional on `#if WITH_GBA` — compiles clean with and without GameplayAbilities. Settings toggle: `bEnableGAS`. Total plugin: 684 → 814 actions, 11 → 12 domains, 14 → 15 MCP tools.

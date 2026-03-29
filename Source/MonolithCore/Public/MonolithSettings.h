@@ -85,6 +85,10 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
 	bool bIndexDataAssets = true;
 
+	/** Enable Gameplay Ability System indexing (abilities, effects, attribute sets, cues) */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
+	bool bIndexGAS = true;
+
 	/** Enable dependency graph indexing */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Post-Pass Indexers")
 	bool bIndexDependencies = true;
@@ -159,6 +163,11 @@ public:
 		meta=(DisplayName="Enable Blueprint Assist Integration",
 			  ToolTip="When enabled and Blueprint Assist is installed, provides enhanced graph formatting via the IMonolithGraphFormatter bridge."))
 	bool bEnableBlueprintAssist = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable GAS Integration",
+			  ToolTip="When enabled, registers gas_query actions for Gameplay Ability System manipulation. Requires GameplayAbilities plugin (engine-bundled)."))
+	bool bEnableGAS = true;
 
 	// --- Modules|Mesh ---
 

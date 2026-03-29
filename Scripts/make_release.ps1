@@ -34,17 +34,19 @@ foreach ($file in $trackedFiles) {
 }
 Pop-Location
 
-# IMPORTANT: Before running this script, ensure MonolithBABridge was built with
-# WITH_BLUEPRINT_ASSIST=0. If your dev machine has Blueprint Assist installed,
-# the bridge DLL is linked against BA symbols and will CRASH for users without BA.
+# IMPORTANT: Before running this script, ensure optional modules were built WITHOUT
+# their optional dependencies. If your dev machine has Blueprint Assist or GBA installed,
+# the bridge DLLs are linked against those symbols and will CRASH for users without them.
 #
-# To build a clean release DLL:
+# To build clean release DLLs:
 #   1. In MonolithBABridge.Build.cs, temporarily force bHasBlueprintAssist = false
-#   2. Run a full UBT build (editor must be closed)
-#   3. Run this script
-#   4. Revert Build.cs and rebuild for your dev environment
+#   2. In MonolithGAS.Build.cs, temporarily force bHasGBA = false
+#      (or use the .Build.cs.release files: copy MonolithGAS.Build.cs.release -> MonolithGAS.Build.cs)
+#   3. Run a full UBT build (editor must be closed)
+#   4. Run this script
+#   5. Revert Build.cs files and rebuild for your dev environment
 #
-# Source users (GitHub clones) are unaffected — Build.cs auto-detects BA at compile time.
+# Source users (GitHub clones) are unaffected — Build.cs auto-detects at compile time.
 
 # Copy Binaries (gitignored but needed for Blueprint-only users)
 # Exclude .pdb (debug symbols) and .patch_* (Live Coding artifacts)
