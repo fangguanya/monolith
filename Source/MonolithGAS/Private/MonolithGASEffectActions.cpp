@@ -113,6 +113,21 @@ FGameplayAttribute ParseAttribute(const FString& AttrString, FString& OutError)
 	{
 		AttrClass = FindFirstObject<UClass>(*(TEXT("U") + ClassName), EFindFirstObjectOptions::NativeFirst);
 	}
+	// Attempt 3: Blueprint generated class (_C suffix)
+	if (!AttrClass)
+	{
+		AttrClass = FindFirstObject<UClass>(*(ClassName + TEXT("_C")), EFindFirstObjectOptions::NativeFirst);
+	}
+	// Attempt 4: Full asset path load (e.g. /Game/GAS/AS_Vitals.AS_Vitals_C)
+	if (!AttrClass && ClassName.Contains(TEXT("/")))
+	{
+		FString ClassPath = ClassName;
+		if (!ClassPath.EndsWith(TEXT("_C")))
+		{
+			ClassPath += TEXT("_C");
+		}
+		AttrClass = StaticLoadClass(UAttributeSet::StaticClass(), nullptr, *ClassPath);
+	}
 	if (!AttrClass)
 	{
 		OutError = FString::Printf(TEXT("Attribute class not found: %s"), *ClassName);

@@ -1068,7 +1068,7 @@ FMonolithActionResult FMonolithGASAbilityActions::HandleSetAbilityPolicy(const T
 			return FMonolithActionResult::Error(
 				FString::Printf(TEXT("Invalid instancing_policy: '%s'. Valid: NonInstanced, InstancedPerActor, InstancedPerExecution"), *Val));
 		}
-		SetPropertyByName(Ctx.CDO, FName(TEXT("InstancingPolicy")), Policy);
+		SetPropertyByName<uint8>(Ctx.CDO, FName(TEXT("InstancingPolicy")), static_cast<uint8>(Policy));
 		bChanged = true;
 	}
 
@@ -1082,7 +1082,7 @@ FMonolithActionResult FMonolithGASAbilityActions::HandleSetAbilityPolicy(const T
 			return FMonolithActionResult::Error(
 				FString::Printf(TEXT("Invalid net_execution_policy: '%s'. Valid: LocalPredicted, LocalOnly, ServerInitiated, ServerOnly"), *Val));
 		}
-		SetPropertyByName(Ctx.CDO, FName(TEXT("NetExecutionPolicy")), Policy);
+		SetPropertyByName<uint8>(Ctx.CDO, FName(TEXT("NetExecutionPolicy")), static_cast<uint8>(Policy));
 		bChanged = true;
 	}
 
@@ -1096,7 +1096,7 @@ FMonolithActionResult FMonolithGASAbilityActions::HandleSetAbilityPolicy(const T
 			return FMonolithActionResult::Error(
 				FString::Printf(TEXT("Invalid net_security_policy: '%s'. Valid: ClientOrServer, ServerOnlyExecution, ServerOnlyTermination, ServerOnly"), *Val));
 		}
-		SetPropertyByName(Ctx.CDO, FName(TEXT("NetSecurityPolicy")), Policy);
+		SetPropertyByName<uint8>(Ctx.CDO, FName(TEXT("NetSecurityPolicy")), static_cast<uint8>(Policy));
 		bChanged = true;
 	}
 

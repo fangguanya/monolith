@@ -632,6 +632,38 @@ FMonolithActionResult FMonolithGASAttributeActions::HandleCreateAttributeSet(con
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 		FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::SkipGarbageCollection);
 
+		// Apply default values from the input JSON to the compiled CDO
+		if (Blueprint->GeneratedClass)
+		{
+			UObject* CDO = Blueprint->GeneratedClass->GetDefaultObject(true);
+			if (CDO)
+			{
+				for (const auto& AttrVal : Attributes)
+				{
+					const TSharedPtr<FJsonObject>* AttrObjPtr;
+					if (!AttrVal->TryGetObject(AttrObjPtr) || !(*AttrObjPtr).IsValid()) continue;
+					const TSharedPtr<FJsonObject>& AttrObj = *AttrObjPtr;
+
+					FString AttrName = AttrObj->GetStringField(TEXT("name"));
+					double DefaultValue = 0;
+					if (AttrObj->TryGetNumberField(TEXT("default_value"), DefaultValue) && DefaultValue != 0)
+					{
+						FProperty* Prop = Blueprint->GeneratedClass->FindPropertyByName(FName(*AttrName));
+						if (Prop)
+						{
+							void* DataPtr = Prop->ContainerPtrToValuePtr<void>(CDO);
+							if (DataPtr)
+							{
+								FGameplayAttributeData* AttrData = static_cast<FGameplayAttributeData*>(DataPtr);
+								AttrData->SetBaseValue(static_cast<float>(DefaultValue));
+								AttrData->SetCurrentValue(static_cast<float>(DefaultValue));
+							}
+						}
+					}
+				}
+			}
+		}
+
 		// Save the package
 		FString PackageFilename = FPackageName::LongPackageNameToFilename(
 			Package->GetName(), FPackageName::GetAssetPackageExtension());
@@ -1238,6 +1270,15 @@ FMonolithActionResult FMonolithGASAttributeActions::HandleListAttributeSets(cons
 		{
 			continue;
 		}
+
+		// Skip compilation artifacts (transient reinstancing/skeleton classes)
+		FString ClassName = Class->GetName();
+		if (ClassName.StartsWith(TEXT("SKEL_")) || ClassName.StartsWith(TEXT("REINST_")))
+			continue;
+		if (Class->GetOutermost()->GetName() == TEXT("/Engine/Transient"))
+			continue;
+		if (Class->HasAnyClassFlags(CLASS_NewerVersionExists))
+			continue;
 
 		// Skip engine/plugin classes if not requested
 		if (!bIncludePlugins)
