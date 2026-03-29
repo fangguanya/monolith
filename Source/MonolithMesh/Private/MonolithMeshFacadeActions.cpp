@@ -437,7 +437,11 @@ void FMonolithMeshFacadeActions::CutOpeningsSelectionInset(UDynamicMesh* Mesh,
 	{
 		VerticalCuts.AddUnique(CenterX - Width * 0.5f);
 		VerticalCuts.AddUnique(CenterX + Width * 0.5f);
-		HorizontalCuts.AddUnique(BottomZ);
+		// Don't slice at exact wall base (Z=0) — produces degenerate zero-height triangles
+		if (BottomZ > KINDA_SMALL_NUMBER)
+		{
+			HorizontalCuts.AddUnique(BottomZ);
+		}
 		HorizontalCuts.AddUnique(BottomZ + Height);
 	};
 
@@ -525,6 +529,16 @@ void FMonolithMeshFacadeActions::CutOpeningsSelectionInset(UDynamicMesh* Mesh,
 		UGeometryScriptLibrary_MeshSelectionFunctions::CombineMeshSelections(
 			BoxSel, NormSel, FrontSel,
 			EGeometryScriptCombineSelectionMode::Intersection);
+
+		// CRITICAL: Guard against empty selection — InsetOutsetFaces with empty selection
+		// insets ALL mesh triangles, which crashes GeometryCore with array index out of bounds.
+		// Empty selection can happen when plane slicing at wall boundaries produces degenerate
+		// triangles with unpredictable normals, or floating-point precision misses vertices.
+		if (FrontSel.GetNumSelected() == 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CutOpeningsSelectionInset: Empty selection for opening — skipping (likely degenerate geometry from plane slice)"));
+			return;
+		}
 
 		// Inset to create frame border geometry
 		FGeometryScriptMeshInsetOutsetFacesOptions InsetOpts;
