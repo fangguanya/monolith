@@ -23,7 +23,9 @@ TSharedPtr<FJsonObject> UMonolithMeshHandlePool::ListHandles() const { return Ma
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "UObject/Package.h"
 #include "UObject/SavePackage.h"
+#include "UObject/Linker.h"
 #include "Misc/PackageName.h"
+#include "PackageTools.h"
 
 #include "GeometryScript/MeshPrimitiveFunctions.h"
 #include "GeometryScript/CollisionFunctions.h"
@@ -185,14 +187,45 @@ bool UMonolithMeshHandlePool::SaveHandle(const FString& HandleName, const FStrin
 	FDynamicMeshToMeshDescription Converter;
 	Converter.Convert(&DynMesh->GetMeshRef(), MeshDesc);
 
-	// Create package and StaticMesh
+	// ---- Handle existing in-memory packages ----
+	// CreatePackage returns an existing in-memory package if one exists at the same path.
+	// That package may be partially loaded (e.g., from asset registry scan or a prior failed save),
+	// which causes "cannot be saved as it has only been partially loaded" errors.
+	// We must fully unload any existing package before creating a fresh one.
 	FString PackageFileName = FPackageName::LongPackageNameToFilename(PackagePath, FPackageName::GetAssetPackageExtension());
+
+	UPackage* ExistingPackage = FindPackage(nullptr, *PackagePath);
+	if (ExistingPackage)
+	{
+		// Fully unload the existing package so CreatePackage returns a clean one
+		TArray<UPackage*> PackagesToUnload;
+		PackagesToUnload.Add(ExistingPackage);
+		UPackageTools::UnloadPackages(PackagesToUnload);
+
+		// Reset the loader so the package is truly detached from disk state
+		ResetLoaders(ExistingPackage);
+
+		// After unload, FindPackage may still return the old object if GC hasn't run.
+		// Rename it out of the way so CreatePackage makes a fresh one.
+		ExistingPackage = FindPackage(nullptr, *PackagePath);
+		if (ExistingPackage)
+		{
+			FString TrashedName = FString::Printf(TEXT("/Temp/__monolith_evicted_%s_%s"),
+				*AssetName, *FGuid::NewGuid().ToString(EGuidFormats::Short));
+			ExistingPackage->Rename(*TrashedName, nullptr, REN_DontCreateRedirectors | REN_NonTransactional | REN_ForceNoResetLoaders);
+		}
+	}
+
 	UPackage* Package = CreatePackage(*PackagePath);
 	if (!Package)
 	{
 		OutError = FString::Printf(TEXT("Failed to create package at '%s'"), *PackagePath);
 		return false;
 	}
+
+	// Ensure the package is fully loaded and clean for saving
+	Package->FullyLoad();
+	Package->SetPackageFlags(PKG_NewlyCreated);
 
 	UStaticMesh* StaticMesh = NewObject<UStaticMesh>(Package, *AssetName, RF_Public | RF_Standalone);
 	if (!StaticMesh)
