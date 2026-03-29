@@ -893,13 +893,11 @@ FMonolithActionResult FMonolithGASEffectActions::HandleCreateGameplayEffect(cons
 		return FMonolithActionResult::Error(TEXT("save_path must not end with '/'"));
 	}
 
-	// Check for existing
-	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
-	FAssetData ExistingAsset = AR.GetAssetByObjectPath(FSoftObjectPath(SavePath + TEXT(".") + AssetName));
-	if (ExistingAsset.IsValid())
+	// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
+	if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
 	{
 		return FMonolithActionResult::Error(
-			FString::Printf(TEXT("Asset already exists at '%s'"), *SavePath));
+			FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
 	}
 
 	// Create package
@@ -2103,6 +2101,14 @@ namespace
 		if (AssetName.IsEmpty())
 		{
 			OutError = FMonolithActionResult::Error(TEXT("save_path must not end with '/'"));
+			return nullptr;
+		}
+
+		// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
+		if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
+		{
+			OutError = FMonolithActionResult::Error(
+				FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
 			return nullptr;
 		}
 

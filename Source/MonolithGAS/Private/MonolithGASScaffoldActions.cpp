@@ -1009,8 +1009,6 @@ FMonolithActionResult FMonolithGASScaffoldActions::HandleScaffoldDamagePipeline(
 	TArray<TSharedPtr<FJsonValue>> AssetErrors;
 	int32 SuccessCount = 0;
 
-	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
-
 	// Check for the SetByCaller.Damage.Base tag
 	FString SBCTagStr = TEXT("SetByCaller.Damage.Base");
 	FGameplayTag SBCTag = FGameplayTag::RequestGameplayTag(FName(*SBCTagStr), false);
@@ -1020,9 +1018,8 @@ FMonolithActionResult FMonolithGASScaffoldActions::HandleScaffoldDamagePipeline(
 		FString GEName = FString::Printf(TEXT("GE_Damage_%s"), *DmgType);
 		FString GEPath = SavePath / GEName;
 
-		// Check for existing
-		FAssetData ExistingAsset = AR.GetAssetByObjectPath(FSoftObjectPath(GEPath + TEXT(".") + GEName));
-		if (ExistingAsset.IsValid())
+		// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
+		if (StaticFindObject(UObject::StaticClass(), nullptr, *GEPath))
 		{
 			TSharedPtr<FJsonObject> Info = MakeShared<FJsonObject>();
 			Info->SetStringField(TEXT("asset_path"), GEPath);
@@ -1184,12 +1181,11 @@ FMonolithActionResult FMonolithGASScaffoldActions::HandleScaffoldStatusEffect(co
 	}
 	FString AssetName = SavePath.Mid(LastSlash + 1);
 
-	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
-	FAssetData ExistingAsset = AR.GetAssetByObjectPath(FSoftObjectPath(SavePath + TEXT(".") + AssetName));
-	if (ExistingAsset.IsValid())
+	// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
+	if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
 	{
 		return FMonolithActionResult::Error(
-			FString::Printf(TEXT("Asset already exists at '%s'"), *SavePath));
+			FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
 	}
 
 	UPackage* Package = CreatePackage(*SavePath);
@@ -1408,12 +1404,11 @@ FMonolithActionResult FMonolithGASScaffoldActions::HandleScaffoldWeaponAbility(c
 	}
 	FString AssetName = SavePath.Mid(LastSlash + 1);
 
-	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
-	FAssetData ExistingAsset = AR.GetAssetByObjectPath(FSoftObjectPath(SavePath + TEXT(".") + AssetName));
-	if (ExistingAsset.IsValid())
+	// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
+	if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
 	{
 		return FMonolithActionResult::Error(
-			FString::Printf(TEXT("Asset already exists at '%s'"), *SavePath));
+			FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
 	}
 
 	UPackage* Package = CreatePackage(*SavePath);

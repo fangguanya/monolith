@@ -590,9 +590,8 @@ FMonolithActionResult FMonolithGASAbilityActions::HandleCreateAbility(const TSha
 			FString::Printf(TEXT("Parent class '%s' is not a GameplayAbility subclass"), *ParentClassName));
 	}
 
-	// Check if asset already exists
-	UObject* ExistingBP = StaticLoadObject(UBlueprint::StaticClass(), nullptr, *SavePath);
-	if (ExistingBP)
+	// Check if asset already exists (in-memory check — faster and safer than StaticLoadObject)
+	if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
 	{
 		return FMonolithActionResult::Error(
 			FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));

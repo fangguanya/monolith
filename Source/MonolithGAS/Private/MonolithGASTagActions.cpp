@@ -282,6 +282,13 @@ FMonolithActionResult FMonolithGASTagActions::HandleAddGameplayTags(const TShare
 				AssetName = PackagePath;
 			}
 
+			// Check for existing asset (in-memory check — prevents duplicate object creation)
+			if (StaticFindObject(UObject::StaticClass(), nullptr, *TablePath))
+			{
+				return FMonolithActionResult::Error(
+					FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *TablePath));
+			}
+
 			UPackage* Package = MonolithGAS::GetOrCreatePackage(TablePath, Error);
 			if (!Package)
 			{

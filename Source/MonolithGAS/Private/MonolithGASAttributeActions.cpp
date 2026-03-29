@@ -524,6 +524,13 @@ FMonolithActionResult FMonolithGASAttributeActions::HandleCreateAttributeSet(con
 			PackagePath = TEXT("/Game");
 		}
 
+		// Check for existing asset (in-memory check — prevents CreateBlueprint assertion)
+		if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
+		{
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
+		}
+
 		FString Error;
 		UPackage* Package = MonolithGAS::GetOrCreatePackage(SavePath, Error);
 		if (!Package)
@@ -2132,6 +2139,13 @@ FMonolithActionResult FMonolithGASAttributeActions::HandleCreateAttributeInitDat
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Invalid save_path: %s"), *SavePath));
 	}
 	FString AssetName = SavePath.Mid(LastSlash + 1);
+
+	// Check for existing asset (in-memory check — prevents duplicate package/object creation)
+	if (StaticFindObject(UObject::StaticClass(), nullptr, *SavePath))
+	{
+		return FMonolithActionResult::Error(
+			FString::Printf(TEXT("Asset already exists at '%s'. Delete it first or use a different path."), *SavePath));
+	}
 
 	FString Error;
 	UPackage* Package = MonolithGAS::GetOrCreatePackage(SavePath, Error);
