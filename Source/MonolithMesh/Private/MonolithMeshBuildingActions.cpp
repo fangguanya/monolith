@@ -1455,7 +1455,7 @@ void FMonolithMeshBuildingActions::GenerateIntegratedFacade(UDynamicMesh* Mesh,
 		//    applies plane slices + selection + inset + deletion, then AppendMesh.
 		FMonolithMeshFacadeActions::CutOpeningsSelectionInset(
 			Mesh, Face, Windows, Doors, WallThickness, Style.FrameWidth,
-			/*bUseSelectionInset=*/true, bHadBooleans);
+			/*bUseSelectionInset=*/false, bHadBooleans); // Boolean fallback — Selection+Inset crashes GeometryCore, use pre-cut walls (Option D) later
 
 		// 6. Add window frames
 		FMonolithMeshFacadeActions::AddWindowFrames(Mesh, Face, Windows, Style, WallThickness);
