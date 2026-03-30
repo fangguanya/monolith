@@ -4,6 +4,30 @@ Last updated: 2026-03-30
 
 ---
 
+### MonolithComboGraph Module — 12 Actions, Phase 1 COMPLETE (2026-03-30)
+
+- [x] Phase 1 — Full module implementation (12 actions): Read (list_combo_graphs, get_combo_graph_info, get_combo_node_effects, validate_combo_graph), Create (create_combo_graph, add_combo_node, add_combo_edge, set_combo_node_effects, set_combo_node_cues), Scaffold (create_combo_ability, link_ability_to_combo_graph, scaffold_combo_from_montages).
+- [x] Conditional compilation — `#if WITH_COMBOGRAPH` wraps entire module. Compiles clean with WITH_COMBOGRAPH=1 and WITH_COMBOGRAPH=0.
+- [x] Settings toggle — `bEnableComboGraph` in UMonolithSettings.
+- [x] Reflection-only integration — uses UObject reflection and UComboGraphFactory, no direct C++ API linkage.
+- [x] EdGraph sync — write actions update both runtime and editor graphs.
+- [x] Skill file — `unreal-combograph` skill created in `Plugins/Monolith/Skills/` and `.claude/skills/`.
+
+#### MonolithComboGraph — Testing Pending
+
+- [ ] **Functional testing** — All 12 actions need test pass with ComboGraph installed (WITH_COMBOGRAPH=1).
+- [ ] **Stub testing** — Verify clean compile and graceful degradation with WITH_COMBOGRAPH=0.
+- [ ] **GAS cross-integration** — Test `create_combo_ability` and `link_ability_to_combo_graph` with MonolithGAS actions for end-to-end combo+ability workflow.
+
+#### MonolithComboGraph — Future Work
+
+- [ ] **Branching combos** — Support for input-conditional branching (e.g., light vs heavy follow-up from same node).
+- [ ] **Combo graph templates** — Preset templates for common combo patterns (3-hit light chain, heavy finisher, dodge cancel).
+- [ ] **Runtime inspection** — PIE-only actions to inspect active combo state on actors.
+- [ ] **Batch node operations** — `batch_add_nodes` for creating multiple nodes in one call.
+
+---
+
 ### MonolithGAS Module — 130 Actions, Phases 1-4 COMPLETE (2026-03-29)
 
 - [x] Phase 1 — Abilities (28 actions): CRUD, grant, activate, cancel, spec handles, instancing, tags, costs, cooldowns.
