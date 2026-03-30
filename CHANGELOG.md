@@ -88,6 +88,15 @@ Widget Blueprint CRUD with a template system that scaffolds complete, functional
 - **Skills** — 9 -> 12 Claude Code skills bundled with plugin
 - **Modules** — 10 -> 13 (added MonolithMesh, MonolithGAS, MonolithBABridge)
 
+### Fixed
+
+- SQLite multi-statement DDL was silently only executing the first statement, leaving source index schema incomplete (thanks @fp12 / ArcstoneGames)
+- Plugin path resolution now uses `IPluginManager` instead of hardcoded `Plugins/Monolith/` — works for nested install paths like `Plugins/Marketplace/Monolith/` (thanks @fp12 / ArcstoneGames)
+
+### Contributors
+
+Thanks to **@fp12** (ArcstoneGames) for two solid PRs this release — real bugs caught and clean fixes shipped.
+
 ## [0.10.0] - 2026-03-25
 
 Massive expansion across all modules: +153 actions (290 to 443). Niagara nearly doubles with 31 new actions and 10 bug fixes. Blueprint and Animation get major expansions. Material function suite rounds out the material pipeline.
