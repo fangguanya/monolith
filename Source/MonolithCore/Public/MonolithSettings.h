@@ -171,6 +171,12 @@ public:
 
 	// --- Modules|Mesh ---
 
+	UPROPERTY(config, EditAnywhere, Category="Modules|Mesh",
+		DisplayName="Enable Procedural Town Generation (Experimental)",
+		Meta=(EditCondition="bEnableMesh",
+			  ToolTip="Registers town gen actions (city blocks, buildings, facades, roofs, floor plans, furnishing, terrain, spatial registry, debug views). EXPERIMENTAL — known geometry issues. Disable to hide these actions from MCP."))
+	bool bEnableProceduralTownGen = false;
+
 	UPROPERTY(config, EditAnywhere, Category="Modules|Mesh", DisplayName="Handle Pool Timeout (seconds)",
 		Meta=(ClampMin="10.0", ClampMax="3600.0", EditCondition="bEnableMesh"))
 	float MeshHandleTimeoutSeconds = 300.0f;
