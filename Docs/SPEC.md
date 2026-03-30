@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 15 MCP tools (815 total actions across 12 domains; 770 active by default — 45 experimental town gen actions disabled), cutting AI assistant context consumption by ~95%.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to 16 MCP tools (827 total actions across 13 domains; 782 active by default — 45 experimental town gen actions disabled), cutting AI assistant context consumption by ~95%.
 
 ### What It Replaces
 
@@ -46,12 +46,13 @@ Monolith.uplugin
   MonolithUI            — Widget blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility (42 actions)
   MonolithMesh          — Mesh inspection, scene manipulation, spatial queries, level blockout, GeometryScript ops, horror/accessibility, lighting, audio/acoustics, performance, decals, level design, tech art, context props, procedural geometry (sweep walls, auto-collision, proc mesh caching, blueprint prefabs), genre presets, encounter design, accessibility reports (197 core actions) + EXPERIMENTAL procedural town generator (45 actions, disabled by default via bEnableProceduralTownGen) = 242 total
   MonolithGAS           — Gameplay Ability System integration: abilities, attributes, effects, ASC, tags, cues, targets, input, inspection, scaffolding (130 actions). Conditional on #if WITH_GBA
+  MonolithComboGraph    — ComboGraph plugin integration: combo graph CRUD, node/edge management, effects, cues, ability scaffolding (12 actions). Conditional on #if WITH_COMBOGRAPH
   MonolithBABridge      — Optional IModularFeatures bridge for Blueprint Assist integration. Exposes IMonolithGraphFormatter; enables BA-powered auto_layout across blueprint, material, animation, and niagara modules when Blueprint Assist is present (0 MCP actions — integration only)
 ```
 
 ### Discovery/Dispatch Pattern
 
-All domain modules register actions with `FMonolithToolRegistry` (central singleton). Each domain exposes a single `{namespace}_query(action, params)` MCP tool. The 4 core tools (`monolith_discover`, `monolith_status`, `monolith_reindex`, `monolith_update`) are standalone. Conditional modules (e.g. MonolithGAS) gate registration on compile-time defines (`#if WITH_GBA`).
+All domain modules register actions with `FMonolithToolRegistry` (central singleton). Each domain exposes a single `{namespace}_query(action, params)` MCP tool. The 4 core tools (`monolith_discover`, `monolith_status`, `monolith_reindex`, `monolith_update`) are standalone. Conditional modules (e.g. MonolithGAS, MonolithComboGraph) gate registration on compile-time defines (`#if WITH_GBA`, `#if WITH_COMBOGRAPH`).
 
 ### MCP Protocol
 
@@ -67,7 +68,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | Module | Loading Phase | Type |
 |--------|--------------|------|
 | MonolithCore | PostEngineInit | Editor |
-| All others (11) | Default | Editor |
+| All others (12) | Default | Editor |
 | MonolithBABridge | Default | Editor (optional) |
 
 ### Plugin Dependencies
@@ -1242,6 +1243,31 @@ MonolithGAS provides full MCP coverage of the Gameplay Ability System. It covers
 >
 > **GBA conditional support:** The `WITH_GBA` define is set automatically by the module's `Build.cs` when GameplayAbilities is found. Projects without GAS get zero compile overhead — the entire module compiles to an empty stub.
 
+### 3.14 MonolithComboGraph
+
+**Dependencies:** Core, CoreUObject, Engine, MonolithCore
+**Namespace:** `combograph` | **Tool:** `combograph_query(action, params)` | **Actions:** 12
+**Conditional:** ComboGraph plugin features wrapped in `#if WITH_COMBOGRAPH`. When ComboGraph is absent, the module compiles to an empty stub (0 actions registered). Uses UObject reflection only — no direct C++ API linkage against ComboGraph binaries.
+**Settings toggle:** `bEnableComboGraph` (default: True)
+
+MonolithComboGraph provides MCP coverage of the ComboGraph marketplace plugin. It covers combo graph CRUD, node and edge management, gameplay effect and cue assignment per node, ability creation/linking, and full-graph scaffolding from montage lists.
+
+#### Action Categories
+
+| Category | Actions | Description |
+|----------|---------|-------------|
+| Read | 4 | List combo graphs, inspect graph structure (nodes/edges/effects), read node effects, validate graph integrity |
+| Create | 5 | Create combo graphs, add nodes with montages, add transition edges, set node effects, set node cues |
+| Scaffold | 3 | Create combo abilities, link abilities to graphs, scaffold complete graphs from ordered montage lists |
+
+#### Notes
+
+> **Precompiled plugin integration.** ComboGraph is a marketplace plugin with precompiled binaries. MonolithComboGraph uses UObject reflection (`FindPropertyByName`, `FProperty::GetValue_InContainer`) and `UComboGraphFactory` (discovered via reflection) rather than linking against ComboGraph headers. This makes the integration version-agnostic as long as property names are stable.
+>
+> **EdGraph sync.** ComboGraph assets contain both runtime and editor graphs. All write actions update both representations so changes are visible in the ComboGraph editor without manual refresh.
+>
+> **GAS integration.** The `create_combo_ability` and `link_ability_to_combo_graph` actions require both ComboGraph and GameplayAbilities plugins to be present.
+
 ---
 
 ## 4. Source Indexer
@@ -1470,6 +1496,7 @@ YourProject/Plugins/Monolith/
     MonolithSource/                (8 source files)
     MonolithUI/                    (17 source files — 9 .cpp + 8 .h)
     MonolithGAS/                   (conditional on WITH_GBA — abilities, attributes, effects, ASC, tags, cues, targets, input, inspect, scaffold)
+    MonolithComboGraph/            (conditional on WITH_COMBOGRAPH — combo graph CRUD, nodes, edges, effects, cues, ability scaffolding)
   Saved/
     .gitkeep
     monolith_offline.py              (Offline CLI — query DBs without the editor)
@@ -1548,7 +1575,8 @@ See `TODO.md` for the full list. Key architectural constraints:
 | MonolithSource | source | 11 |
 | MonolithUI | ui | 42 |
 | MonolithGAS | gas | 130 |
+| MonolithComboGraph | combograph | 12 |
 | MonolithBABridge | — | 0 (integration only) |
-| **Total** | | **815** (770 active by default) |
+| **Total** | | **827** (782 active by default) |
 
-**Note:** MonolithMesh includes 197 core actions (always registered) plus 45 experimental Procedural Town Generator actions (registered only when `bEnableProceduralTownGen = true`, default: false — known geometry issues). MonolithGAS is conditional on `#if WITH_GBA` — projects without GameplayAbilities register 0 GAS actions. MonolithBABridge registers no MCP actions — it only provides the `IMonolithGraphFormatter` IModularFeatures bridge consumed by `auto_layout` in the blueprint, material, animation, and niagara modules. The original Python server had higher tool counts (~231 tools) due to fragmented action design — Monolith consolidates these into 15 MCP tools with namespaced actions.
+**Note:** MonolithMesh includes 197 core actions (always registered) plus 45 experimental Procedural Town Generator actions (registered only when `bEnableProceduralTownGen = true`, default: false — known geometry issues). MonolithGAS is conditional on `#if WITH_GBA` — projects without GameplayAbilities register 0 GAS actions. MonolithComboGraph is conditional on `#if WITH_COMBOGRAPH` — projects without the ComboGraph plugin register 0 combograph actions. MonolithBABridge registers no MCP actions — it only provides the `IMonolithGraphFormatter` IModularFeatures bridge consumed by `auto_layout` in the blueprint, material, animation, and niagara modules. The original Python server had higher tool counts (~231 tools) due to fragmented action design — Monolith consolidates these into 16 MCP tools with namespaced actions.
