@@ -585,7 +585,18 @@ void FMonolithComboGraphActions::RegisterActions(FMonolithToolRegistry& Registry
 			.Optional(TEXT("transition_behavior"), TEXT("string"), TEXT("Transition behavior for all edges (default: Immediately)"), TEXT("Immediately"))
 			.Build());
 
-	UE_LOG(LogMonolithComboGraph, Log, TEXT("Registered 12 combograph actions"));
+	// ── Layout ──
+
+	Registry.RegisterAction(TEXT("combograph"), TEXT("layout_combo_graph"),
+		TEXT("Auto-layout nodes in a combo graph. Arranges nodes left-to-right following the combo chain, with branches spreading vertically."),
+		FMonolithActionHandler::CreateStatic(&HandleLayoutComboGraph),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("ComboGraph asset path"))
+			.Optional(TEXT("horizontal_spacing"), TEXT("integer"), TEXT("Horizontal spacing between nodes (default 300)"), TEXT("300"))
+			.Optional(TEXT("vertical_spacing"), TEXT("integer"), TEXT("Vertical spacing between branch nodes (default 200)"), TEXT("200"))
+			.Build());
+
+	UE_LOG(LogMonolithComboGraph, Log, TEXT("Registered 13 combograph actions"));
 }
 
 // ============================================================
@@ -2053,6 +2064,164 @@ FMonolithActionResult FMonolithComboGraphActions::HandleScaffoldComboFromMontage
 	Result->SetStringField(TEXT("message"),
 		FString::Printf(TEXT("Scaffolded combo graph with %d nodes and %d edges from %d montages"),
 			MontagePaths.Num(), EdgesCreated, MontagePaths.Num()));
+
+	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================
+//  13. layout_combo_graph
+// ============================================================
+
+FMonolithActionResult FMonolithComboGraphActions::HandleLayoutComboGraph(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	if (AssetPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("asset_path is required"));
+	}
+
+	const int32 HSpacing = Params->HasField(TEXT("horizontal_spacing"))
+		? static_cast<int32>(Params->GetNumberField(TEXT("horizontal_spacing")))
+		: 300;
+	const int32 VSpacing = Params->HasField(TEXT("vertical_spacing"))
+		? static_cast<int32>(Params->GetNumberField(TEXT("vertical_spacing")))
+		: 200;
+
+	// Load the ComboGraph asset
+	UObject* Graph = LoadObject<UObject>(nullptr, *AssetPath);
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to load asset: %s"), *AssetPath));
+	}
+
+	UClass* ComboGraphClass = FindComboGraphClass();
+	if (!ComboGraphClass || !Graph->IsA(ComboGraphClass))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Asset is not a ComboGraph: %s"), *AssetPath));
+	}
+
+	// Get the EditorGraph (UEdGraph) via reflection
+	FObjectProperty* EdGraphProp = CastField<FObjectProperty>(Graph->GetClass()->FindPropertyByName(TEXT("EditorGraph")));
+	if (!EdGraphProp)
+	{
+		return FMonolithActionResult::Error(TEXT("Could not find EditorGraph property on ComboGraph"));
+	}
+
+	UEdGraph* EdGraph = Cast<UEdGraph>(EdGraphProp->GetObjectPropertyValue(EdGraphProp->ContainerPtrToValuePtr<void>(Graph)));
+	if (!EdGraph)
+	{
+		return FMonolithActionResult::Error(TEXT("EditorGraph is null"));
+	}
+
+	if (EdGraph->Nodes.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("EditorGraph has no nodes"));
+	}
+
+	// Find the entry node
+	UEdGraphNode* EntryNode = nullptr;
+	for (UEdGraphNode* Node : EdGraph->Nodes)
+	{
+		if (Node && Node->GetClass()->GetName().Contains(TEXT("Entry")))
+		{
+			EntryNode = Node;
+			break;
+		}
+	}
+	if (!EntryNode && EdGraph->Nodes.Num() > 0)
+	{
+		EntryNode = EdGraph->Nodes[0];
+	}
+
+	// BFS from entry to assign depths
+	TMap<UEdGraphNode*, int32> DepthMap;
+	TQueue<UEdGraphNode*> Queue;
+	if (EntryNode)
+	{
+		Queue.Enqueue(EntryNode);
+		DepthMap.Add(EntryNode, 0);
+	}
+
+	int32 MaxDepth = 0;
+
+	while (!Queue.IsEmpty())
+	{
+		UEdGraphNode* Current;
+		Queue.Dequeue(Current);
+		int32 CurrentDepth = DepthMap[Current];
+		MaxDepth = FMath::Max(MaxDepth, CurrentDepth);
+
+		for (UEdGraphPin* Pin : Current->Pins)
+		{
+			if (Pin->Direction == EGPD_Output)
+			{
+				for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+				{
+					UEdGraphNode* NextNode = LinkedPin->GetOwningNode();
+					if (NextNode && !DepthMap.Contains(NextNode))
+					{
+						DepthMap.Add(NextNode, CurrentDepth + 1);
+						Queue.Enqueue(NextNode);
+					}
+				}
+			}
+		}
+	}
+
+	// Assign positions by depth layer
+	TMap<int32, int32> DepthCounters;
+	int32 MaxY = 0;
+	int32 LayoutNodeCount = 0;
+
+	for (auto& Pair : DepthMap)
+	{
+		int32 Depth = Pair.Value;
+		int32 Index = DepthCounters.FindOrAdd(Depth);
+		DepthCounters[Depth] = Index + 1;
+
+		Pair.Key->NodePosX = Depth * HSpacing;
+		Pair.Key->NodePosY = Index * VSpacing;
+
+		MaxY = FMath::Max(MaxY, Index * VSpacing);
+		LayoutNodeCount++;
+	}
+
+	// Handle unconnected nodes (not reached by BFS) — place below the main layout
+	int32 UnconnectedY = MaxY + VSpacing * 2;
+	int32 UnconnectedX = 0;
+	int32 UnconnectedCount = 0;
+
+	for (UEdGraphNode* Node : EdGraph->Nodes)
+	{
+		if (Node && !DepthMap.Contains(Node))
+		{
+			// Check if this is a comment node — place comments at the end
+			Node->NodePosX = UnconnectedX;
+			Node->NodePosY = UnconnectedY;
+			UnconnectedX += HSpacing;
+			UnconnectedCount++;
+			LayoutNodeCount++;
+		}
+	}
+
+	// Mark dirty
+	Graph->MarkPackageDirty();
+	EdGraph->NotifyGraphChanged();
+
+	// Build result
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("asset_path"), AssetPath);
+	Result->SetNumberField(TEXT("nodes_laid_out"), LayoutNodeCount);
+	Result->SetNumberField(TEXT("connected_nodes"), DepthMap.Num());
+	Result->SetNumberField(TEXT("unconnected_nodes"), UnconnectedCount);
+	Result->SetNumberField(TEXT("max_depth"), MaxDepth);
+	Result->SetNumberField(TEXT("horizontal_spacing"), HSpacing);
+	Result->SetNumberField(TEXT("vertical_spacing"), VSpacing);
+	Result->SetNumberField(TEXT("layout_width"), MaxDepth * HSpacing);
+	Result->SetNumberField(TEXT("layout_height"), MaxY);
+	Result->SetStringField(TEXT("message"),
+		FString::Printf(TEXT("Laid out %d nodes across %d layers (%d unconnected placed below)"),
+			LayoutNodeCount, MaxDepth + 1, UnconnectedCount));
 
 	return FMonolithActionResult::Success(Result);
 }

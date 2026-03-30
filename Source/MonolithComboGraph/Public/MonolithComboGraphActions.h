@@ -26,4 +26,7 @@ private:
 	static FMonolithActionResult HandleCreateComboAbility(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleLinkAbilityToComboGraph(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleScaffoldComboFromMontages(const TSharedPtr<FJsonObject>& Params);
+
+	// Layout
+	static FMonolithActionResult HandleLayoutComboGraph(const TSharedPtr<FJsonObject>& Params);
 };
