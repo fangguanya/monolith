@@ -992,6 +992,19 @@ FMonolithActionResult FMonolithGASInspectActions::HandleTraceAbilityActivation(c
 			TEXT("Actor '%s' has no AbilitySystemComponent."), *ActorIdent));
 	}
 
+	// Normalize the ability class identifier to a bare class name for matching
+	FString MatchName = AbilityClassStr;
+	// Strip asset path prefix: "/Game/Path/GA_Foo" -> "GA_Foo"
+	if (MatchName.Contains(TEXT("/")))
+	{
+		MatchName = FPaths::GetBaseFilename(MatchName);
+	}
+	// Strip _C suffix if present
+	if (MatchName.EndsWith(TEXT("_C")))
+	{
+		MatchName = MatchName.LeftChop(2);
+	}
+
 	// Find the ability spec
 	const FGameplayAbilitySpec* FoundSpec = nullptr;
 	const TArray<FGameplayAbilitySpec>& Abilities = ASC->GetActivatableAbilities();
@@ -999,7 +1012,13 @@ FMonolithActionResult FMonolithGASInspectActions::HandleTraceAbilityActivation(c
 	{
 		if (!Spec.Ability) continue;
 		FString ClassName = Spec.Ability->GetClass()->GetName();
-		if (ClassName == AbilityClassStr || ClassName.Contains(AbilityClassStr))
+		// Runtime class names for Blueprint abilities end with _C
+		FString BareClassName = ClassName;
+		if (BareClassName.EndsWith(TEXT("_C")))
+		{
+			BareClassName = BareClassName.LeftChop(2);
+		}
+		if (BareClassName == MatchName || ClassName == MatchName || BareClassName.Contains(MatchName))
 		{
 			FoundSpec = &Spec;
 			break;
@@ -1402,6 +1421,7 @@ void DiffStringArrays(
 void DiffAttributes(
 	const TSharedPtr<FJsonObject>& ActorA,
 	const TSharedPtr<FJsonObject>& ActorB,
+	const FString& ActorName,
 	TArray<TSharedPtr<FJsonValue>>& OutDiffs)
 {
 	// Build flat maps of attribute name -> current_value for each snapshot
@@ -1446,6 +1466,7 @@ void DiffAttributes(
 			TSharedPtr<FJsonObject> Diff = MakeShared<FJsonObject>();
 			Diff->SetStringField(TEXT("type"), TEXT("removed"));
 			Diff->SetStringField(TEXT("category"), TEXT("attribute"));
+			Diff->SetStringField(TEXT("actor_name"), ActorName);
 			Diff->SetStringField(TEXT("attribute"), Pair.Key);
 			Diff->SetNumberField(TEXT("old_value"), Pair.Value);
 			OutDiffs.Add(MakeShared<FJsonValueObject>(Diff));
@@ -1455,6 +1476,7 @@ void DiffAttributes(
 			TSharedPtr<FJsonObject> Diff = MakeShared<FJsonObject>();
 			Diff->SetStringField(TEXT("type"), TEXT("changed"));
 			Diff->SetStringField(TEXT("category"), TEXT("attribute"));
+			Diff->SetStringField(TEXT("actor_name"), ActorName);
 			Diff->SetStringField(TEXT("attribute"), Pair.Key);
 			Diff->SetNumberField(TEXT("old_value"), Pair.Value);
 			Diff->SetNumberField(TEXT("new_value"), *BVal);
@@ -1470,6 +1492,7 @@ void DiffAttributes(
 			TSharedPtr<FJsonObject> Diff = MakeShared<FJsonObject>();
 			Diff->SetStringField(TEXT("type"), TEXT("added"));
 			Diff->SetStringField(TEXT("category"), TEXT("attribute"));
+			Diff->SetStringField(TEXT("actor_name"), ActorName);
 			Diff->SetStringField(TEXT("attribute"), Pair.Key);
 			Diff->SetNumberField(TEXT("new_value"), Pair.Value);
 			OutDiffs.Add(MakeShared<FJsonValueObject>(Diff));
@@ -1564,7 +1587,7 @@ FMonolithActionResult FMonolithGASInspectActions::HandleCompareGASStates(const T
 		const TArray<TSharedPtr<FJsonValue>>* EfB = nullptr;
 		Pair.Value->TryGetArrayField(TEXT("active_effects"), EfA);
 		(*BObj)->TryGetArrayField(TEXT("active_effects"), EfB);
-		DiffJsonArrayByKey(EfA, EfB, TEXT("handle"), ActorPrefix + TEXT("effect"), AllDiffs);
+		DiffJsonArrayByKey(EfA, EfB, TEXT("effect_class"), ActorPrefix + TEXT("effect"), AllDiffs);
 
 		// Diff tags
 		const TArray<TSharedPtr<FJsonValue>>* TagA = nullptr;
@@ -1574,7 +1597,7 @@ FMonolithActionResult FMonolithGASInspectActions::HandleCompareGASStates(const T
 		DiffStringArrays(TagA, TagB, ActorPrefix + TEXT("tag"), AllDiffs);
 
 		// Diff attributes
-		DiffAttributes(Pair.Value, *BObj, AllDiffs);
+		DiffAttributes(Pair.Value, *BObj, Pair.Key, AllDiffs);
 	}
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();

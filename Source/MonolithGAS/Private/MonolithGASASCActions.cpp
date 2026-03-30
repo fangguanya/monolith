@@ -15,6 +15,7 @@
 #include "AttributeSet.h"
 #include "EdGraphSchema_K2.h"
 #include "EngineUtils.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 
 // LogMonolithGAS declared in MonolithGASInternal.h, defined in MonolithGASModule.cpp
 
@@ -1858,22 +1859,38 @@ namespace
 		{
 			FoundClass = FindFirstObject<UClass>(*(TEXT("U") + ClassId), EFindFirstObjectOptions::NativeFirst);
 		}
+		// Try with _C suffix (Blueprint-generated classes)
+		if (!FoundClass && !ClassId.EndsWith(TEXT("_C")))
+		{
+			FoundClass = FindFirstObject<UClass>(*(ClassId + TEXT("_C")), EFindFirstObjectOptions::NativeFirst);
+		}
 		if (FoundClass && FoundClass->IsChildOf(UGameplayAbility::StaticClass()))
 		{
 			return FoundClass;
 		}
 
-		// Try Blueprint-generated class path
-		FString ClassPath = ClassId;
-		if (!ClassPath.EndsWith(TEXT("_C")))
+		// Try Asset Registry lookup for bare Blueprint names
 		{
-			FString BaseName = FPaths::GetBaseFilename(ClassId);
-			ClassPath = ClassId + TEXT(".") + BaseName + TEXT("_C");
-		}
-		UClass* LoadedClass = LoadClass<UGameplayAbility>(nullptr, *ClassPath);
-		if (LoadedClass)
-		{
-			return LoadedClass;
+			IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+			FString SearchName = ClassId;
+			if (SearchName.EndsWith(TEXT("_C")))
+			{
+				SearchName = SearchName.LeftChop(2);
+			}
+			TArray<FAssetData> Assets;
+			AR.GetAssetsByClass(UBlueprint::StaticClass()->GetClassPathName(), Assets);
+			for (const FAssetData& Asset : Assets)
+			{
+				if (Asset.AssetName.ToString() == SearchName)
+				{
+					FString BPPath = Asset.GetObjectPathString() + TEXT("_C");
+					UClass* LoadedFromAR = LoadClass<UGameplayAbility>(nullptr, *BPPath);
+					if (LoadedFromAR)
+					{
+						return LoadedFromAR;
+					}
+				}
+			}
 		}
 
 		OutError = FString::Printf(TEXT("GameplayAbility class not found: '%s'"), *ClassId);

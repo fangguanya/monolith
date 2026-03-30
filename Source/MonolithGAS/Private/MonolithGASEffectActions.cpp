@@ -3502,22 +3502,38 @@ namespace
 		{
 			FoundClass = FindFirstObject<UClass>(*(TEXT("U") + ClassId), EFindFirstObjectOptions::NativeFirst);
 		}
+		// Try with _C suffix (Blueprint-generated classes)
+		if (!FoundClass && !ClassId.EndsWith(TEXT("_C")))
+		{
+			FoundClass = FindFirstObject<UClass>(*(ClassId + TEXT("_C")), EFindFirstObjectOptions::NativeFirst);
+		}
 		if (FoundClass && FoundClass->IsChildOf(UGameplayEffect::StaticClass()))
 		{
 			return FoundClass;
 		}
 
-		// Try loading as a Blueprint-generated class
-		FString ClassPath = ClassId;
-		if (!ClassPath.EndsWith(TEXT("_C")))
+		// Try Asset Registry lookup for bare Blueprint names
 		{
-			FString BaseName = FPaths::GetBaseFilename(ClassId);
-			ClassPath = ClassId + TEXT(".") + BaseName + TEXT("_C");
-		}
-		UClass* LoadedClass = LoadClass<UGameplayEffect>(nullptr, *ClassPath);
-		if (LoadedClass)
-		{
-			return LoadedClass;
+			IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+			FString SearchName = ClassId;
+			if (SearchName.EndsWith(TEXT("_C")))
+			{
+				SearchName = SearchName.LeftChop(2);
+			}
+			TArray<FAssetData> Assets;
+			AR.GetAssetsByClass(UBlueprint::StaticClass()->GetClassPathName(), Assets);
+			for (const FAssetData& Asset : Assets)
+			{
+				if (Asset.AssetName.ToString() == SearchName)
+				{
+					FString BPPath = Asset.GetObjectPathString() + TEXT("_C");
+					UClass* LoadedFromAR = LoadClass<UGameplayEffect>(nullptr, *BPPath);
+					if (LoadedFromAR)
+					{
+						return LoadedFromAR;
+					}
+				}
+			}
 		}
 
 		OutError = FString::Printf(TEXT("GameplayEffect class not found: '%s'"), *ClassId);
