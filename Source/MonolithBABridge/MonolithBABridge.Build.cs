@@ -6,6 +6,7 @@ public class MonolithBABridge : ModuleRules
 	public MonolithBABridge(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		bUseUnity = false;
 
 		// Probe for Blueprint Assist in multiple locations.
 		// BA installs to Engine/Plugins/Marketplace/ with an obfuscated folder name,
