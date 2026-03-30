@@ -5,7 +5,7 @@ description: Use when working with Unreal Engine meshes, scene spatial queries, 
 
 # Unreal Mesh & Spatial Workflows
 
-You have access to **Monolith** with **241 Mesh actions** (Phases 0-22 + Proc Geo Overhaul + Procedural Town Generator) via `mesh_query()`.
+You have access to **Monolith** with **242 Mesh actions** (197 core + 45 experimental town gen) via `mesh_query()`. Town gen actions require `bEnableProceduralTownGen = true` in Editor Preferences (disabled by default — known geometry issues).
 
 ### New in Overhaul (5 new actions + major feature upgrades):
 - `create_blueprint_prefab` -- Dialog-free Blueprint prefab from world actors
