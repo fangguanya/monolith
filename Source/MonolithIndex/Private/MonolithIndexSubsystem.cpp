@@ -35,6 +35,15 @@ void UMonolithIndexSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 
+	// Respect the module toggle — if the user disabled the Index module, skip all
+	// DB work, indexer registration, and automatic asset indexing entirely.
+	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
+	if (Settings && !Settings->bEnableIndex)
+	{
+		UE_LOG(LogMonolithIndex, Log, TEXT("Index module disabled via bEnableIndex=False — skipping asset indexing"));
+		return;
+	}
+
 	// In commandlet mode, only open the DB for queries — skip indexing, live callbacks, and AR registration
 	if (IsRunningCommandlet())
 	{
