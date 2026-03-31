@@ -89,9 +89,13 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
 	bool bIndexGAS = true;
 
-	/** Enable AI asset indexing (behavior trees, blackboards, state trees, EQS, smart objects) */
+	/** Enable BehaviorTree/Blackboard/EQS indexing (nodes, keys, cross-references) */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
-	bool bIndexAI = true;
+	bool bIndexBehaviorTrees = true;
+
+	/** Enable StateTree indexing (states, tasks, transitions). Requires StateTreeModule. */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
+	bool bIndexStateTrees = true;
 
 	/** Enable dependency graph indexing */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Post-Pass Indexers")
