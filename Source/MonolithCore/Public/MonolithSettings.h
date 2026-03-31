@@ -197,6 +197,11 @@ public:
 			  ToolTip="When enabled, registers light namespace actions for light components, IES profiles, post-process, sky atmosphere, Lumen, height fog, and volumetric clouds."))
 	bool bEnableLight = true;
 
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Capture Module",
+			  ToolTip="When enabled, registers capture namespace actions for viewport capture, scene preview (Niagara/Material/StaticMesh/SkeletalMesh/Animation/Widget), map management, and multi-frame sequence capture."))
+	bool bEnableCapture = true;
+
 	// --- Modules|Mesh ---
 
 	UPROPERTY(config, EditAnywhere, Category="Modules|Mesh",
