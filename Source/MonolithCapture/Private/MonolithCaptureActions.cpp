@@ -332,14 +332,10 @@ bool FMonolithCaptureActions::CaptureNiagaraFrame(
 {
 	if (!System) return false;
 
-	FPreviewScene::ConstructionValues CVs;
-	CVs.bDefaultLighting = false;
-	CVs.LightBrightness = 0.0f;
-	CVs.SkyBrightness = 0.0f;
+	// 使用默认光照，确保非自发光粒子也可见
 	TSharedPtr<FAdvancedPreviewScene> PreviewScene =
-		MakeShareable(new FAdvancedPreviewScene(CVs));
+		MakeShareable(new FAdvancedPreviewScene(FPreviewScene::ConstructionValues()));
 	PreviewScene->SetFloorVisibility(false);
-	PreviewScene->SetEnvironmentVisibility(false);
 
 	UNiagaraComponent* NiagaraComp = NewObject<UNiagaraComponent>(
 		GetTransientPackage(), NAME_None, RF_Transient);
@@ -576,22 +572,11 @@ bool FMonolithCaptureActions::CaptureSkeletalMeshFrame(
 		MakeShareable(new FAdvancedPreviewScene(FPreviewScene::ConstructionValues()));
 	PreviewScene->SetFloorVisibility(false);
 
-	UDebugSkelMeshComponent* SkelComp = NewObject<UDebugSkelMeshComponent>(
+	// 使用 USkeletalMeshComponent 而非 UDebugSkelMeshComponent
+	// UDebugSkelMeshComponent 在 SceneCaptureComponent2D 中无法正确渲染
+	USkeletalMeshComponent* SkelComp = NewObject<USkeletalMeshComponent>(
 		GetTransientPackage(), NAME_None, RF_Transient);
 	SkelComp->SetSkeletalMesh(Mesh);
-
-	if (bShowBones)
-	{
-		SkelComp->bDisplayBones = true;
-		SkelComp->bDrawMesh = true;
-		SkelComp->BonesOfInterest.Empty();
-		// 显示所有骨骼
-		const FReferenceSkeleton& RefSkel = Mesh->GetRefSkeleton();
-		for (int32 i = 0; i < RefSkel.GetNum(); ++i)
-		{
-			SkelComp->BonesOfInterest.Add(i);
-		}
-	}
 
 	if (Anim)
 	{
@@ -602,9 +587,26 @@ bool FMonolithCaptureActions::CaptureSkeletalMeshFrame(
 
 	PreviewScene->AddComponent(SkelComp, FTransform::Identity);
 
-	// Tick 保证姿态更新
-	SkelComp->TickComponent(0.016f, ELevelTick::LEVELTICK_All, nullptr);
-	SkelComp->RefreshBoneTransforms();
+	// 初始化动画系统并多次 Tick 以确保渲染数据就绪
+	SkelComp->InitAnim(true);
+	UWorld* World = PreviewScene->GetWorld();
+	constexpr int32 WarmUpFrames = 5;
+	const float DeltaTime = 1.0f / 30.0f;
+	for (int32 i = 0; i < WarmUpFrames; ++i)
+	{
+		if (World)
+		{
+			World->Tick(ELevelTick::LEVELTICK_PauseTick, DeltaTime);
+		}
+		SkelComp->TickAnimation(DeltaTime, false);
+		SkelComp->RefreshBoneTransforms();
+		SkelComp->TickComponent(DeltaTime, ELevelTick::LEVELTICK_All, nullptr);
+		if (World)
+		{
+			World->SendAllEndOfFrameUpdates();
+		}
+		FlushRenderingCommands();
+	}
 
 	if (GShaderCompilingManager)
 	{
@@ -631,7 +633,6 @@ bool FMonolithCaptureActions::CaptureSkeletalMeshFrame(
 	CaptureComp->FOVAngle = FOV;
 	CaptureComp->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
 
-	UWorld* World = PreviewScene->GetWorld();
 	CaptureComp->RegisterComponentWithWorld(World);
 	CaptureComp->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
 
@@ -1096,21 +1097,35 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureAnimation(const TSha
 			FString::Printf(TEXT("Failed to load AnimSequence: %s"), *AssetPath));
 	}
 
-	// 获取关联的 SkeletalMesh
-	USkeleton* Skeleton = Anim->GetSkeleton();
-	if (!Skeleton)
+	// 获取关联的 SkeletalMesh：优先使用用户指定的 skeletal_mesh_path
+	USkeletalMesh* Mesh = nullptr;
+	FString SkMeshPath = Params->GetStringField(TEXT("skeletal_mesh_path"));
+	if (!SkMeshPath.IsEmpty())
 	{
-		return FMonolithActionResult::Error(TEXT("AnimSequence has no skeleton"));
+		Mesh = LoadObject<USkeletalMesh>(nullptr, *SkMeshPath);
+		if (!Mesh)
+		{
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("Failed to load SkeletalMesh: %s"), *SkMeshPath));
+		}
 	}
-
-	USkeletalMesh* Mesh = Skeleton->GetAssetPreviewMesh(Anim);
+	else
+	{
+		// 从动画的 Skeleton 自动查找
+		USkeleton* Skeleton = Anim->GetSkeleton();
+		if (Skeleton)
+		{
+			Mesh = Skeleton->GetAssetPreviewMesh(Anim);
+			if (!Mesh)
+			{
+				Mesh = Skeleton->FindCompatibleMesh();
+			}
+		}
+	}
 	if (!Mesh)
 	{
-		Mesh = Skeleton->FindCompatibleMesh();
-	}
-	if (!Mesh)
-	{
-		return FMonolithActionResult::Error(TEXT("No compatible SkeletalMesh found for this animation's skeleton"));
+		return FMonolithActionResult::Error(
+			TEXT("No SkeletalMesh found. Provide 'skeletal_mesh_path' parameter or use an AnimSequence with a skeleton reference."));
 	}
 
 	// 时间戳
