@@ -182,6 +182,11 @@
 			"Name": "MonolithLight",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithCapture",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		}
 	]
 }
