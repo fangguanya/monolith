@@ -188,6 +188,11 @@ public:
 			  ToolTip="Registers ai_query actions for AI asset manipulation (BT, BB, ST, EQS, SO, Navigation, Perception)."))
 	bool bEnableAI = true;
 
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Light Module",
+			  ToolTip="When enabled, registers light namespace actions for light components, IES profiles, post-process, sky atmosphere, Lumen, height fog, and volumetric clouds."))
+	bool bEnableLight = true;
+
 	// --- Modules|Mesh ---
 
 	UPROPERTY(config, EditAnywhere, Category="Modules|Mesh",

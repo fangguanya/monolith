@@ -177,6 +177,11 @@
 			"Name": "MonolithLogicDriver",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithLight",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		}
 	]
 }
