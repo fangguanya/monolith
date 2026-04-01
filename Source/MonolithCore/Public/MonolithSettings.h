@@ -89,6 +89,18 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
 	bool bIndexGAS = true;
 
+	/** Enable BehaviorTree/Blackboard/EQS indexing (nodes, keys, cross-references) */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
+	bool bIndexBehaviorTrees = true;
+
+	/** Enable AI deep indexing (BT, BB, EQS, StateTree, SmartObject, Perception, Navigation) */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
+	bool bIndexAI = true;
+
+	/** Enable StateTree indexing (states, tasks, transitions). Requires StateTreeModule. */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
+	bool bIndexStateTrees = true;
+
 	/** Enable dependency graph indexing */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Post-Pass Indexers")
 	bool bIndexDependencies = true;
@@ -168,6 +180,31 @@ public:
 		meta=(DisplayName="Enable GAS Integration",
 			  ToolTip="When enabled, registers gas_query actions for Gameplay Ability System manipulation. Requires GameplayAbilities plugin (engine-bundled)."))
 	bool bEnableGAS = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable ComboGraph Integration",
+			  ToolTip="When enabled and ComboGraph is installed, registers combograph_query actions for combo graph manipulation."))
+	bool bEnableComboGraph = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Logic Driver Integration",
+			  ToolTip="When enabled and Logic Driver Pro is installed, registers logicdriver_query actions for state machine manipulation."))
+	bool bEnableLogicDriver = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable AI Module",
+			  ToolTip="Registers ai_query actions for AI asset manipulation (BT, BB, ST, EQS, SO, Navigation, Perception)."))
+	bool bEnableAI = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Light Module",
+			  ToolTip="When enabled, registers light namespace actions for light components, IES profiles, post-process, sky atmosphere, Lumen, height fog, and volumetric clouds."))
+	bool bEnableLight = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Capture Module",
+			  ToolTip="When enabled, registers capture namespace actions for viewport capture, scene preview (Niagara/Material/StaticMesh/SkeletalMesh/Animation/Widget), map management, and multi-frame sequence capture."))
+	bool bEnableCapture = true;
 
 	// --- Modules|Mesh ---
 
