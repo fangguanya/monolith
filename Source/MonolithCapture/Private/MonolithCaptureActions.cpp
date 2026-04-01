@@ -7,6 +7,7 @@
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "FileHelpers.h"
 #include "LevelEditor.h"
 #include "LevelEditorViewport.h"
@@ -17,7 +18,6 @@
 // 截屏
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/TextureRenderTarget2D.h"
-#include "AdvancedPreviewScene.h"
 #include "ImageUtils.h"
 #include "RenderingThread.h"
 #include "ShaderCompiler.h"
@@ -30,9 +30,10 @@
 #include "Components/StaticMeshComponent.h"
 #include "Engine/SkeletalMesh.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Animation/SkeletalMeshActor.h"
 #include "Animation/AnimSequence.h"
-#include "Animation/DebugSkelMeshComponent.h"
 #include "Materials/MaterialInterface.h"
+#include "Materials/Material.h"
 
 // UMG Widget 截屏
 #include "Blueprint/UserWidget.h"
@@ -324,6 +325,120 @@ bool FMonolithCaptureActions::RenderAndSaveCapture(
 	return FImageUtils::SaveImageAutoFormat(*OutputPath, Image);
 }
 
+// 在编辑器世界中使用 SCC2D + ShowOnlyList 截取指定组件（通用辅助函数）
+// 双次捕获：第一次触发着色器编译，第二次使用已编译着色器产出最终图像。
+// Component 必须已经通过 RegisterComponentWithWorld 注册到编辑器世界中。
+static bool CaptureComponentInEditorWorld(
+	UPrimitiveComponent* Component,
+	const FVector& CameraLocation, const FRotator& CameraRotation, float FOV,
+	int32 ResX, int32 ResY, const FString& OutputPath)
+{
+	if (!Component) return false;
+
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World)
+	{
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureComponentInEditorWorld: 编辑器世界不可用"));
+		return false;
+	}
+
+	// Tick 确保组件渲染状态初始化
+	const float TickDelta = 1.0f / 30.0f;
+	for (int32 i = 0; i < 5; i++)
+	{
+		World->Tick(LEVELTICK_TimeOnly, TickDelta);
+		World->SendAllEndOfFrameUpdates();
+		FlushRenderingCommands();
+	}
+
+	// 创建渲染目标
+	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	RT->InitAutoFormat(ResX, ResY);
+	RT->ClearColor = FLinearColor::Black;
+	RT->UpdateResourceImmediate(true);
+
+	// 创建 SCC2D，仅渲染目标组件（ShowOnlyList）
+	USceneCaptureComponent2D* SCC = NewObject<USceneCaptureComponent2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	SCC->bTickInEditor = false;
+	SCC->SetComponentTickEnabled(false);
+	SCC->bCaptureEveryFrame = false;
+	SCC->bCaptureOnMovement = false;
+	SCC->TextureTarget = RT;
+	SCC->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
+	SCC->ProjectionType = ECameraProjectionMode::Perspective;
+	SCC->FOVAngle = FOV;
+
+	// 仅渲染目标组件
+	SCC->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
+	SCC->ShowOnlyComponents.Add(Component);
+
+	// 隐藏大气/雾等环境效果，保留天空光照以提供环境光
+	SCC->ShowFlags.SetAtmosphere(false);
+	SCC->ShowFlags.SetFog(false);
+	SCC->ShowFlags.SetVolumetricFog(false);
+	SCC->ShowFlags.SetCloud(false);
+
+	// 固定曝光
+	SCC->PostProcessSettings.bOverride_AutoExposureMethod = true;
+	SCC->PostProcessSettings.AutoExposureMethod = EAutoExposureMethod::AEM_Manual;
+	SCC->PostProcessSettings.bOverride_AutoExposureBias = true;
+	SCC->PostProcessSettings.AutoExposureBias = 0.0f;
+	SCC->PostProcessBlendWeight = 1.0f;
+
+	SCC->RegisterComponentWithWorld(World);
+	SCC->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
+
+	// 确保着色器就绪
+	if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
+	FlushRenderingCommands();
+
+	// 第一次截屏——触发残余着色器编译
+	SCC->CaptureScene();
+	FlushRenderingCommands();
+
+	if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
+	FlushRenderingCommands();
+
+	// 第二次截屏——使用已编译着色器产出最终图像
+	SCC->CaptureScene();
+	FlushRenderingCommands();
+
+	// 读取像素
+	FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
+	if (!RTResource)
+	{
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureComponentInEditorWorld: 无法获取 RenderTarget 资源"));
+		SCC->TextureTarget = nullptr;
+		SCC->UnregisterComponent();
+		return false;
+	}
+
+	TArray<FColor> Pixels;
+	if (!RTResource->ReadPixels(Pixels) || Pixels.Num() == 0)
+	{
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureComponentInEditorWorld: ReadPixels 失败"));
+		SCC->TextureTarget = nullptr;
+		SCC->UnregisterComponent();
+		return false;
+	}
+
+	FString Dir = FPaths::GetPath(OutputPath);
+	IFileManager::Get().MakeDirectory(*Dir, true);
+
+	FImage Image;
+	Image.Init(ResX, ResY, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+	FMemory::Memcpy(Image.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+
+	bool bSaved = FImageUtils::SaveImageAutoFormat(*OutputPath, Image);
+
+	SCC->TextureTarget = nullptr;
+	SCC->UnregisterComponent();
+
+	return bSaved;
+}
+
 bool FMonolithCaptureActions::CaptureNiagaraFrame(
 	UNiagaraSystem* System, float SeekTime,
 	const FVector& CameraLocation, const FRotator& CameraRotation, float FOV,
@@ -332,11 +447,15 @@ bool FMonolithCaptureActions::CaptureNiagaraFrame(
 {
 	if (!System) return false;
 
-	// 使用默认光照，确保非自发光粒子也可见
-	TSharedPtr<FAdvancedPreviewScene> PreviewScene =
-		MakeShareable(new FAdvancedPreviewScene(FPreviewScene::ConstructionValues()));
-	PreviewScene->SetFloorVisibility(false);
+	// 在编辑器世界中渲染 Niagara（GPU 粒子需要完整渲染管线支持）
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World)
+	{
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureNiagaraFrame: 编辑器世界不可用"));
+		return false;
+	}
 
+	// 创建 Niagara 组件并注册到编辑器世界
 	UNiagaraComponent* NiagaraComp = NewObject<UNiagaraComponent>(
 		GetTransientPackage(), NAME_None, RF_Transient);
 	NiagaraComp->CastShadow = false;
@@ -347,66 +466,58 @@ bool FMonolithCaptureActions::CaptureNiagaraFrame(
 	NiagaraComp->SetAgeUpdateMode(ENiagaraAgeUpdateMode::DesiredAge);
 	NiagaraComp->SetCanRenderWhileSeeking(true);
 	NiagaraComp->SetMaxSimTime(0.0f);
+	NiagaraComp->RegisterComponentWithWorld(World);
 	NiagaraComp->Activate(true);
+	NiagaraComp->ResetSystem();
 
-	PreviewScene->AddComponent(NiagaraComp, NiagaraComp->GetRelativeTransform());
-
-	const float SeekDelta = 1.0f / 30.0f;
-	UWorld* World = NiagaraComp->GetWorld();
+	// 推进粒子模拟：先通过 World Tick 初始化系统，再 Seek 到目标时间
+	const float TickDelta = 1.0f / 30.0f;
+	constexpr int32 InitFrames = 3;
+	for (int32 i = 0; i < InitFrames; i++)
+	{
+		World->Tick(ELevelTick::LEVELTICK_TimeOnly, TickDelta);
+		World->SendAllEndOfFrameUpdates();
+		FlushRenderingCommands();
+	}
 
 	if (SeekTime > 0.0f)
 	{
-		NiagaraComp->SetSeekDelta(SeekDelta);
+		NiagaraComp->SetSeekDelta(TickDelta);
 		NiagaraComp->SeekToDesiredAge(SeekTime);
-
-		if (World)
+		NiagaraComp->TickComponent(TickDelta, ELevelTick::LEVELTICK_All, nullptr);
+		World->SendAllEndOfFrameUpdates();
+		if (FNiagaraWorldManager* WorldManager = FNiagaraWorldManager::Get(World))
 		{
-			World->TimeSeconds = SeekTime;
-			World->UnpausedTimeSeconds = SeekTime;
-			World->RealTimeSeconds = SeekTime;
-			World->DeltaRealTimeSeconds = SeekDelta;
-			World->DeltaTimeSeconds = SeekDelta;
-			World->Tick(ELevelTick::LEVELTICK_PauseTick, 0.0f);
-		}
-
-		NiagaraComp->TickComponent(SeekDelta, ELevelTick::LEVELTICK_All, nullptr);
-
-		if (World)
-		{
-			World->SendAllEndOfFrameUpdates();
-			if (FNiagaraWorldManager* WorldManager = FNiagaraWorldManager::Get(World))
-			{
-				WorldManager->FlushComputeAndDeferredQueues(true);
-			}
+			WorldManager->FlushComputeAndDeferredQueues(true);
 		}
 	}
 
-	if (World)
+	// Warm-up：多帧 Tick 确保 GPU 粒子缓冲已填充
+	constexpr int32 WarmUpFrames = 5;
+	for (int32 i = 0; i < WarmUpFrames; i++)
 	{
-		constexpr int32 WarmUpFrames = 3;
-		for (int32 i = 0; i < WarmUpFrames; i++)
+		World->Tick(ELevelTick::LEVELTICK_TimeOnly, TickDelta);
+		NiagaraComp->TickComponent(TickDelta, ELevelTick::LEVELTICK_All, nullptr);
+		World->SendAllEndOfFrameUpdates();
+		if (FNiagaraWorldManager* WorldManager = FNiagaraWorldManager::Get(World))
 		{
-			World->Tick(ELevelTick::LEVELTICK_PauseTick, SeekDelta);
-			NiagaraComp->TickComponent(SeekDelta, ELevelTick::LEVELTICK_All, nullptr);
-			World->SendAllEndOfFrameUpdates();
-			if (FNiagaraWorldManager* WorldManager = FNiagaraWorldManager::Get(World))
-			{
-				WorldManager->FlushComputeAndDeferredQueues(true);
-			}
-			FlushRenderingCommands();
+			WorldManager->FlushComputeAndDeferredQueues(true);
 		}
+		FlushRenderingCommands();
 	}
 
-	if (GShaderCompilingManager)
-	{
-		GShaderCompilingManager->FinishAllCompilation();
-	}
+	if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
 	FlushRenderingCommands();
 
+	UE_LOG(LogMonolithCapture, Log, TEXT("CaptureNiagaraFrame: IsActive=%d IsComplete=%d NumEmitters=%d"),
+		NiagaraComp->IsActive(), NiagaraComp->IsComplete(),
+		System->GetNumEmitters());
+
+	// 离屏渲染——使用 ShowOnlyComponent 仅捕获 Niagara 效果
 	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
 		GetTransientPackage(), NAME_None, RF_Transient);
 	RT->InitAutoFormat(ResX, ResY);
-	RT->ClearColor = FLinearColor::Black;
+	RT->ClearColor = FLinearColor(0.0f, 0.0f, 0.0f);
 	RT->UpdateResourceImmediate(true);
 
 	USceneCaptureComponent2D* CaptureComp = NewObject<USceneCaptureComponent2D>(
@@ -417,19 +528,70 @@ bool FMonolithCaptureActions::CaptureNiagaraFrame(
 	CaptureComp->bCaptureEveryFrame = false;
 	CaptureComp->bCaptureOnMovement = false;
 	CaptureComp->TextureTarget = RT;
-	CaptureComp->CaptureSource = CaptureSource;
+	CaptureComp->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
 	CaptureComp->ProjectionType = ECameraProjectionMode::Perspective;
 	CaptureComp->FOVAngle = FOV;
+
+	// GPU 粒子在 ShowOnlyList 模式下可能不渲染，使用 HiddenActors 隐藏场景 actor
 	CaptureComp->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
+	// 隐藏场景中已有的 actor，只保留 Niagara 组件可见
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		CaptureComp->HiddenActors.Add(*It);
+	}
+
+	// 隐藏大气/雾等环境效果，使粒子在黑色背景上可见
+	CaptureComp->ShowFlags.SetAtmosphere(false);
+	CaptureComp->ShowFlags.SetFog(false);
+	CaptureComp->ShowFlags.SetVolumetricFog(false);
+	CaptureComp->ShowFlags.SetSkyLighting(false);
+	CaptureComp->ShowFlags.SetCloud(false);
+
+	CaptureComp->PostProcessSettings.bOverride_AutoExposureMethod = true;
+	CaptureComp->PostProcessSettings.AutoExposureMethod = EAutoExposureMethod::AEM_Manual;
+	CaptureComp->PostProcessSettings.bOverride_AutoExposureBias = true;
+	CaptureComp->PostProcessSettings.AutoExposureBias = 0.0f;
+	CaptureComp->PostProcessBlendWeight = 1.0f;
 
 	CaptureComp->RegisterComponentWithWorld(World);
 	CaptureComp->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
 
-	bool bSuccess = RenderAndSaveCapture(CaptureComp, RT, ResX, ResY, OutputPath);
+	// 双次捕获：第一次触发着色器编译，第二次产出最终图像
+	if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
+	FlushRenderingCommands();
 
+	CaptureComp->CaptureScene();
+	FlushRenderingCommands();
+
+	if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
+	FlushRenderingCommands();
+
+	CaptureComp->CaptureScene();
+	FlushRenderingCommands();
+
+	// 读取像素并保存
+	FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
+	bool bSuccess = false;
+	if (RTResource)
+	{
+		TArray<FColor> Pixels;
+		if (RTResource->ReadPixels(Pixels) && Pixels.Num() > 0)
+		{
+			FString Dir = FPaths::GetPath(OutputPath);
+			IFileManager::Get().MakeDirectory(*Dir, true);
+
+			FImage Image;
+			Image.Init(ResX, ResY, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+			FMemory::Memcpy(Image.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+			bSuccess = FImageUtils::SaveImageAutoFormat(*OutputPath, Image);
+		}
+	}
+
+	// 清理临时组件
 	CaptureComp->TextureTarget = nullptr;
 	CaptureComp->UnregisterComponent();
-	PreviewScene->RemoveComponent(NiagaraComp);
+	NiagaraComp->Deactivate();
+	NiagaraComp->UnregisterComponent();
 
 	return bSuccess;
 }
@@ -442,64 +604,52 @@ bool FMonolithCaptureActions::CaptureMaterialFrame(
 {
 	if (!Material) return false;
 
-	TSharedPtr<FAdvancedPreviewScene> PreviewScene =
-		MakeShareable(new FAdvancedPreviewScene(FPreviewScene::ConstructionValues()));
-	PreviewScene->SetFloorVisibility(false);
-
-	FString MeshPath;
-	if (MeshType.Equals(TEXT("sphere"), ESearchCase::IgnoreCase))
-		MeshPath = TEXT("/Engine/BasicShapes/Sphere");
-	else if (MeshType.Equals(TEXT("cube"), ESearchCase::IgnoreCase))
-		MeshPath = TEXT("/Engine/BasicShapes/Cube");
-	else if (MeshType.Equals(TEXT("cylinder"), ESearchCase::IgnoreCase))
-		MeshPath = TEXT("/Engine/BasicShapes/Cylinder");
-	else
-		MeshPath = TEXT("/Engine/BasicShapes/Plane");
-
-	UStaticMesh* Mesh = LoadObject<UStaticMesh>(nullptr, *MeshPath);
-	if (!Mesh)
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World)
 	{
-		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureMaterialFrame: Failed to load mesh %s"), *MeshPath);
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureMaterialFrame: 编辑器世界不可用"));
 		return false;
+	}
+
+	// 加载预览形状
+	UStaticMesh* PreviewMesh = nullptr;
+	if (MeshType.Equals(TEXT("cube"), ESearchCase::IgnoreCase))
+	{
+		PreviewMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube"));
+	}
+	else if (MeshType.Equals(TEXT("plane"), ESearchCase::IgnoreCase))
+	{
+		PreviewMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane"));
+	}
+	else
+	{
+		PreviewMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Sphere"));
+	}
+	if (!PreviewMesh)
+	{
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureMaterialFrame: 无法加载预览形状"));
+		return false;
+	}
+
+	// 确保材质着色器编译完成
+	if (UMaterial* BaseMat = Material->GetMaterial())
+	{
+		BaseMat->EnsureIsComplete();
 	}
 
 	UStaticMeshComponent* MeshComp = NewObject<UStaticMeshComponent>(
 		GetTransientPackage(), NAME_None, RF_Transient);
-	MeshComp->SetStaticMesh(Mesh);
+	MeshComp->SetStaticMesh(PreviewMesh);
 	MeshComp->SetMaterial(0, const_cast<UMaterialInterface*>(Material));
-	MeshComp->SetRelativeScale3D(FVector(2.0f, 2.0f, 1.0f));
+	MeshComp->CastShadow = false;
+	MeshComp->bCastDynamicShadow = false;
+	MeshComp->SetMobility(EComponentMobility::Movable);
+	MeshComp->RegisterComponentWithWorld(World);
 
-	PreviewScene->AddComponent(MeshComp, MeshComp->GetRelativeTransform());
+	bool bSuccess = CaptureComponentInEditorWorld(
+		MeshComp, CameraLocation, CameraRotation, FOV, ResX, ResY, OutputPath);
 
-	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
-		GetTransientPackage(), NAME_None, RF_Transient);
-	RT->InitAutoFormat(ResX, ResY);
-	RT->ClearColor = FLinearColor(0.18f, 0.18f, 0.18f);
-	RT->UpdateResourceImmediate(true);
-
-	USceneCaptureComponent2D* CaptureComp = NewObject<USceneCaptureComponent2D>(
-		GetTransientPackage(), NAME_None, RF_Transient);
-	CaptureComp->bTickInEditor = false;
-	CaptureComp->SetComponentTickEnabled(false);
-	CaptureComp->SetVisibility(true);
-	CaptureComp->bCaptureEveryFrame = false;
-	CaptureComp->bCaptureOnMovement = false;
-	CaptureComp->TextureTarget = RT;
-	CaptureComp->CaptureSource = CaptureSource;
-	CaptureComp->ProjectionType = ECameraProjectionMode::Perspective;
-	CaptureComp->FOVAngle = FOV;
-	CaptureComp->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
-
-	UWorld* World = PreviewScene->GetWorld();
-	CaptureComp->RegisterComponentWithWorld(World);
-	CaptureComp->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
-
-	bool bSuccess = RenderAndSaveCapture(CaptureComp, RT, ResX, ResY, OutputPath);
-
-	CaptureComp->TextureTarget = nullptr;
-	CaptureComp->UnregisterComponent();
-	PreviewScene->RemoveComponent(MeshComp);
-
+	MeshComp->UnregisterComponent();
 	return bSuccess;
 }
 
@@ -511,52 +661,25 @@ bool FMonolithCaptureActions::CaptureStaticMeshFrame(
 {
 	if (!Mesh) return false;
 
-	TSharedPtr<FAdvancedPreviewScene> PreviewScene =
-		MakeShareable(new FAdvancedPreviewScene(FPreviewScene::ConstructionValues()));
-	PreviewScene->SetFloorVisibility(false);
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World)
+	{
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureStaticMeshFrame: 编辑器世界不可用"));
+		return false;
+	}
 
 	UStaticMeshComponent* MeshComp = NewObject<UStaticMeshComponent>(
 		GetTransientPackage(), NAME_None, RF_Transient);
 	MeshComp->SetStaticMesh(Mesh);
+	MeshComp->CastShadow = false;
+	MeshComp->bCastDynamicShadow = false;
+	MeshComp->SetMobility(EComponentMobility::Movable);
+	MeshComp->RegisterComponentWithWorld(World);
 
-	PreviewScene->AddComponent(MeshComp, FTransform::Identity);
+	bool bSuccess = CaptureComponentInEditorWorld(
+		MeshComp, CameraLocation, CameraRotation, FOV, ResX, ResY, OutputPath);
 
-	// 等待着色器编译完成
-	if (GShaderCompilingManager)
-	{
-		GShaderCompilingManager->FinishAllCompilation();
-	}
-	FlushRenderingCommands();
-
-	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
-		GetTransientPackage(), NAME_None, RF_Transient);
-	RT->InitAutoFormat(ResX, ResY);
-	RT->ClearColor = FLinearColor(0.18f, 0.18f, 0.18f);
-	RT->UpdateResourceImmediate(true);
-
-	USceneCaptureComponent2D* CaptureComp = NewObject<USceneCaptureComponent2D>(
-		GetTransientPackage(), NAME_None, RF_Transient);
-	CaptureComp->bTickInEditor = false;
-	CaptureComp->SetComponentTickEnabled(false);
-	CaptureComp->SetVisibility(true);
-	CaptureComp->bCaptureEveryFrame = false;
-	CaptureComp->bCaptureOnMovement = false;
-	CaptureComp->TextureTarget = RT;
-	CaptureComp->CaptureSource = CaptureSource;
-	CaptureComp->ProjectionType = ECameraProjectionMode::Perspective;
-	CaptureComp->FOVAngle = FOV;
-	CaptureComp->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
-
-	UWorld* World = PreviewScene->GetWorld();
-	CaptureComp->RegisterComponentWithWorld(World);
-	CaptureComp->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
-
-	bool bSuccess = RenderAndSaveCapture(CaptureComp, RT, ResX, ResY, OutputPath);
-
-	CaptureComp->TextureTarget = nullptr;
-	CaptureComp->UnregisterComponent();
-	PreviewScene->RemoveComponent(MeshComp);
-
+	MeshComp->UnregisterComponent();
 	return bSuccess;
 }
 
@@ -568,80 +691,65 @@ bool FMonolithCaptureActions::CaptureSkeletalMeshFrame(
 {
 	if (!Mesh) return false;
 
-	TSharedPtr<FAdvancedPreviewScene> PreviewScene =
-		MakeShareable(new FAdvancedPreviewScene(FPreviewScene::ConstructionValues()));
-	PreviewScene->SetFloorVisibility(false);
+	// 确保渲染资源和材质已就绪
+	if (Mesh->GetResourceForRendering() == nullptr)
+	{
+		Mesh->InitResources();
+	}
+	FlushAsyncLoading();
+	if (UPackage* MeshPackage = Mesh->GetOutermost())
+	{
+		MeshPackage->FullyLoad();
+	}
+	Mesh->ConditionalPostLoad();
 
-	// 使用 USkeletalMeshComponent 而非 UDebugSkelMeshComponent
-	// UDebugSkelMeshComponent 在 SceneCaptureComponent2D 中无法正确渲染
+	for (const FSkeletalMaterial& SkelMat : Mesh->GetMaterials())
+	{
+		if (UMaterialInterface* Mat = SkelMat.MaterialInterface)
+		{
+			if (UMaterial* BaseMat = Mat->GetMaterial())
+			{
+				BaseMat->EnsureIsComplete();
+			}
+		}
+	}
+
+	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+	if (!World)
+	{
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureSkeletalMeshFrame: 编辑器世界不可用"));
+		return false;
+	}
+
 	USkeletalMeshComponent* SkelComp = NewObject<USkeletalMeshComponent>(
 		GetTransientPackage(), NAME_None, RF_Transient);
 	SkelComp->SetSkeletalMesh(Mesh);
+	SkelComp->CastShadow = false;
+	SkelComp->bCastDynamicShadow = false;
+	SkelComp->SetMobility(EComponentMobility::Movable);
+	SkelComp->bPauseAnims = false;
+	SkelComp->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+	SkelComp->RegisterComponentWithWorld(World);
 
+	// 初始化骨骼动画系统后再设置动画和时间
+	SkelComp->InitAnim(true);
 	if (Anim)
 	{
 		SkelComp->SetAnimationMode(EAnimationMode::AnimationSingleNode);
-		SkelComp->SetAnimation(Anim);
-		SkelComp->SetPosition(Time);
+		SkelComp->PlayAnimation(Anim, false);
 	}
 
-	PreviewScene->AddComponent(SkelComp, FTransform::Identity);
+	// 使用目标时间作为 Tick delta 推进动画到指定时间点
+	SkelComp->TickComponent(FMath::Max(Time, 0.016f), ELevelTick::LEVELTICK_All, nullptr);
+	// 确保骨骼变换更新到渲染线程
+	SkelComp->RefreshBoneTransforms();
+	SkelComp->MarkRenderStateDirty();
+	SkelComp->MarkRenderDynamicDataDirty();
 
-	// 初始化动画系统并多次 Tick 以确保渲染数据就绪
-	SkelComp->InitAnim(true);
-	UWorld* World = PreviewScene->GetWorld();
-	constexpr int32 WarmUpFrames = 5;
-	const float DeltaTime = 1.0f / 30.0f;
-	for (int32 i = 0; i < WarmUpFrames; ++i)
-	{
-		if (World)
-		{
-			World->Tick(ELevelTick::LEVELTICK_PauseTick, DeltaTime);
-		}
-		SkelComp->TickAnimation(DeltaTime, false);
-		SkelComp->RefreshBoneTransforms();
-		SkelComp->TickComponent(DeltaTime, ELevelTick::LEVELTICK_All, nullptr);
-		if (World)
-		{
-			World->SendAllEndOfFrameUpdates();
-		}
-		FlushRenderingCommands();
-	}
+	bool bSuccess = CaptureComponentInEditorWorld(
+		SkelComp, CameraLocation, CameraRotation, FOV, ResX, ResY, OutputPath);
 
-	if (GShaderCompilingManager)
-	{
-		GShaderCompilingManager->FinishAllCompilation();
-	}
-	FlushRenderingCommands();
-
-	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
-		GetTransientPackage(), NAME_None, RF_Transient);
-	RT->InitAutoFormat(ResX, ResY);
-	RT->ClearColor = FLinearColor(0.18f, 0.18f, 0.18f);
-	RT->UpdateResourceImmediate(true);
-
-	USceneCaptureComponent2D* CaptureComp = NewObject<USceneCaptureComponent2D>(
-		GetTransientPackage(), NAME_None, RF_Transient);
-	CaptureComp->bTickInEditor = false;
-	CaptureComp->SetComponentTickEnabled(false);
-	CaptureComp->SetVisibility(true);
-	CaptureComp->bCaptureEveryFrame = false;
-	CaptureComp->bCaptureOnMovement = false;
-	CaptureComp->TextureTarget = RT;
-	CaptureComp->CaptureSource = CaptureSource;
-	CaptureComp->ProjectionType = ECameraProjectionMode::Perspective;
-	CaptureComp->FOVAngle = FOV;
-	CaptureComp->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
-
-	CaptureComp->RegisterComponentWithWorld(World);
-	CaptureComp->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
-
-	bool bSuccess = RenderAndSaveCapture(CaptureComp, RT, ResX, ResY, OutputPath);
-
-	CaptureComp->TextureTarget = nullptr;
-	CaptureComp->UnregisterComponent();
-	PreviewScene->RemoveComponent(SkelComp);
-
+	SkelComp->UnregisterComponent();
 	return bSuccess;
 }
 
@@ -1079,6 +1187,7 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureSkeletalMesh(const T
 	Result->SetStringField(TEXT("output_file"), OutputPath);
 	Result->SetBoolField(TEXT("show_bones"), bShowBones);
 	Result->SetNumberField(TEXT("capture_time_ms"), ElapsedMs);
+
 	return FMonolithActionResult::Success(Result);
 }
 
@@ -1289,6 +1398,14 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureMaterial(const TShar
 
 	FVector CameraLocation; FRotator CameraRotation; float FOV;
 	ParseCameraParams(Params, CameraLocation, CameraRotation, FOV);
+
+	// 自动计算预览形状的相机位置（Engine BasicShapes 默认半径约 50）
+	if (!Params->HasField(TEXT("camera")))
+	{
+		const float Radius = 50.0f;
+		CameraLocation = FVector(Radius * 2.5f, Radius * 0.5f, Radius * 0.8f);
+		CameraRotation = (-CameraLocation).Rotation();
+	}
 
 	int32 ResX, ResY;
 	ParseResolutionParams(Params, ResX, ResY);
