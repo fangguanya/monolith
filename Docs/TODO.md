@@ -4,7 +4,7 @@ Last updated: 2026-04-01
 
 ---
 
-### MonolithComboGraph Module — 12 Actions, Phase 1 COMPLETE (2026-03-30)
+### MonolithComboGraph Module — 13 Actions, Phase 1 COMPLETE (2026-03-30)
 
 - [x] Phase 1 — Full module implementation (12 actions): Read (list_combo_graphs, get_combo_graph_info, get_combo_node_effects, validate_combo_graph), Create (create_combo_graph, add_combo_node, add_combo_edge, set_combo_node_effects, set_combo_node_cues), Scaffold (create_combo_ability, link_ability_to_combo_graph, scaffold_combo_from_montages).
 - [x] Conditional compilation — `#if WITH_COMBOGRAPH` wraps entire module. Compiles clean with WITH_COMBOGRAPH=1 and WITH_COMBOGRAPH=0.
@@ -341,7 +341,7 @@ The mesh module ships horror defaults (storytelling patterns, room templates, ac
 - [ ] **SSE streaming** — DEFERRED. `MonolithHttpServer.cpp` SSE endpoint returns a single event and closes. Comment: "Full SSE streaming will be implemented when we need server-initiated notifications."
   - **File:** `Source/MonolithCore/Private/MonolithHttpServer.cpp` (~line 232)
 
-- [x] **C++ source indexer — native port complete** — DONE (2026-03-15). `MonolithSource` module now runs a native C++ indexer via `UMonolithSourceSubsystem`. The Python tree-sitter indexer (`Scripts/source_indexer/`) is legacy and no longer invoked. New action: `trigger_project_reindex` for incremental project-only C++ re-index. New commandlet: `UMonolithQueryCommandlet` (-run=MonolithQuery) replaces `monolith_offline.py` as the preferred offline access path.
+- [x] **C++ source indexer — native port complete** — DONE (2026-03-15). `MonolithSource` module now runs a native C++ indexer via `UMonolithSourceSubsystem`. The Python tree-sitter indexer (`Scripts/source_indexer/`) is legacy and no longer invoked. New action: `trigger_project_reindex` for incremental project-only C++ re-index. Offline query now via standalone `monolith_query.exe` — the previous `UMonolithQueryCommandlet` has been removed.
 
 - [x] **Python indexer: capture full class/struct definitions** — FIXED (2026-03-08). Added UE macro preprocessor that strips UCLASS/USTRUCT/UENUM/UINTERFACE, *_API, GENERATED_BODY() before tree-sitter parsing. 62,059 definitions now captured (was near-zero).
 
@@ -391,7 +391,7 @@ Priority features identified for future waves:
 ## Completed
 
 - [x] Core infrastructure (HTTP server, registry, settings, JSON utils, asset utils)
-- [x] All 11 domain modules compiling clean on UE 5.7
+- [x] All 15 domain modules compiling clean on UE 5.7
 - [x] SQLite FTS5 project indexer with 14 indexers (Blueprint, Material, Generic, Dependency, Animation, Niagara, DataTable, Level, GameplayTag, Config, Cpp, UserDefinedEnum, UserDefinedStruct, InputAction)
 - [x] Python tree-sitter engine source indexer
 - [x] Auto-updater via GitHub Releases
@@ -533,3 +533,7 @@ Priority features identified for future waves:
 - [x] **Plugin content scope fix (bInstalled filter)** — FIXED (2026-03-28). Replaced `bInstalled` filter with explicit path enumeration. DrawCallReducer and NiagaraDestructionDriver now indexed. MeshCatalogIndexer paths corrected.
 - [x] **MCP reindex action (incremental default + force param)** — IMPLEMENTED (2026-03-28). `monolith_reindex()` defaults to incremental mode; `force=true` triggers full wipe-and-rebuild.
 - [x] **NEW: MonolithGAS module** — IMPLEMENTED (2026-03-29), TESTED (2026-03-30). 130 actions in `gas` namespace (`gas_query` tool). 53/53 tests PASS, 12 bugs fixed (8 commits: 32c86d7-5639dda). Key fixes: IGameplayTagsEditorModule API, EnsureAssetPathFree 3-tier guard, BS_BeingCreated suppression, AR pre-filter, GAS deep indexer. Conditional on `#if WITH_GBA`. Total plugin: 685 → 815 actions, 11 → 12 domains, 14 → 15 MCP tools.
+- [x] **NEW: MonolithAI module** — IMPLEMENTED (2026-04-01). 229 actions in `ai` namespace (`ai_query` tool). 24K lines C++, 30 files. Covers BT, BB, State Trees, EQS, Smart Objects, AI Controllers, Perception, Navigation, Runtime/PIE, Scaffolds, Discovery, Advanced. Crown jewels: `build_behavior_tree_from_spec`, `build_state_tree_from_spec`. Conditional on `#if WITH_STATETREE` + `#if WITH_SMARTOBJECTS` (required); `#if WITH_MASSENTITY` + `#if WITH_ZONEGRAPH` (optional).
+- [x] **NEW: MonolithLogicDriver module** — IMPLEMENTED (2026-04-01), TESTED (2026-04-01). 66 actions in `logicdriver` namespace (`logicdriver_query` tool). 17/17 tests PASS, 6 bugs fixed. Reflection-only integration against Logic Driver Pro precompiled binaries. Conditional on `#if WITH_LOGICDRIVER`. 3-location Build.cs detection.
+- [x] **Python-to-C++ port: MCP proxy** — IMPLEMENTED (2026-04-01). `monolith_proxy.exe` replaces `monolith_proxy.py` as the primary MCP stdio-to-HTTP proxy. Standalone C++ binary, zero dependencies. Source at `Tools/MonolithProxy/`, build via `build.bat`. Supports env vars: `MONOLITH_URL`, `MONOLITH_SPLIT_EDITOR_QUERY`, `MONOLITH_EDITOR_ACTION_ALLOWLIST`, `MONOLITH_EDITOR_ACTION_DENYLIST`. Python proxy retained as legacy fallback.
+- [x] **Python-to-C++ port: offline query tool** — IMPLEMENTED (2026-04-01). `monolith_query.exe` replaces both `MonolithQueryCommandlet` (removed) and `monolith_offline.py` (deprecated) as the primary offline query tool. Standalone C++ binary, no UE runtime, instant startup. Source at `Tools/MonolithQuery/`, build via `build.bat`. 14 actions across source and project namespaces. `monolith_offline.py` retained as legacy fallback.

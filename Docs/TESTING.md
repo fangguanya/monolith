@@ -45,9 +45,13 @@ def test_action(namespace, action, params=None):
 
 ---
 
-## Current Status: 533/665 ACTIONS PASS (9 PENDING, 46 UNTESTED, 130 GAS PASS, 66 LOGICDRIVER PASS, 45 TOWN GEN EXPERIMENTAL) + Incremental Indexer PASS
+## Current Status: 533/665 ACTIONS PASS (9 PENDING, 46 UNTESTED, 130 GAS PASS, 66 LOGICDRIVER PASS, 229 AI UNTESTED, 45 TOWN GEN EXPERIMENTAL) + Incremental Indexer PASS + Standalone Tools PASS
 
-All 13 modules tested. Total plugin: 881 actions (836 active by default + 45 experimental town gen disabled by default).
+All 15 modules tested or compiled. Total plugin: 1125 actions (1080 active by default + 45 experimental town gen disabled by default). Standalone tools: `monolith_query.exe` (14/14 PASS), `monolith_proxy.exe` (3/3 PASS).
+
+2026-04-01: **Standalone tools verified.** `monolith_query.exe` — 14/14 actions PASS (all source + project queries). `monolith_proxy.exe` — 3/3 PASS (initialize, tools/list with 18 tools, tools/call). Both replace Python counterparts.
+
+2026-04-01: MonolithAI module compiled — 229 actions in `ai` namespace. 24K lines C++, 30 files. Full MCP runtime test pass pending.
 
 2026-04-01: MonolithLogicDriver full test pass — 17/17 PASS, 0 FAIL. 6 bugs found and fixed during testing. All 4 phases implemented. Key fixes: factory assertion crash guard, CollectGarbage after delete, recursive graph search, initial state detection, OnRenameNode for state naming, skip recompile for name persistence.
 
@@ -98,6 +102,41 @@ All 13 modules tested. Total plugin: 881 actions (836 active by default + 45 exp
 | is_initial always false (wrong base class) | Specific entry node class check |
 | State names "State_0" (wrong property target) | OnRenameNode + NodeDescription.Name |
 | Names lost on recompile | Set names after compile, skip recompile |
+
+---
+
+## Standalone Tools — Test Pass (2026-04-01)
+
+### monolith_query.exe — 14/14 PASS
+
+Standalone C++ offline query tool. Replaces `MonolithQueryCommandlet` (removed) and `monolith_offline.py` (deprecated).
+
+| Test | Action | Result | Notes |
+|------|--------|--------|-------|
+| Source search | search_source | **PASS** | FTS across symbols + source lines, BM25 ranking |
+| Source read | read_source | **PASS** | Class/function source retrieval with FTS fallback |
+| Find references | find_references | **PASS** | All usage sites for a symbol |
+| Find callers | find_callers | **PASS** | Call graph upstream traversal |
+| Find callees | find_callees | **PASS** | Call graph downstream traversal |
+| Class hierarchy | get_class_hierarchy | **PASS** | Inheritance tree both directions |
+| Module info | get_module_info | **PASS** | File count, symbol counts, key classes |
+| Symbol context | get_symbol_context | **PASS** | Definition with surrounding context lines |
+| Read file | read_file | **PASS** | Source lines by path with DB suffix matching |
+| Project search | search | **PASS** | FTS across assets and nodes |
+| Find by type | find_by_type | **PASS** | Asset class filter with pagination |
+| Project refs | find_references (project) | **PASS** | Bidirectional dependency lookup |
+| Get stats | get_stats | **PASS** | Row counts + asset class breakdown |
+| Asset details | get_asset_details | **PASS** | Nodes, variables, parameters for single asset |
+
+### monolith_proxy.exe — 3/3 PASS
+
+Standalone C++ MCP stdio-to-HTTP proxy. Replaces `monolith_proxy.py`.
+
+| Test | Method | Result | Notes |
+|------|--------|--------|-------|
+| Initialize | initialize | **PASS** | Handshake, capabilities negotiation, server info returned |
+| Tools list | tools/list | **PASS** | 18 tools returned (4 core + 14 namespace tools) |
+| Tool call | tools/call (monolith_status) | **PASS** | Status response with version, uptime, action count, engine version |
 
 ---
 
@@ -588,6 +627,10 @@ All 8/8 PASS. Tested 2026-03-28.
 
 | Date | Scope | Result | Notes |
 |------|-------|--------|-------|
+| 2026-04-01 | monolith_query.exe (14 actions) | **14/14 PASS** | Standalone C++ offline query tool. All source (9) and project (5) actions tested. Replaces MonolithQueryCommandlet (removed). |
+| 2026-04-01 | monolith_proxy.exe (MCP proxy) | **3/3 PASS** | Standalone C++ MCP proxy. Initialize, tools/list (18 tools), tools/call (monolith_status) all passing. Replaces Python proxy. |
+| 2026-04-01 | MonolithAI module build verification (229 actions) | **COMPILED** | 229 actions in `ai` namespace. 24K lines C++, 30 files. WITH_STATETREE + WITH_SMARTOBJECTS required. Full MCP runtime test pass pending. |
+| 2026-04-01 | MonolithLogicDriver full test pass (17/17) | **17/17 PASS** | 66 actions across 4 phases. 6 bugs found and fixed. WITH_LOGICDRIVER=1 and WITH_LOGICDRIVER=0 compile clean. |
 | 2026-03-30 | Procedural Town Generator marked EXPERIMENTAL | **EXPERIMENTAL** | `bEnableProceduralTownGen = false` by default. Fix Plan v5 applied (7 fixes: facade reorder, boolean isolation, wall alignment, door clamp, window density, template variety, furniture placement). Fundamental geometry issues remain. 45 town gen actions only registered when enabled. Total plugin: 815 actions (770 active default). |
 | 2026-03-30 | MonolithGAS full test pass (53/53) | **53/53 PASS** | 130 actions across 10 categories. 12 bugs found and fixed (8 git commits: 32c86d7-5639dda). Key fixes: IGameplayTagsEditorModule API, EnsureAssetPathFree 3-tier guard, BS_BeingCreated suppression, AR pre-filter, GAS deep indexer. PIE runtime tests all passing. |
 | 2026-03-29 | MonolithGAS module build verification (130 actions) | **COMPILED** | Initial build verification. WITH_GBA=1 and WITH_GBA=0 both compile clean. `gas` namespace registered. Total plugin: 815 actions. |
