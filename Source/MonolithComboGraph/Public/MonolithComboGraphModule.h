@@ -2,6 +2,8 @@
 
 #include "Modules/ModuleInterface.h"
 
+DECLARE_LOG_CATEGORY_EXTERN(LogMonolithComboGraph, Log, All);
+
 class FMonolithComboGraphModule : public IModuleInterface
 {
 public:

@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "MonolithToolRegistry.h"
+#include "MonolithComboGraphModule.h"
 
 class FMonolithComboGraphActions
 {
