@@ -35,7 +35,7 @@ Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate M
 ```
 Monolith.uplugin
   MonolithCore          — HTTP server, tool registry, discovery, settings, auto-updater
-  MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile (86 actions)
+  MonolithBlueprint     — Blueprint inspection, variable/component/graph CRUD, node operations, compile, spawn (88 actions)
   MonolithMaterial      — Material inspection + graph editing + CRUD + function suite (57 actions)
   MonolithAnimation     — Animation sequences, montages, ABPs, curves, notifies, skeletons, PoseSearch (115 actions)
   MonolithNiagara       — Niagara particle systems, HLSL module/function creation, DI config, event handlers, sim stages, NPC, effect types (96 actions)
@@ -125,11 +125,11 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 | Class | Responsibility |
 |-------|---------------|
-| `FMonolithBlueprintModule` | Registers 86 blueprint actions |
+| `FMonolithBlueprintModule` | Registers 88 blueprint actions |
 | `FMonolithBlueprintActions` | Static handlers. Uses `FMonolithAssetUtils::LoadAssetByPath<UBlueprint>` |
 | `MonolithBlueprintInternal` | Helpers: AddGraphArray, FindGraphByName, PinTypeToString, SerializePin/Node, TraceExecFlow, FindEntryNode |
 
-#### Actions (86 — namespace: "blueprint")
+#### Actions (88 — namespace: "blueprint")
 
 **Read Actions (13)**
 | Action | Params | Description |
@@ -205,6 +205,12 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 | Action | Params | Description |
 |--------|--------|-------------|
 | `auto_layout` | `asset_path`, `graph_name`?, `formatter`? | Auto-arrange nodes in a Blueprint graph. `formatter`: `"auto"` (default) — uses Blueprint Assist if available, falls back to built-in hierarchical layout; `"blueprint_assist"` — requires BA, errors if not present; `"builtin"` — built-in layout only |
+
+**Spawn (2)**
+| Action | Params | Description |
+|--------|--------|-------------|
+| `spawn_blueprint_actor` | `blueprint`, `location`?, `rotation`?, `scale`?, `label`?, `folder`?, `properties`?, `tags`?, `sublevel`?, `mobility`?, `select`? | Spawn a Blueprint actor into the editor world with full transform, property reflection, tags, sublevel targeting, and mobility control. Uses `GEditor->AddActor` for proper editor integration (undo/redo). Default folder: `"Blueprints"` |
+| `batch_spawn_blueprint_actors` | `blueprint`, `count`, `pattern`?, `origin`?, `spacing`?, `columns`?, `direction`?, `rotation`?, `scale`?, `label_prefix`?, `folder`?, `properties`?, `tags`?, `sublevel`?, `mobility`?, `select`? | Spawn multiple Blueprint actors in a grid or linear pattern. Partial failure semantics — continues on per-actor failure, reports successes and failures separately. Single undo transaction. Max 1000 |
 
 ---
 
