@@ -2228,8 +2228,6 @@ FMonolithActionResult FMonolithComboGraphActions::HandleLayoutComboGraph(const T
 
 #else // !WITH_COMBOGRAPH
 
-DEFINE_LOG_CATEGORY_STATIC(LogMonolithComboGraph, Log, All);
-
 void FMonolithComboGraphActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	UE_LOG(LogMonolithComboGraph, Log, TEXT("ComboGraph not installed — no combograph actions registered"));
