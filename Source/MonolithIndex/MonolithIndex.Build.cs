@@ -1,4 +1,5 @@
 using UnrealBuildTool;
+using System.IO;
 
 public class MonolithIndex : ModuleRules
 {
@@ -31,7 +32,39 @@ public class MonolithIndex : ModuleRules
 			"GameplayTags",
 			"GameplayAbilities",
 			"EnhancedInput",
-			"Projects"
+			"Projects",
+			"AIModule"
 		});
+
+		// --- Conditional: StateTree (UE 5.4+) ---
+		bool bHasStateTree = false;
+		bool bReleaseBuild = System.Environment.GetEnvironmentVariable("MONOLITH_RELEASE_BUILD") == "1";
+
+		if (!bReleaseBuild)
+		{
+			string EngineDir = Path.GetFullPath(Target.RelativeEnginePath);
+			string StateTreePluginDir = Path.Combine(EngineDir, "Plugins", "Runtime", "StateTree");
+			bHasStateTree = Directory.Exists(StateTreePluginDir);
+
+			if (!bHasStateTree)
+			{
+				string EnginePluginsDir = Path.Combine(EngineDir, "Plugins");
+				bHasStateTree = Directory.Exists(Path.Combine(EnginePluginsDir, "StateTree"));
+			}
+		}
+
+		if (bHasStateTree)
+		{
+			PrivateDependencyModuleNames.AddRange(new string[]
+			{
+				"StateTreeModule",
+				"StateTreeEditorModule"
+			});
+			PublicDefinitions.Add("WITH_STATETREE=1");
+		}
+		else
+		{
+			PublicDefinitions.Add("WITH_STATETREE=0");
+		}
 	}
 }

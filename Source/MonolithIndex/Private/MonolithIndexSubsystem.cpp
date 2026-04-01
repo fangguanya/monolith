@@ -30,10 +30,27 @@
 #include "Indexers/DataAssetIndexer.h"
 #include "Indexers/MeshCatalogIndexer.h"
 #include "Indexers/GASIndexer.h"
+#include "Indexers/BehaviorTreeIndexer.h"
+#include "Indexers/EQSIndexer.h"
+#if WITH_STATETREE
+#include "Indexers/StateTreeIndexer.h"
+#endif
 
 void UMonolithIndexSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
+
+	// In commandlet mode, only open the DB for queries — skip indexing, live callbacks, and AR registration
+	if (IsRunningCommandlet())
+	{
+		Database = MakeUnique<FMonolithIndexDatabase>();
+		FString DbPath = GetDatabasePath();
+		if (Database->Open(DbPath))
+		{
+			UE_LOG(LogMonolithIndex, Log, TEXT("Commandlet mode — opened index DB read-only at %s"), *DbPath);
+		}
+		return;
+	}
 
 	Database = MakeUnique<FMonolithIndexDatabase>();
 	FString DbPath = GetDatabasePath();
@@ -182,6 +199,15 @@ void UMonolithIndexSubsystem::RegisterDefaultIndexers()
 		RegisterIndexer(MakeShared<FMeshCatalogIndexer>());
 	if (Settings->bIndexGAS)
 		RegisterIndexer(MakeShared<FGASIndexer>());
+	if (Settings->bIndexBehaviorTrees)
+	{
+		RegisterIndexer(MakeShared<FBehaviorTreeIndexer>());
+		RegisterIndexer(MakeShared<FEQSIndexer>());
+	}
+#if WITH_STATETREE
+	if (Settings->bIndexStateTrees)
+		RegisterIndexer(MakeShared<FStateTreeIndexer>());
+#endif
 
 	UE_LOG(LogMonolithIndex, Log, TEXT("Registered %d indexers"), Indexers.Num());
 }
@@ -906,8 +932,12 @@ void UMonolithIndexSubsystem::OnIndexingFinished(bool bSuccess)
 
 FString UMonolithIndexSubsystem::GetDatabasePath() const
 {
-	FString PluginDir = FPaths::ProjectPluginsDir() / TEXT("Monolith") / TEXT("Saved");
-	return PluginDir / TEXT("ProjectIndex.db");
+	TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Monolith"));
+	if (Plugin.IsValid())
+	{
+		return Plugin->GetBaseDir() / TEXT("Saved") / TEXT("ProjectIndex.db");
+	}
+	return FPaths::ProjectPluginsDir() / TEXT("Monolith") / TEXT("Saved") / TEXT("ProjectIndex.db");
 }
 
 bool UMonolithIndexSubsystem::ShouldAutoIndex() const
