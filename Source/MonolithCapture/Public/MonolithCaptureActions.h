@@ -30,6 +30,14 @@ public:
 	// 通用多帧
 	static FMonolithActionResult HandleCaptureSequenceFrames(const TSharedPtr<FJsonObject>& Params);
 
+	// 离屏场景截图
+	static FMonolithActionResult HandleCaptureScene(const TSharedPtr<FJsonObject>& Params);
+
+	// Actor 查找与聚焦
+	static FMonolithActionResult HandleFindActorsByClass(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSelectAndFocus(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleFocusActor(const TSharedPtr<FJsonObject>& Params);
+
 private:
 	// 截图辅助
 	static bool RenderAndSaveCapture(

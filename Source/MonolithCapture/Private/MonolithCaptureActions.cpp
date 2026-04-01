@@ -285,6 +285,47 @@ void FMonolithCaptureActions::RegisterActions()
 			.Optional(TEXT("output_dir"), TEXT("string"), TEXT("输出目录"))
 			.Optional(TEXT("filename_prefix"), TEXT("string"), TEXT("帧文件名前缀"), TEXT("frame"))
 			.Build());
+
+	// --- 离屏场景截图（不依赖视口） ---
+	Registry.RegisterAction(TEXT("capture"), TEXT("capture_scene"),
+		TEXT("使用 SceneCaptureComponent2D 进行离屏全场景截图，不依赖编辑器视口状态"),
+		FMonolithActionHandler::CreateStatic(&HandleCaptureScene),
+		FParamSchemaBuilder()
+			.Optional(TEXT("camera"), TEXT("object"), TEXT("{location:{x,y,z}, rotation:{pitch,yaw,roll}, fov:60}"))
+			.Optional(TEXT("resolution"), TEXT("array"), TEXT("[width, height]"), TEXT("[1280,720]"))
+			.Optional(TEXT("output_path"), TEXT("string"), TEXT("输出 PNG 路径"))
+			.Optional(TEXT("capability"), TEXT("string"), TEXT("artifact 路径分类"), TEXT("grapple"))
+			.Optional(TEXT("run_id"), TEXT("string"), TEXT("artifact 归档 run-id"))
+			.Optional(TEXT("artifact_root"), TEXT("string"), TEXT("显式 artifact 输出目录"))
+			.Build());
+
+	// --- Actor 查找与聚焦 ---
+	Registry.RegisterAction(TEXT("capture"), TEXT("find_actors_by_class"),
+		TEXT("按类名查找当前地图中的 Actor"),
+		FMonolithActionHandler::CreateStatic(&HandleFindActorsByClass),
+		FParamSchemaBuilder()
+			.Optional(TEXT("class_name"), TEXT("string"), TEXT("类名模糊匹配过滤器"))
+			.Optional(TEXT("limit"), TEXT("integer"), TEXT("最大返回数量"), TEXT("50"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("capture"), TEXT("select_and_focus"),
+		TEXT("选中指定 Actor 并将视口聚焦到它"),
+		FMonolithActionHandler::CreateStatic(&HandleSelectAndFocus),
+		FParamSchemaBuilder()
+			.Optional(TEXT("actor_name"), TEXT("string"), TEXT("Actor 名称模糊匹配"))
+			.Optional(TEXT("class_name"), TEXT("string"), TEXT("Actor 类名模糊匹配"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("capture"), TEXT("focus_actor"),
+		TEXT("计算相机位置并对准指定 Actor"),
+		FMonolithActionHandler::CreateStatic(&HandleFocusActor),
+		FParamSchemaBuilder()
+			.Optional(TEXT("actor_name"), TEXT("string"), TEXT("Actor 名称模糊匹配"))
+			.Optional(TEXT("class_name"), TEXT("string"), TEXT("Actor 类名模糊匹配"))
+			.Optional(TEXT("distance"), TEXT("number"), TEXT("观察距离，0 表示自动计算"), TEXT("0"))
+			.Optional(TEXT("pitch"), TEXT("number"), TEXT("俯仰角度"), TEXT("-30"))
+			.Optional(TEXT("yaw"), TEXT("number"), TEXT("偏航角度"), TEXT("45"))
+			.Build());
 }
 
 // ===== 截图辅助 =====
@@ -1696,5 +1737,351 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureSequenceFrames(const
 	Result->SetBoolField(TEXT("success"), true);
 	Result->SetArrayField(TEXT("frames"), FrameResults);
 	Result->SetNumberField(TEXT("total_capture_time_ms"), ElapsedMs);
+	return FMonolithActionResult::Success(Result);
+}
+
+// ===== 离屏场景截图 =====
+
+FMonolithActionResult FMonolithCaptureActions::HandleCaptureScene(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("GEditor 不可用"));
+	}
+
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("当前没有打开的地图"));
+	}
+
+	// 解析相机参数
+	FVector CameraLocation(0, 0, 500);
+	FRotator CameraRotation(-30, 0, 0);
+	float FOV = 60.0f;
+	if (Params.IsValid() && Params->HasField(TEXT("camera")))
+	{
+		ParseCameraParams(Params, CameraLocation, CameraRotation, FOV);
+	}
+
+	// 解析分辨率
+	int32 ResX = 1280, ResY = 720;
+	if (Params.IsValid())
+	{
+		ParseResolutionParams(Params, ResX, ResY);
+	}
+
+	// 创建渲染目标
+	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	RT->InitAutoFormat(ResX, ResY);
+	RT->ClearColor = FLinearColor::Black;
+	RT->UpdateResourceImmediate(true);
+
+	// 创建 SceneCaptureComponent2D — 渲染全部场景
+	USceneCaptureComponent2D* SCC = NewObject<USceneCaptureComponent2D>(
+		GetTransientPackage(), NAME_None, RF_Transient);
+	SCC->bTickInEditor = false;
+	SCC->SetComponentTickEnabled(false);
+	SCC->bCaptureEveryFrame = false;
+	SCC->bCaptureOnMovement = false;
+	SCC->TextureTarget = RT;
+	SCC->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
+	SCC->ProjectionType = ECameraProjectionMode::Perspective;
+	SCC->FOVAngle = FOV;
+
+	// 渲染场景中所有图元
+	SCC->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
+
+	SCC->RegisterComponentWithWorld(World);
+	SCC->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
+
+	// 确保着色器就绪
+	if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
+	FlushRenderingCommands();
+
+	// 双次捕获：第一次触发着色器编译，第二次产出最终图像
+	SCC->CaptureScene();
+	FlushRenderingCommands();
+
+	if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
+	FlushRenderingCommands();
+
+	SCC->CaptureScene();
+	FlushRenderingCommands();
+
+	// 读取像素
+	FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
+	if (!RTResource)
+	{
+		SCC->TextureTarget = nullptr;
+		SCC->UnregisterComponent();
+		return FMonolithActionResult::Error(TEXT("无法获取 RenderTarget 资源"));
+	}
+
+	TArray<FColor> Pixels;
+	if (!RTResource->ReadPixels(Pixels) || Pixels.Num() == 0)
+	{
+		SCC->TextureTarget = nullptr;
+		SCC->UnregisterComponent();
+		return FMonolithActionResult::Error(TEXT("ReadPixels 失败"));
+	}
+
+	// 清理 SCC
+	SCC->TextureTarget = nullptr;
+	SCC->UnregisterComponent();
+
+	// 确定输出路径
+	FString OutputPath;
+	if (Params.IsValid() && Params->HasField(TEXT("output_path")))
+	{
+		OutputPath = Params->GetStringField(TEXT("output_path"));
+		if (FPaths::IsRelative(OutputPath))
+		{
+			OutputPath = FPaths::ProjectDir() / OutputPath;
+		}
+	}
+	else
+	{
+		const FString ArtifactRoot = ResolveArtifactRoot(Params);
+		const FString ScreenshotDir = FPaths::Combine(ArtifactRoot, TEXT("screenshots"));
+		IFileManager::Get().MakeDirectory(*ScreenshotDir, true);
+		const FString Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
+		OutputPath = FPaths::Combine(ScreenshotDir, FString::Printf(TEXT("scene_%s.png"), *Timestamp));
+	}
+
+	// 确保目录存在
+	FString Dir = FPaths::GetPath(OutputPath);
+	IFileManager::Get().MakeDirectory(*Dir, true);
+
+	// 编码 PNG
+	FImage Image;
+	Image.Init(ResX, ResY, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+	FMemory::Memcpy(Image.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+
+	if (!FImageUtils::SaveImageAutoFormat(*OutputPath, Image))
+	{
+		return FMonolithActionResult::Error(TEXT("截图保存失败"));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("path"), OutputPath);
+	Result->SetNumberField(TEXT("width"), ResX);
+	Result->SetNumberField(TEXT("height"), ResY);
+	Result->SetStringField(TEXT("map"), World->GetMapName());
+	return FMonolithActionResult::Success(Result);
+}
+
+// ===== Actor 查找与聚焦 =====
+
+FMonolithActionResult FMonolithCaptureActions::HandleFindActorsByClass(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("GEditor 不可用"));
+	}
+
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("当前没有打开的地图"));
+	}
+
+	const FString ClassName = Params.IsValid() && Params->HasField(TEXT("class_name"))
+		? Params->GetStringField(TEXT("class_name")) : FString();
+	const int32 Limit = Params.IsValid() && Params->HasField(TEXT("limit"))
+		? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 50;
+
+	TArray<TSharedPtr<FJsonValue>> ActorArray;
+	int32 Count = 0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!IsValid(Actor)) continue;
+		if (!ClassName.IsEmpty() && !Actor->GetClass()->GetName().Contains(ClassName)) continue;
+
+		TSharedPtr<FJsonObject> ActorObj = MakeShared<FJsonObject>();
+		ActorObj->SetStringField(TEXT("name"), Actor->GetName());
+		ActorObj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
+
+		const FVector Loc = Actor->GetActorLocation();
+		TSharedPtr<FJsonObject> LocObj = MakeShared<FJsonObject>();
+		LocObj->SetNumberField(TEXT("x"), Loc.X);
+		LocObj->SetNumberField(TEXT("y"), Loc.Y);
+		LocObj->SetNumberField(TEXT("z"), Loc.Z);
+		ActorObj->SetObjectField(TEXT("location"), LocObj);
+
+		FVector Origin, Extent;
+		Actor->GetActorBounds(false, Origin, Extent);
+		TSharedPtr<FJsonObject> BoundsObj = MakeShared<FJsonObject>();
+		BoundsObj->SetNumberField(TEXT("extent_x"), Extent.X);
+		BoundsObj->SetNumberField(TEXT("extent_y"), Extent.Y);
+		BoundsObj->SetNumberField(TEXT("extent_z"), Extent.Z);
+		ActorObj->SetObjectField(TEXT("bounds"), BoundsObj);
+
+		ActorArray.Add(MakeShared<FJsonValueObject>(ActorObj));
+		if (++Count >= Limit) break;
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetArrayField(TEXT("actors"), ActorArray);
+	Result->SetNumberField(TEXT("count"), Count);
+	Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Found %d actors"), Count));
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithCaptureActions::HandleSelectAndFocus(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("GEditor 不可用"));
+	}
+
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("当前没有打开的地图"));
+	}
+
+	const FString ActorName = Params.IsValid() && Params->HasField(TEXT("actor_name"))
+		? Params->GetStringField(TEXT("actor_name")) : FString();
+	const FString ClassName = Params.IsValid() && Params->HasField(TEXT("class_name"))
+		? Params->GetStringField(TEXT("class_name")) : FString();
+	if (ActorName.IsEmpty() && ClassName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("需要 actor_name 或 class_name 参数"));
+	}
+
+	AActor* TargetActor = nullptr;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!IsValid(Actor)) continue;
+		if (!ActorName.IsEmpty() && Actor->GetName().Contains(ActorName)) { TargetActor = Actor; break; }
+		if (!ClassName.IsEmpty() && Actor->GetClass()->GetName().Contains(ClassName)) { TargetActor = Actor; break; }
+	}
+
+	if (!TargetActor)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("未找到匹配的 Actor: name=%s class=%s"), *ActorName, *ClassName));
+	}
+
+	GEditor->SelectNone(false, true, false);
+	GEditor->SelectActor(TargetActor, true, true, true);
+	GEditor->MoveViewportCamerasToActor(*TargetActor, true);
+	GEditor->RedrawAllViewports(true);
+	FlushRenderingCommands();
+
+	FVector Origin, Extent;
+	TargetActor->GetActorBounds(false, Origin, Extent);
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("actor_name"), TargetActor->GetName());
+	Result->SetStringField(TEXT("actor_class"), TargetActor->GetClass()->GetName());
+	TSharedPtr<FJsonObject> OriginObj = MakeShared<FJsonObject>();
+	OriginObj->SetNumberField(TEXT("x"), Origin.X);
+	OriginObj->SetNumberField(TEXT("y"), Origin.Y);
+	OriginObj->SetNumberField(TEXT("z"), Origin.Z);
+	Result->SetObjectField(TEXT("origin"), OriginObj);
+	TSharedPtr<FJsonObject> ExtentObj = MakeShared<FJsonObject>();
+	ExtentObj->SetNumberField(TEXT("x"), Extent.X);
+	ExtentObj->SetNumberField(TEXT("y"), Extent.Y);
+	ExtentObj->SetNumberField(TEXT("z"), Extent.Z);
+	Result->SetObjectField(TEXT("extent"), ExtentObj);
+	Result->SetStringField(TEXT("message"), FString::Printf(TEXT("已选中并聚焦 %s"), *TargetActor->GetName()));
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithCaptureActions::HandleFocusActor(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("GEditor 不可用"));
+	}
+
+	UWorld* World = GEditor->GetEditorWorldContext().World();
+	if (!World)
+	{
+		return FMonolithActionResult::Error(TEXT("当前没有打开的地图"));
+	}
+
+	const TArray<FLevelEditorViewportClient*>& Clients = GEditor->GetLevelViewportClients();
+	if (Clients.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("没有可用的编辑器视口"));
+	}
+
+	const FString ActorName = Params.IsValid() && Params->HasField(TEXT("actor_name"))
+		? Params->GetStringField(TEXT("actor_name")) : FString();
+	const FString ClassName = Params.IsValid() && Params->HasField(TEXT("class_name"))
+		? Params->GetStringField(TEXT("class_name")) : FString();
+	float Distance = Params.IsValid() && Params->HasField(TEXT("distance"))
+		? static_cast<float>(Params->GetNumberField(TEXT("distance"))) : 0.0f;
+	const float Pitch = Params.IsValid() && Params->HasField(TEXT("pitch"))
+		? static_cast<float>(Params->GetNumberField(TEXT("pitch"))) : -30.0f;
+	const float Yaw = Params.IsValid() && Params->HasField(TEXT("yaw"))
+		? static_cast<float>(Params->GetNumberField(TEXT("yaw"))) : 45.0f;
+
+	if (ActorName.IsEmpty() && ClassName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("需要 actor_name 或 class_name 参数"));
+	}
+
+	AActor* TargetActor = nullptr;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!IsValid(Actor)) continue;
+		if (!ActorName.IsEmpty() && Actor->GetName().Contains(ActorName)) { TargetActor = Actor; break; }
+		if (!ClassName.IsEmpty() && Actor->GetClass()->GetName().Contains(ClassName)) { TargetActor = Actor; break; }
+	}
+
+	if (!TargetActor)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("未找到匹配的 Actor: name=%s class=%s"), *ActorName, *ClassName));
+	}
+
+	FVector Origin, Extent;
+	TargetActor->GetActorBounds(false, Origin, Extent);
+	const float MaxExtent = FMath::Max3(Extent.X, Extent.Y, Extent.Z);
+	if (Distance <= 0.0f)
+	{
+		Distance = FMath::Max(MaxExtent * 2.5f, 500.0f);
+	}
+
+	const FRotator LookRotation(Pitch, Yaw, 0.0f);
+	const FVector CameraLocation = Origin + LookRotation.Vector() * -Distance;
+
+	FLevelEditorViewportClient* ViewportClient = Clients[0];
+	ViewportClient->SetViewLocation(CameraLocation);
+	ViewportClient->SetViewRotation(LookRotation);
+	ViewportClient->Tick(0.033f);
+	if (ViewportClient->Viewport)
+	{
+		ViewportClient->Viewport->Invalidate();
+		ViewportClient->Viewport->InvalidateDisplay();
+	}
+	GEditor->RedrawAllViewports(true);
+	FlushRenderingCommands();
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("actor_name"), TargetActor->GetName());
+	Result->SetStringField(TEXT("actor_class"), TargetActor->GetClass()->GetName());
+	TSharedPtr<FJsonObject> OriginObj = MakeShared<FJsonObject>();
+	OriginObj->SetNumberField(TEXT("x"), Origin.X);
+	OriginObj->SetNumberField(TEXT("y"), Origin.Y);
+	OriginObj->SetNumberField(TEXT("z"), Origin.Z);
+	Result->SetObjectField(TEXT("actor_origin"), OriginObj);
+	TSharedPtr<FJsonObject> CameraObj = MakeShared<FJsonObject>();
+	CameraObj->SetNumberField(TEXT("x"), CameraLocation.X);
+	CameraObj->SetNumberField(TEXT("y"), CameraLocation.Y);
+	CameraObj->SetNumberField(TEXT("z"), CameraLocation.Z);
+	Result->SetObjectField(TEXT("camera_location"), CameraObj);
+	Result->SetNumberField(TEXT("distance"), Distance);
+	Result->SetStringField(TEXT("message"), FString::Printf(TEXT("相机已对准 %s"), *TargetActor->GetName()));
 	return FMonolithActionResult::Success(Result);
 }

@@ -93,6 +93,10 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
 	bool bIndexBehaviorTrees = true;
 
+	/** Enable AI deep indexing (BT, BB, EQS, StateTree, SmartObject, Perception, Navigation) */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
+	bool bIndexAI = true;
+
 	/** Enable StateTree indexing (states, tasks, transitions). Requires StateTreeModule. */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
 	bool bIndexStateTrees = true;
