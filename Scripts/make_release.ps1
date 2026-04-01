@@ -21,8 +21,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $PluginDir = Split-Path -Parent $PSScriptRoot
-$ProjectDir = Split-Path -Parent $PluginDir
-$OutputZip = Join-Path (Split-Path -Parent $PluginDir) "Monolith-v$Version.zip"
+$ProjectDir = Split-Path -Parent (Split-Path -Parent $PluginDir)
+$OutputZip = Join-Path $ProjectDir "Monolith-v$Version.zip"
 $TempDir = Join-Path $env:TEMP "Monolith_Release_$Version"
 $UBT = 'C:\Program Files (x86)\UE_5.7\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.exe'
 $UProject = Join-Path $ProjectDir "Leviathan.uproject"
