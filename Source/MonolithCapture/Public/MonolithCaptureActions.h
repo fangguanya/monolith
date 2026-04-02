@@ -9,11 +9,6 @@ class FMonolithCaptureActions
 public:
 	static void RegisterActions();
 
-	// 地图管理
-	static FMonolithActionResult HandleGetCurrentMap(const TSharedPtr<FJsonObject>& Params);
-	static FMonolithActionResult HandleOpenMap(const TSharedPtr<FJsonObject>& Params);
-	static FMonolithActionResult HandleSaveMap(const TSharedPtr<FJsonObject>& Params);
-
 	// 视口截屏
 	static FMonolithActionResult HandleCaptureViewport(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetViewportCamera(const TSharedPtr<FJsonObject>& Params);
@@ -32,11 +27,6 @@ public:
 
 	// 离屏场景截图
 	static FMonolithActionResult HandleCaptureScene(const TSharedPtr<FJsonObject>& Params);
-
-	// Actor 查找与聚焦
-	static FMonolithActionResult HandleFindActorsByClass(const TSharedPtr<FJsonObject>& Params);
-	static FMonolithActionResult HandleSelectAndFocus(const TSharedPtr<FJsonObject>& Params);
-	static FMonolithActionResult HandleFocusActor(const TSharedPtr<FJsonObject>& Params);
 
 private:
 	// 截图辅助
