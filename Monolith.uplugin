@@ -187,6 +187,11 @@
 			"Name": "MonolithCapture",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithBase",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
 		}
 	]
 }
