@@ -1,73 +1,112 @@
 ---
 name: unreal-build
-description: Use when building, compiling, or fixing build errors in Unreal Engine projects. Determines whether to use Live Coding or UBT based on what changed.
+description: "Use when building, compiling, or fixing Unreal build errors in this repository. Contains the fixed Live Coding vs UBT pipeline and avoids discover-first Monolith usage."
 ---
 
-# Unreal Build — Smart Build Decision Guide
+# Unreal Build
 
-## Step 1: Check What Changed
+用于本仓库的 UE 编译、Live Coding、UBT 构建与构建错误排查。
 
-Analyze the files you modified. Classify each change:
+## 覆盖场景
 
-| Change Type | Build Method |
+- 日常编译
+- Live Coding
+- 结构性改动后的完整重编
+- 编译失败后重启编辑器并恢复地图
+
+## 固定 Pipeline
+
+1. 先看改动类型。
+2. 仅 `.cpp` 逻辑改动才优先考虑 Live Coding。
+3. `.h`、`.Build.cs`、`.uplugin`、新增/删除源码文件，统一走完整 UBT。
+4. 不要先 `monolith_discover()`；`editor` 的构建动作是已知面。
+
+## 改动类型判定
+
+| 改动 | 构建方式 |
 |---|---|
-| `.cpp` body changes only | Live Coding |
-| `.h` modified (members, layout, macros) | UBT (editor must close) |
-| `.h` added | UBT (editor must close) |
-| `.cpp` added | UBT (editor must close) |
-| `.cpp` deleted | UBT (editor must close) |
-| `.Build.cs` changed | UBT (editor must close) |
-| `.uplugin` changed | UBT (editor must close) |
+| 仅 `.cpp` 函数体 | Live Coding |
+| 修改 `.h` | UBT |
+| 新增 `.cpp` / `.h` | UBT |
+| 删除 `.cpp` / `.h` | UBT |
+| 修改 `.Build.cs` | UBT |
+| 修改 `.uplugin` | UBT |
 
-**Rule: If ANY file requires UBT, the whole build requires UBT.**
+规则：只要命中一条 UBT 条件，就整次构建都按 UBT 处理。
 
-## Step 2: Check Editor Status
+## Live Coding Pipeline
 
-Try calling Monolith MCP: `editor_query({action: 'get_build_status'})` or `monolith_status()`.
-
-- **MCP responds** → Editor is running
-- **MCP fails/timeout** → Editor is closed
-
-## Step 3: Execute Build
-
-### Live Coding Path (editor open + .cpp-only changes)
-
-1. Call `editor_query({ action: "trigger_build" })` via MCP
-2. Wait ~10 seconds for compilation
-3. Call `editor_query({ action: "get_compile_output" })` to check result
-4. If errors: call `editor_query({ action: "get_build_errors", params: { compile_only: true } })`
-
-### UBT Path (editor closed OR header/new-file/Build.cs changes)
-
-**If editor is open and UBT is needed:**
-> Tell the user: "Header/structural changes detected — Live Coding can't handle these. Please close the editor so I can run a full UBT build, then reopen after."
->
-> Do NOT attempt UBT while editor is running. You will get: `"Unable to build while Live Coding is active"`
-
-**When editor is confirmed closed, run:**
-
-```bash
-'C:\Program Files (x86)\UE_5.7\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.exe' LeviathanEditor Win64 Development '-Project=D:\Unreal Projects\Leviathan\Leviathan.uproject' -waitmutex
+```text
+1. editor_query({ action: "get_build_status", params: {} })
+2. editor_query({ action: "trigger_build", params: {} })
+3. 等待 10 秒，或轮询 get_build_status
+4. editor_query({ action: "get_compile_output", params: {} })
+5. 失败时再调 editor_query({ action: "get_build_errors", params: { compile_only: true } })
 ```
 
-> **IMPORTANT:** Use single quotes around the UBT path — bash can't handle `(x86)` in parentheses unquoted. Do NOT use `Build.bat`.
+## UBT Pipeline
 
-Check exit code: `0` = success, non-zero = failure. On failure, grep output for `error` lines.
+```text
+1. 关闭编辑器
+2. 运行项目标准 Build.bat / UBT 命令
+3. 读取终端输出
+4. 如需交叉验证，再看 get_compile_output / get_build_errors
+```
 
-## Decision Matrix (Quick Reference)
+本仓库路径约定（所有路径均相对于 repo 根目录 `<repo_root>`）：
 
-| Editor | Changes | Action |
-|--------|---------|--------|
-| Open | .cpp only | `editor_query("trigger_build")` via MCP |
-| Open | .h / new files / Build.cs | Ask user to close editor → UBT |
-| Open | .uplugin | Ask user to close editor → UBT |
-| Closed | Any | Run UBT directly |
+| 变量 | 相对路径 |
+|---|---|
+| Engine Build.bat | `Engine/Build/BatchFiles/Build.bat` |
+| UnrealEditor | `Engine/Binaries/Win64/UnrealEditor.exe` |
+| 客户端项目 | `Client/CitySample.uproject` |
+| Editor Target | `CitySampleEditor` |
+| Autosaves | `Client/Saved/Autosaves/` |
 
-## Live Coding Gotchas
+本仓库常用命令（`<repo_root>` 在运行时解析为工作区绝对路径）：
 
-- **Header changes** (new members, class layout, UCLASS/USTRUCT) → requires editor restart + full UBT build
-- **New .cpp files** are NOT picked up by Live Coding — UBT required
-- **Deleted files** are NOT handled by Live Coding — UBT required
-- After triggering Live Coding, **wait ~10s** before checking compile result
-- `"Unable to build while Live Coding is active"` → use `editor_query("trigger_build")` instead of UBT, or close editor first
-- When in doubt, close editor and use UBT — it always works
+```powershell
+& "<repo_root>/Engine/Build/BatchFiles/Build.bat" CitySampleEditor Win64 Development "<repo_root>/Client/CitySample.uproject" -WaitMutex
+```
+
+编辑器重启命令（自动跳过 Restore Packages 对话框）：
+
+```powershell
+Start-Process -FilePath '<repo_root>\Engine\Binaries\Win64\UnrealEditor.exe' -ArgumentList '<repo_root>\Client\CitySample.uproject','-SkipRestorePackageBackup'
+```
+
+启动前先清理 autosave 避免 Restore 弹窗：
+
+```powershell
+Remove-Item -Recurse -Force "<repo_root>/Client/Saved/Autosaves/" -ErrorAction SilentlyContinue
+```
+
+## 编译并恢复编辑器 Pipeline
+
+```text
+1. monolith_status() 检查编辑器是否在线
+2. 若在线，先 editor_world_query(get_current_map) 记录当前地图
+3. 判断是 Live Coding 还是完整 UBT
+4. Live Coding 成功则结束
+5. 若需 UBT：关闭编辑器，执行 Build.bat
+6. Build 成功后启动 UnrealEditor.exe
+7. 轮询 monolith_status() 直到编辑器恢复
+8. 若之前记录了地图，调用 editor_world_query(open_map) 恢复
+9. 用 monolith_discover() 或 monolith_status() 确认 namespace 正常注册
+```
+
+## 快速分诊
+
+| 场景 | 下一步 |
+|---|---|
+| `.cpp` only 且编辑器开着 | `trigger_build` |
+| `.h` / `.Build.cs` / `.uplugin` 改了 | 关闭编辑器，跑 UBT |
+| 输出不清楚 | `get_compile_output` |
+| 编译错误很多 | `get_build_errors(compile_only=true)` |
+| linker / include 错误 | 切到 `unreal-cpp` skill |
+
+## 不要做的事
+
+- 不要在编辑器开着且 Live Coding 激活时强跑 UBT。
+- 不要把结构性改动交给 Live Coding。
+- 不要先 discover 再 build。
