@@ -5,7 +5,7 @@ description: Use when capturing screenshots or previews of Unreal Engine assets 
 
 # Unreal Capture Workflows
 
-You have access to **Monolith** with **13 capture actions** across 4 categories via the `capture` namespace.
+You have access to **Monolith** with **16 capture actions** across 5 categories via the `capture` namespace.
 
 ## Discovery
 
@@ -64,6 +64,14 @@ monolith_discover({ namespace: "capture" })
 | `capture_widget` | asset_path, resolution?, output_path? | WidgetBlueprint 设计器预览截图 |
 | `capture_sequence_frames` | asset_path, asset_type, timestamps, show_bones?, camera?, resolution?, output_dir?, filename_prefix? | 对支持时间轴的资产进行多帧序列截图（niagara / animation） |
 
+### Actor 查找与聚焦 (3)
+
+| Action | Key Params | Purpose |
+|--------|-----------|---------|
+| `find_actors_by_class` | class_name?, limit? | 按类名查找当前地图中的 Actor，返回名称、位置、包围盒 |
+| `select_and_focus` | actor_name?, class_name? | 选中 Actor 并将编辑器相机聚焦到它 |
+| `focus_actor` | actor_name?, class_name?, distance?, pitch?, yaw? | 将相机精确对准指定 Actor，支持自定义相机参数 |
+
 ## Common Workflows
 
 ### 视口截图归档
@@ -103,7 +111,7 @@ capture_query({ action: "capture_animation", params: {
   asset_path: "/Game/Animations/Idle",
   timestamps: [0.0, 0.5, 1.0, 1.5],
   show_bones: true,
-  output_dir: "E:/CityGenerator/Saved/Screenshots/AnimFrames"
+  output_dir: "<repo_root>/Client/Saved/Screenshots/AnimFrames"
 }})
 
 # 或使用通用 capture_sequence_frames
@@ -112,4 +120,17 @@ capture_query({ action: "capture_sequence_frames", params: {
   asset_type: "niagara",
   timestamps: [0.0, 0.5, 1.0, 2.0, 3.0]
 }})
+```
+
+### Actor 查找与聚焦截图
+```
+# 1. 查找场景中的特定类型 Actor
+capture_query({ action: "find_actors_by_class", params: { class_name: "StaticMeshActor", limit: 20 }})
+
+# 2. 选中并聚焦到目标 Actor
+capture_query({ action: "select_and_focus", params: { actor_name: "MyBuilding_01" }})
+
+# 3. 精确控制相机对准 Actor 并截图
+capture_query({ action: "focus_actor", params: { actor_name: "MyBuilding_01", distance: 2000, pitch: -30, yaw: 45 }})
+capture_query({ action: "capture_viewport", params: { run_id: "building-review" }})
 ```
