@@ -926,6 +926,13 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureViewport(const TShar
 		return FMonolithActionResult::Error(TEXT("没有可用的视口客户端"));
 	}
 
+	// 强制开启实时渲染（确保后台也能刷新帧）
+	const bool bWasRealtime = CaptureViewportClient->IsRealtime();
+	if (!bWasRealtime)
+	{
+		CaptureViewportClient->SetRealtime(true);
+	}
+
 	// 设置相机
 	if (Params.IsValid())
 	{
@@ -981,12 +988,24 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureViewport(const TShar
 		return FMonolithActionResult::Error(TEXT("视口尺寸为零"));
 	}
 
-	// 多帧 Tick 确保资源加载完成
-	for (int32 i = 0; i < 8; ++i)
+	// 强制重绘：先 Invalidate，再用 Draw() 直接触发渲染
+	CaptureViewportClient->Invalidate();
+	if (Viewport)
+	{
+		Viewport->InvalidateDisplay();
+	}
+	// 用 Tick 推进引擎状态，然后 Draw() 强制渲染
+	for (int32 i = 0; i < 4; ++i)
 	{
 		FSlateApplication::Get().Tick();
 		CaptureViewportClient->Tick(0.033f);
-		GEditor->RedrawAllViewports(true);
+	}
+	// 直接调用 Draw 强制渲染新帧到 backbuffer
+	if (Viewport)
+	{
+		Viewport->Draw(false);
+		FlushRenderingCommands();
+		Viewport->Draw(true);
 		FlushRenderingCommands();
 	}
 
