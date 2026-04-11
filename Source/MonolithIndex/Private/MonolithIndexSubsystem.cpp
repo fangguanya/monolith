@@ -392,6 +392,9 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	RegistryEvent->Wait();
 	FPlatformProcess::ReturnSynchEventToPool(RegistryEvent);
 
+	// 临时关闭
+	AllAssets.Empty();
+
 	TotalAssets = AllAssets.Num();
 	Owner->IndexingStatusMessage = FString::Printf(TEXT("Scanning %d assets..."), TotalAssets.Load());
 	UE_LOG(LogMonolithIndex, Log, TEXT("Indexing %d assets..."), TotalAssets.Load());
@@ -664,6 +667,7 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 		}
 		IndexedPaths.Add(FName(*CleanPath));
 	}
+
 	// Add user-configured additional content paths
 	{
 		const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
@@ -687,7 +691,8 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// Run dependency indexer on game thread (Asset Registry requires it)
 	Owner->IndexingStatusMessage = TEXT("Analyzing dependencies...");
 	TSharedPtr<IMonolithIndexer>* DepIndexer = Owner->ClassToIndexer.Find(TEXT("__Dependencies__"));
-	if (DepIndexer && DepIndexer->IsValid())
+	// 临时关闭
+	if (false && DepIndexer && DepIndexer->IsValid())
 	{
 		double SentinelStart = FPlatformTime::Seconds();
 		UE_LOG(LogMonolithIndex, Log, TEXT("Running dependency indexer..."));
@@ -713,7 +718,8 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// Run level indexer on game thread (asset loading requires it)
 	Owner->IndexingStatusMessage = TEXT("Indexing level actors...");
 	TSharedPtr<IMonolithIndexer>* LevelIndexer = Owner->ClassToIndexer.Find(TEXT("__Levels__"));
-	if (LevelIndexer && LevelIndexer->IsValid())
+	// 临时关闭
+	if (false && LevelIndexer && LevelIndexer->IsValid())
 	{
 		double SentinelStart = FPlatformTime::Seconds();
 		UE_LOG(LogMonolithIndex, Log, TEXT("Running level indexer..."));
@@ -739,7 +745,8 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// Run DataTable indexer on game thread (requires asset loading)
 	Owner->IndexingStatusMessage = TEXT("Indexing DataTable rows...");
 	TSharedPtr<IMonolithIndexer>* DTIndexer = Owner->ClassToIndexer.Find(TEXT("__DataTables__"));
-	if (DTIndexer && DTIndexer->IsValid())
+	// 临时关闭
+	if (false && DTIndexer && DTIndexer->IsValid())
 	{
 		double SentinelStart = FPlatformTime::Seconds();
 		UE_LOG(LogMonolithIndex, Log, TEXT("Running DataTable indexer..."));
@@ -789,7 +796,8 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// Run animation indexer on game thread (asset loading requires it)
 	Owner->IndexingStatusMessage = TEXT("Indexing animations...");
 	TSharedPtr<IMonolithIndexer>* AnimIndexer = Owner->ClassToIndexer.Find(TEXT("__Animations__"));
-	if (AnimIndexer && AnimIndexer->IsValid())
+	// 临时关闭
+	if (false && AnimIndexer && AnimIndexer->IsValid())
 	{
 		double SentinelStart = FPlatformTime::Seconds();
 		UE_LOG(LogMonolithIndex, Log, TEXT("Running animation indexer..."));
@@ -811,7 +819,8 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// Run gameplay tag indexer on game thread (GameplayTagsManager requires it)
 	Owner->IndexingStatusMessage = TEXT("Indexing gameplay tags...");
 	TSharedPtr<IMonolithIndexer>* TagIndexer = Owner->ClassToIndexer.Find(TEXT("__GameplayTags__"));
-	if (TagIndexer && TagIndexer->IsValid())
+	// 临时关闭
+	if (false && TagIndexer && TagIndexer->IsValid())
 	{
 		double SentinelStart = FPlatformTime::Seconds();
 		UE_LOG(LogMonolithIndex, Log, TEXT("Running gameplay tag indexer..."));
@@ -833,7 +842,8 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// Run Niagara indexer on game thread (requires asset loading)
 	Owner->IndexingStatusMessage = TEXT("Indexing Niagara systems...");
 	TSharedPtr<IMonolithIndexer>* NiagaraIndexerPtr = Owner->ClassToIndexer.Find(TEXT("__Niagara__"));
-	if (NiagaraIndexerPtr && NiagaraIndexerPtr->IsValid())
+	// 临时关闭
+	if (false && NiagaraIndexerPtr && NiagaraIndexerPtr->IsValid())
 	{
 		double SentinelStart = FPlatformTime::Seconds();
 		UE_LOG(LogMonolithIndex, Log, TEXT("Running Niagara indexer..."));
@@ -855,7 +865,8 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// Run mesh catalog indexer on game thread (requires asset loading)
 	Owner->IndexingStatusMessage = TEXT("Building mesh catalog...");
 	TSharedPtr<IMonolithIndexer>* MeshCatIndexer = Owner->ClassToIndexer.Find(TEXT("__MeshCatalog__"));
-	if (MeshCatIndexer && MeshCatIndexer->IsValid())
+	// 临时关闭
+	if (false && MeshCatIndexer && MeshCatIndexer->IsValid())
 	{
 		double SentinelStart = FPlatformTime::Seconds();
 		UE_LOG(LogMonolithIndex, Log, TEXT("Running mesh catalog indexer..."));
@@ -999,6 +1010,9 @@ void UMonolithIndexSubsystem::StartIncrementalIndex()
 				ValidPrefixes.Add(CustomPath);
 		}
 	}
+
+	// 临时关闭
+	ValidPrefixes.Empty();
 
 	AR.EnumerateAllPackages([&](FName PackageName, const FAssetPackageData& PkgData)
 	{
@@ -1362,6 +1376,9 @@ void UMonolithIndexSubsystem::ProcessPendingChanges()
 
 	TArray<FPendingIndexChange> RawChanges = MoveTemp(PendingChanges);
 	PendingChanges.Reset();
+
+	// 临时关闭
+	RawChanges.Empty();
 
 	if (!Database || !Database->IsOpen()) return;
 
