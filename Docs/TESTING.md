@@ -1,6 +1,6 @@
 # Monolith — Testing Reference
 
-Last updated: 2026-04-04
+Last updated: 2026-04-08
 
 ---
 
@@ -59,7 +59,66 @@ All 15 modules tested or compiled. Total plugin: 1126 actions (1081 active by de
 
 2026-03-30: Procedural Town Generator marked **EXPERIMENTAL** — `bEnableProceduralTownGen = false` by default. 45 town gen actions not registered unless explicitly enabled. Fix Plan v5 applied (7 fixes) but fundamental geometry issues remain (wall misalignment, room separation). Town gen test status: **FAIL** (geometry). Core mesh actions (197) unaffected.
 
+2026-04-08: MonolithAudio Phase 0-2 full test pass — 28/28 PASS. 81 actions (CRUD 15, Query 10, Batch 10, SoundCue 21, MetaSound 25). 5 bugs found+fixed. Key: InsertChildNode crash fix, PagedGraphs read fix, short path normalization. All crown jewels operational: `build_sound_cue_from_spec`, `build_metasound_from_spec`, `apply_audio_template`, `preview_sound`. 63 actions remain untested (lower priority).
+
 2026-03-30: MonolithGAS full test pass — 53/53 PASS, 0 FAIL. 12 bugs found and fixed (8 git commits). Key fixes: IGameplayTagsEditorModule, EnsureAssetPathFree, BS_BeingCreated suppression, AR pre-filter, GAS deep indexer. PIE runtime tests passing. 2026-03-28: Fix Plan v2 — 20 fixes across 3 phases + `validate_building` action. Stair/fire escape/ramp angle fixes, floor plan corridor/door/entrance guarantees, building_context on arch features. 2026-03-28: Procedural Town Generator — 45 new actions across 11 sub-projects. Compilation verified, runtime testing shows geometry failures. 2026-03-27: MonolithMesh module — 46 new actions (443→489 total). Compilation verified, basic MCP registration verified. 2026-03-25: Niagara expansion — 31 new actions (65→96 niagara, 349→443 total). 40/40 PASS, 3 SKIPPED, 3 bugs found and fixed during testing (type fallback warning, spawn shape duplicate, NPC namespace mismatch). Also 9 new material function actions (48→57 mat). Polish pass 2026-03-14 added 4 Niagara actions + get_system_property (213→218). 2026-03-15: HLSL module/function creation tested end-to-end (CPU + GPU), 3 bugs fixed (input exposure, dot validation, numeric index lookup). 2026-03-17: Blueprint module waves 2-7 full test pass (48/48 + 17 retests). 21 bugs found and fixed during testing session. Total actions now 278. 2026-03-17: Material module full test pass (44/44 + 11 retests). 11 bugs found and fixed. 2026-03-18: Niagara module full test pass (37/37 + 8 retests). 16 bugs found and fixed. 2026-03-18: Animation Wave 8-10 full test pass (33/33 + 4 retests). 12 bugs found and fixed. 2026-03-22: MonolithUI module full test pass (42/42). All 8 action classes verified.
+
+---
+
+## MonolithAudio — Phase 0-2 Full Test Pass (2026-04-08)
+
+**28/28 PASS, 0 FAIL.** 81 actions across 3 phases. 5 bugs found and fixed during testing.
+
+### Test Results
+
+| # | Action | Result | Notes |
+|---|--------|--------|-------|
+| 1 | `create_sound_attenuation` | **PASS** | FalloffDistance=2000, bSpatialize=true |
+| 2 | `get_attenuation_settings` | **PASS** | Short path fix verified — 50+ fields returned |
+| 3 | `set_attenuation_settings` | **PASS** | FalloffDistance 2000→5000, bEnableOcclusion toggled |
+| 4 | `create_sound_class` | **PASS** | Volume=0.8, hierarchy support |
+| 5 | `create_sound_concurrency` | **PASS** | MaxCount=4, ResolutionRule=StopOldest |
+| 6 | `create_sound_submix` | **PASS** | Empty chain, no parent |
+| 7 | `create_sound_mix` | **PASS** | 4-band EQ with custom FrequencyCenter/Gain |
+| 8 | `list_audio_assets` | **PASS** | SoundWave type filter, path_filter, limit |
+| 9 | `search_audio_assets` | **PASS** | "footstep" → 5 results (path+name matching) |
+| 10 | `get_sound_wave_info` | **PASS** | Duration, channels, sample rate, compression |
+| 11 | `get_sound_class_hierarchy` | **PASS** | 8 root classes, recursive children |
+| 12 | `get_audio_stats` | **PASS** | 3,405 assets (1940 SW, 1405 SC, 32 MS) |
+| 13 | `find_audio_references` | **PASS** | Found CUE referencing WAV |
+| 14 | `find_sounds_without_class` | **PASS** | Found test assets with null SoundClass |
+| 15 | `apply_audio_template` | **PASS** | 2 assets, class+attenuation applied |
+| 16 | `list_sound_cue_node_types` | **PASS** | 22/22 types with max_children |
+| 17 | `create_random_sound_cue` | **PASS** | 3 waves, weights [1,1,0.5], no crash |
+| 18 | `get_sound_cue_graph` | **PASS** | 4 nodes, 3 connections, full property readback |
+| 19 | `build_sound_cue_from_spec` | **PASS** | 2 nodes (Random+Modulator), 1 connection |
+| 20 | `validate_sound_cue` | **PASS** | Caught null FirstNode on broken cue |
+| 21 | `preview_sound` | **PASS** | Audio played in editor (0.31s duration) |
+| 22 | `delete_audio_asset` | **PASS** | Deleted test Sound Cue |
+| 23 | `create_metasound_source` | **PASS** | Mono, one-shot, 1 audio output |
+| 24 | `list_available_metasound_nodes` | **PASS** | Sine oscillator: 8 inputs, 1 output |
+| 25 | `add_metasound_node` | **PASS** | Sine node added, handle + vertex IDs returned |
+| 26 | `build_metasound_from_spec` | **PASS** | Sine→Multiply, Freq input, Audio:0 output |
+| 27 | `get_metasound_graph` | **PASS** | 7 nodes, 3 edges — full topology visible |
+| 28 | `create_oneshot_sfx` | **PASS** | MetaSound template with WavePlayer |
+
+### Bugs Found & Fixed
+
+| # | Severity | Bug | Fix | Commit |
+|---|----------|-----|-----|--------|
+| 1 | CRITICAL | `create_random_sound_cue` crash — InputPins/ChildNodes assertion | `InsertChildNode()` instead of `SetChildNodes()` (6 sites) | dv.commit.126 |
+| 2 | Medium | Short path loading fails without `.AssetName` suffix | Path normalization in `LoadAudioAsset` | dv.commit.126 |
+| 3 | Medium | `search_audio_assets` returns 0 — only matched asset name | Match against both name AND full path | dv.commit.126 |
+| 4 | Medium | MetaSound builder doc not readable via Cast | `GetConstBuilder().GetConstDocumentChecked()` | dv.commit.126 |
+| 5 | Medium | MetaSound graph read shows 0 nodes — deprecated `RootGraph.Graph` | `GetConstDefaultGraph()` for PagedGraphs | dv.commit.128 |
+
+### Untested Actions (63 remaining — not blocked, lower priority)
+
+Phase 0 not yet tested: `get_sound_class_properties`, `set_sound_class_properties`, `get_sound_mix_settings`, `set_sound_mix_settings`, `get_concurrency_settings`, `set_concurrency_settings`, `get_submix_properties`, `set_submix_properties`, `get_submix_hierarchy`, `find_unused_audio`, `find_unattenuated_sounds`, `batch_assign_sound_class`, `batch_assign_attenuation`, `batch_set_compression`, `batch_set_submix`, `batch_set_concurrency`, `batch_set_looping`, `batch_set_virtualization`, `batch_rename_audio`, `batch_set_sound_wave_properties`.
+
+Phase 1 not yet tested: `add_sound_cue_node`, `remove_sound_cue_node`, `connect_sound_cue_nodes`, `set_sound_cue_first_node`, `set_sound_cue_node_property`, `find_sound_waves_in_cue`, `create_layered_sound_cue`, `create_looping_ambient_cue`, `create_distance_crossfade_cue`, `create_switch_sound_cue`, `duplicate_sound_cue`, `stop_preview`, `get_sound_cue_duration`.
+
+Phase 2 not yet tested: `create_metasound_patch`, `remove_metasound_node`, `connect_metasound_nodes`, `disconnect_metasound_nodes`, `add_metasound_input`, `add_metasound_output`, `set_metasound_input_default`, `add_metasound_interface`, `list_metasound_connections`, `get_metasound_node_info`, `find_metasound_node_inputs`, `find_metasound_node_outputs`, `get_metasound_input_names`, `create_metasound_preset`, `create_looping_ambient_metasound`, `create_synthesized_tone`, `create_interactive_metasound`, `add_metasound_variable`, `set_metasound_node_location`.
 
 ---
 
@@ -667,6 +726,7 @@ All 8/8 PASS. Tested 2026-03-28.
 | 2026-03-14 | Niagara polish pass: set_system_property, set_static_switch_value, list_module_scripts, list_renderer_properties, get_system_property + DI prefix fix, curve readback fix, BP node alias fix | **7/7 PASS** | 213→218 actions. All prior actions still PASS. |
 | 2026-03-13 | Infrastructure: registry param validation, Niagara aliases, material PostEditChange fixes, tools/list schemas | **6 fixes** | All 213 actions still PASS. Behavioral improvements — no regressions |
 | 2026-03-13 | Niagara get_system_diagnostics + SimTarget/CalculateBoundsMode + 4 bug fixes | **8/8 PASS** | False DataMissing, add_emitter loading, create_system_from_spec save_path, create_system template — all fixed |
+| 2026-04-08 | MonolithAudio Phase 0-2 | **28/28 PASS** | 81 actions (CRUD 15, Query 10, Batch 10, SoundCue 21, MetaSound 25). 5 bugs found+fixed: (1) CRITICAL random cue crash — InsertChildNode fix, (2) short path normalization, (3) search matching path+name, (4) MetaSound builder doc read, (5) PagedGraphs vs deprecated Graph field. All APIs source-verified. |
 | 2026-03-13 | Bug fix verification | **3/3 PASS** | `add_component` name fix, `create_blueprint` crash guard, `set_module_input_value` data input fix. |
 | 2026-03-13 | Blueprint full pass | **46/46 PASS** | 6→46 actions. `remove_local_variable` bug fixed. 3 deprecation fixes. All tested via MCP. |
 | 2026-03-13 | Core params fix | PASS | Claude Code string-params bug fixed. `project_query("search")` now works from Claude Code. |

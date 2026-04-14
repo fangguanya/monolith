@@ -193,6 +193,11 @@ public:
 			  ToolTip="Registers inventory_query actions for InventorySystemX integration (items, equipment, storage, crafting, runtime PIE, AI, accessibility)."))
 	bool bEnableInventorySystemX = true;
 
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Audio Module",
+			  ToolTip="Registers audio_query actions for audio asset creation, inspection, batch management, Sound Cue graph building, and MetaSound graph building."))
+	bool bEnableAudio = true;
+
 	// --- Modules|Mesh ---
 
 	UPROPERTY(config, EditAnywhere, Category="Modules|Mesh",
