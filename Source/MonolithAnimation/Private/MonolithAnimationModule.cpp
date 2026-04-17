@@ -1,9 +1,10 @@
-#include "MonolithAnimationModule.h"
+﻿#include "MonolithAnimationModule.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithAnimationActions.h"
 #include "MonolithPoseSearchActions.h"
 #include "MonolithControlRigWriteActions.h"
 #include "MonolithAbpWriteActions.h"
+#include "MonolithAbpDumpActions.h"
 #include "MonolithAnimLayoutActions.h"
 #include "MonolithToolRegistry.h"
 
@@ -15,8 +16,9 @@ void FMonolithAnimationModule::StartupModule()
 	FMonolithPoseSearchActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithControlRigWriteActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithAbpDumpActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithAnimLayoutActions::RegisterActions(FMonolithToolRegistry::Get());
-	UE_LOG(LogMonolith, Verbose, TEXT("Monolith — Animation module loaded (81 actions)"));
+	UE_LOG(LogMonolith, Verbose, TEXT("Monolith — Animation module loaded (83 actions)"));
 }
 
 void FMonolithAnimationModule::ShutdownModule()

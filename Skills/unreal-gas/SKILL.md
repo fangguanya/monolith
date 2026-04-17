@@ -1,4 +1,4 @@
----
+﻿---
 name: unreal-gas
 description: Use when working with Unreal Engine Gameplay Ability System (GAS) via Monolith MCP — creating and editing abilities, attribute sets, gameplay effects, ASC setup, gameplay tags, gameplay cues, targeting, input binding, runtime inspection, and project scaffolding. Triggers on GAS, ability, attribute, gameplay effect, gameplay tag, gameplay cue, ASC, ability system, cooldown, modifier, stacking, ability task.
 ---

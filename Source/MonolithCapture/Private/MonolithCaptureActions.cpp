@@ -1,4 +1,4 @@
-#include "MonolithCaptureActions.h"
+﻿#include "MonolithCaptureActions.h"
 #include "MonolithCaptureModule.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
@@ -14,6 +14,8 @@
 #include "IAssetViewport.h"
 #include "Framework/Application/SlateApplication.h"
 #include "UnrealClient.h"
+#include "Engine/GameViewportClient.h"
+#include "Engine/GameInstance.h"
 
 // 截屏
 #include "Components/SceneCaptureComponent2D.h"
@@ -47,6 +49,185 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 
+namespace
+{
+	bool TryReadVector(const TSharedPtr<FJsonObject>& Parent, const FString& FieldName, FVector& OutVector)
+	{
+		if (!Parent.IsValid() || !Parent->HasField(FieldName))
+		{
+			return false;
+		}
+
+		if (const TSharedPtr<FJsonObject>* VectorObject = nullptr;
+			Parent->TryGetObjectField(FieldName, VectorObject) && VectorObject && (*VectorObject).IsValid())
+		{
+			OutVector.X = (*VectorObject)->GetNumberField(TEXT("x"));
+			OutVector.Y = (*VectorObject)->GetNumberField(TEXT("y"));
+			OutVector.Z = (*VectorObject)->GetNumberField(TEXT("z"));
+			return true;
+		}
+
+		if (const TArray<TSharedPtr<FJsonValue>>* VectorArray = nullptr;
+			Parent->TryGetArrayField(FieldName, VectorArray) && VectorArray && VectorArray->Num() >= 3)
+		{
+			OutVector.X = (*VectorArray)[0]->AsNumber();
+			OutVector.Y = (*VectorArray)[1]->AsNumber();
+			OutVector.Z = (*VectorArray)[2]->AsNumber();
+			return true;
+		}
+
+		return false;
+	}
+
+	bool TryReadRotator(const TSharedPtr<FJsonObject>& Parent, const FString& FieldName, FRotator& OutRotator)
+	{
+		if (!Parent.IsValid() || !Parent->HasField(FieldName))
+		{
+			return false;
+		}
+
+		if (const TSharedPtr<FJsonObject>* RotatorObject = nullptr;
+			Parent->TryGetObjectField(FieldName, RotatorObject) && RotatorObject && (*RotatorObject).IsValid())
+		{
+			OutRotator.Pitch = (*RotatorObject)->GetNumberField(TEXT("pitch"));
+			OutRotator.Yaw = (*RotatorObject)->GetNumberField(TEXT("yaw"));
+			OutRotator.Roll = (*RotatorObject)->GetNumberField(TEXT("roll"));
+			return true;
+		}
+
+		if (const TArray<TSharedPtr<FJsonValue>>* RotatorArray = nullptr;
+			Parent->TryGetArrayField(FieldName, RotatorArray) && RotatorArray && RotatorArray->Num() >= 3)
+		{
+			OutRotator.Pitch = (*RotatorArray)[0]->AsNumber();
+			OutRotator.Yaw = (*RotatorArray)[1]->AsNumber();
+			OutRotator.Roll = (*RotatorArray)[2]->AsNumber();
+			return true;
+		}
+
+		return false;
+	}
+
+	FLevelEditorViewportClient* ResolveTargetLevelViewportClient(FViewport*& OutViewport)
+	{
+		OutViewport = nullptr;
+		if (!GEditor)
+		{
+			return nullptr;
+		}
+
+		if (FLevelEditorModule* LevelEditor = FModuleManager::GetModulePtr<FLevelEditorModule>(TEXT("LevelEditor")))
+		{
+			TSharedPtr<IAssetViewport> ActiveViewport = LevelEditor->GetFirstActiveViewport();
+			if (!ActiveViewport.IsValid())
+			{
+				if (TSharedPtr<FTabManager> TabManager = LevelEditor->GetLevelEditorTabManager())
+				{
+					TabManager->TryInvokeTab(FTabId(TEXT("LevelEditorViewport")));
+					for (int32 i = 0; i < 5; ++i)
+					{
+						FSlateApplication::Get().Tick();
+					}
+					ActiveViewport = LevelEditor->GetFirstActiveViewport();
+				}
+			}
+
+			if (ActiveViewport.IsValid())
+			{
+				OutViewport = ActiveViewport->GetActiveViewport();
+			}
+		}
+
+		FLevelEditorViewportClient* Result = nullptr;
+		const TArray<FLevelEditorViewportClient*>& ViewportClients = GEditor->GetLevelViewportClients();
+		if (OutViewport)
+		{
+			for (FLevelEditorViewportClient* ViewportClient : ViewportClients)
+			{
+				if (ViewportClient && ViewportClient->Viewport == OutViewport)
+				{
+					Result = ViewportClient;
+					break;
+				}
+			}
+		}
+
+		if (!Result)
+		{
+			for (FLevelEditorViewportClient* ViewportClient : ViewportClients)
+			{
+				if (!ViewportClient) continue;
+				Result = ViewportClient;
+				if (ViewportClient->Viewport)
+				{
+					OutViewport = ViewportClient->Viewport;
+				}
+				break;
+			}
+		}
+
+		return Result;
+	}
+
+	void RefreshLevelViewportClient(FLevelEditorViewportClient* ViewportClient, FViewport* Viewport)
+	{
+		if (!ViewportClient)
+		{
+			return;
+		}
+
+		const bool bWasRealtime = ViewportClient->IsRealtime();
+		if (!bWasRealtime)
+		{
+			ViewportClient->SetRealtime(true);
+		}
+
+		ViewportClient->Invalidate();
+		if (Viewport)
+		{
+			Viewport->Invalidate();
+			Viewport->InvalidateDisplay();
+		}
+
+		for (int32 i = 0; i < 4; ++i)
+		{
+			FSlateApplication::Get().Tick();
+			ViewportClient->Tick(0.033f);
+		}
+
+		GEditor->RedrawAllViewports(true);
+		if (Viewport)
+		{
+			Viewport->Draw(false);
+			FlushRenderingCommands();
+			Viewport->Draw(true);
+			FlushRenderingCommands();
+		}
+
+		if (!bWasRealtime)
+		{
+			ViewportClient->SetRealtime(false);
+		}
+	}
+
+	TSharedPtr<FJsonObject> MakeVectorJson(const FVector& Value)
+	{
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetNumberField(TEXT("x"), Value.X);
+		Result->SetNumberField(TEXT("y"), Value.Y);
+		Result->SetNumberField(TEXT("z"), Value.Z);
+		return Result;
+	}
+
+	TSharedPtr<FJsonObject> MakeRotatorJson(const FRotator& Value)
+	{
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetNumberField(TEXT("pitch"), Value.Pitch);
+		Result->SetNumberField(TEXT("yaw"), Value.Yaw);
+		Result->SetNumberField(TEXT("roll"), Value.Roll);
+		return Result;
+	}
+}
+
 // ===== 参数解析辅助 =====
 
 void FMonolithCaptureActions::ParseCameraParams(
@@ -57,12 +238,15 @@ void FMonolithCaptureActions::ParseCameraParams(
 	OutRotation = FRotator(0.0f, 180.0f, 0.0f);
 	OutFOV = 60.0f;
 
-	if (!Params->HasField(TEXT("camera"))) return;
+	if (!Params.IsValid())
+	{
+		return;
+	}
 
 	const TSharedPtr<FJsonObject>* CameraObj = nullptr;
 	TSharedPtr<FJsonObject> ParsedCamera;
 
-	if (!Params->TryGetObjectField(TEXT("camera"), CameraObj))
+	if (Params->HasField(TEXT("camera")) && !Params->TryGetObjectField(TEXT("camera"), CameraObj))
 	{
 		FString CameraStr = Params->GetStringField(TEXT("camera"));
 		if (!CameraStr.IsEmpty())
@@ -74,22 +258,19 @@ void FMonolithCaptureActions::ParseCameraParams(
 
 	if (CameraObj && (*CameraObj).IsValid())
 	{
-		if ((*CameraObj)->HasField(TEXT("location")))
-		{
-			const TArray<TSharedPtr<FJsonValue>>& Loc = (*CameraObj)->GetArrayField(TEXT("location"));
-			if (Loc.Num() >= 3)
-				OutLocation = FVector(Loc[0]->AsNumber(), Loc[1]->AsNumber(), Loc[2]->AsNumber());
-		}
-		if ((*CameraObj)->HasField(TEXT("rotation")))
-		{
-			const TArray<TSharedPtr<FJsonValue>>& Rot = (*CameraObj)->GetArrayField(TEXT("rotation"));
-			if (Rot.Num() >= 3)
-				OutRotation = FRotator(Rot[0]->AsNumber(), Rot[1]->AsNumber(), Rot[2]->AsNumber());
-		}
+		TryReadVector(*CameraObj, TEXT("location"), OutLocation);
+		TryReadRotator(*CameraObj, TEXT("rotation"), OutRotation);
 		if ((*CameraObj)->HasField(TEXT("fov")))
 		{
 			OutFOV = (float)(*CameraObj)->GetNumberField(TEXT("fov"));
 		}
+	}
+
+	TryReadVector(Params, TEXT("camera_location"), OutLocation);
+	TryReadRotator(Params, TEXT("camera_rotation"), OutRotation);
+	if (Params->HasField(TEXT("fov")))
+	{
+		OutFOV = (float)Params->GetNumberField(TEXT("fov"));
 	}
 }
 
@@ -270,10 +451,13 @@ void FMonolithCaptureActions::RegisterActions()
 
 	// --- 离屏场景截图（不依赖视口） ---
 	Registry.RegisterAction(TEXT("capture"), TEXT("capture_scene"),
-		TEXT("使用 SceneCaptureComponent2D 进行离屏全场景截图，不依赖编辑器视口状态"),
+		TEXT("以脚本方式设置编辑器主视口相机并截图，结束后自动恢复原视角"),
 		FMonolithActionHandler::CreateStatic(&HandleCaptureScene),
 		FParamSchemaBuilder()
-			.Optional(TEXT("camera"), TEXT("object"), TEXT("{location:{x,y,z}, rotation:{pitch,yaw,roll}, fov:60}"))
+			.Optional(TEXT("camera"), TEXT("any"), TEXT("{location:{x,y,z}|[x,y,z], rotation:{pitch,yaw,roll}|[p,y,r], fov:60}"))
+			.Optional(TEXT("camera_location"), TEXT("object"), TEXT("兼容字段: 相机位置对象 {x,y,z}"))
+			.Optional(TEXT("camera_rotation"), TEXT("object"), TEXT("兼容字段: 相机朝向对象 {pitch,yaw,roll}"))
+			.Optional(TEXT("fov"), TEXT("number"), TEXT("兼容字段: 相机视角"))
 			.Optional(TEXT("resolution"), TEXT("array"), TEXT("[width, height]"), TEXT("[1280,720]"))
 			.Optional(TEXT("output_path"), TEXT("string"), TEXT("输出 PNG 路径"))
 			.Optional(TEXT("capability"), TEXT("string"), TEXT("artifact 路径分类"), TEXT("grapple"))
@@ -759,67 +943,84 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureViewport(const TShar
 		return FMonolithActionResult::Error(TEXT("GEditor 不可用"));
 	}
 
-	FLevelEditorModule& LevelEditor = FModuleManager::GetModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
-	TSharedPtr<IAssetViewport> ActiveViewport = LevelEditor.GetFirstActiveViewport();
-	if (!ActiveViewport.IsValid())
+	// PIE 分支：运行中的 PIE 会 takeover 主视口，LevelEditorViewportClient 报 0x0 尺寸。
+	// 直接走 UGameViewportClient -> FViewport 读像素，跳过 editor level viewport 逻辑。
+	// 不改 PIE 相机（bCameraLocation/bCameraRotation 参数对 PIE 无意义；玩家 PC 已拥有 viewport）。
+	if (FWorldContext* PIEWorldContext = GEditor->GetPIEWorldContext())
 	{
-		if (TSharedPtr<FTabManager> TabManager = LevelEditor.GetLevelEditorTabManager())
+		UGameViewportClient* PIEGameViewport = PIEWorldContext->GameViewport;
+		if (!PIEGameViewport)
 		{
-			TabManager->TryInvokeTab(FTabId(TEXT("LevelEditorViewport")));
-			for (int32 i = 0; i < 5; ++i)
+			if (UGameInstance* PIEGameInstance = PIEWorldContext->OwningGameInstance)
 			{
-				FSlateApplication::Get().Tick();
+				PIEGameViewport = PIEGameInstance->GetGameViewportClient();
 			}
-			ActiveViewport = LevelEditor.GetFirstActiveViewport();
 		}
-	}
 
-	if (!ActiveViewport.IsValid())
-	{
-		return FMonolithActionResult::Error(TEXT("没有可用的编辑器视口"));
-	}
-
-	FViewport* Viewport = ActiveViewport->GetActiveViewport();
-	if (!Viewport)
-	{
-		return FMonolithActionResult::Error(TEXT("视口不可用"));
-	}
-
-	FLevelEditorViewportClient* CaptureViewportClient = nullptr;
-	const TArray<FLevelEditorViewportClient*>& ViewportClients = GEditor->GetLevelViewportClients();
-	for (FLevelEditorViewportClient* VC : ViewportClients)
-	{
-		if (VC && VC->Viewport == Viewport)
+		FViewport* PIEViewport = PIEGameViewport ? PIEGameViewport->Viewport : nullptr;
+		if (PIEViewport && PIEViewport->GetSizeXY().X > 0 && PIEViewport->GetSizeXY().Y > 0)
 		{
-			CaptureViewportClient = VC;
-			break;
-		}
-	}
+			// 强制 PIE 重绘一帧以拿到最新内容。
+			PIEViewport->InvalidateDisplay();
+			PIEViewport->Draw(true);
+			FlushRenderingCommands();
 
-	if (!CaptureViewportClient)
-	{
-		for (FLevelEditorViewportClient* VC : ViewportClients)
-		{
-			if (!VC) continue;
-			CaptureViewportClient = VC;
-			if (VC->Viewport)
+			TArray<FColor> PIEBitmap;
+			const int32 PIEWidth = PIEViewport->GetSizeXY().X;
+			const int32 PIEHeight = PIEViewport->GetSizeXY().Y;
+			if (PIEViewport->ReadPixels(PIEBitmap) && PIEBitmap.Num() > 0)
 			{
-				Viewport = VC->Viewport;
+				for (FColor& Pixel : PIEBitmap)
+				{
+					Pixel.A = 255;
+				}
+
+				const FString ArtifactRoot = ResolveArtifactRoot(Params);
+				const FString ScreenshotDir = FPaths::Combine(ArtifactRoot, TEXT("screenshots"));
+				IFileManager::Get().MakeDirectory(*ScreenshotDir, true);
+
+				const FString Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
+				const FString Filename = FString::Printf(TEXT("viewport_pie_%s.png"), *Timestamp);
+				const FString FullPath = FPaths::Combine(ScreenshotDir, Filename);
+
+				IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+				TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+				if (!ImageWrapper.IsValid() || !ImageWrapper->SetRaw(PIEBitmap.GetData(), PIEBitmap.Num() * sizeof(FColor), PIEWidth, PIEHeight, ERGBFormat::BGRA, 8))
+				{
+					return FMonolithActionResult::Error(TEXT("PIE 截图编码失败"));
+				}
+
+				const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed();
+				if (!FFileHelper::SaveArrayToFile(CompressedData, *FullPath))
+				{
+					return FMonolithActionResult::Error(TEXT("PIE 截图保存失败"));
+				}
+
+				const UWorld* PIEWorld = PIEWorldContext->World();
+				TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+				Result->SetBoolField(TEXT("success"), true);
+				Result->SetStringField(TEXT("path"), FullPath);
+				Result->SetNumberField(TEXT("width"), PIEWidth);
+				Result->SetNumberField(TEXT("height"), PIEHeight);
+				Result->SetStringField(TEXT("map"), PIEWorld ? PIEWorld->GetMapName() : TEXT(""));
+				Result->SetBoolField(TEXT("pie"), true);
+				return FMonolithActionResult::Success(Result);
 			}
-			break;
 		}
+		// PIEGameViewport 存在但尺寸仍 0 / ReadPixels 失败：fall through，让 editor viewport 兜底
 	}
+
+	FViewport* Viewport = nullptr;
+	FLevelEditorViewportClient* CaptureViewportClient = ResolveTargetLevelViewportClient(Viewport);
 
 	if (!CaptureViewportClient)
 	{
 		return FMonolithActionResult::Error(TEXT("没有可用的视口客户端"));
 	}
 
-	// 强制开启实时渲染（确保后台也能刷新帧）
-	const bool bWasRealtime = CaptureViewportClient->IsRealtime();
-	if (!bWasRealtime)
+	if (!Viewport)
 	{
-		CaptureViewportClient->SetRealtime(true);
+		return FMonolithActionResult::Error(TEXT("视口不可用"));
 	}
 
 	// 设置相机
@@ -858,9 +1059,12 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureViewport(const TShar
 
 	for (int32 i = 0; i < 20 && !IsViewportReady(); ++i)
 	{
-		if (TSharedPtr<FTabManager> TabManager = LevelEditor.GetLevelEditorTabManager())
+		if (FLevelEditorModule* LevelEditor = FModuleManager::GetModulePtr<FLevelEditorModule>(TEXT("LevelEditor")))
 		{
-			TabManager->TryInvokeTab(FTabId(TEXT("LevelEditorViewport")));
+			if (TSharedPtr<FTabManager> TabManager = LevelEditor->GetLevelEditorTabManager())
+			{
+				TabManager->TryInvokeTab(FTabId(TEXT("LevelEditorViewport")));
+			}
 		}
 		FSlateApplication::Get().Tick();
 		CaptureViewportClient->Tick(0.033f);
@@ -877,26 +1081,7 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureViewport(const TShar
 		return FMonolithActionResult::Error(TEXT("视口尺寸为零"));
 	}
 
-	// 强制重绘：先 Invalidate，再用 Draw() 直接触发渲染
-	CaptureViewportClient->Invalidate();
-	if (Viewport)
-	{
-		Viewport->InvalidateDisplay();
-	}
-	// 用 Tick 推进引擎状态，然后 Draw() 强制渲染
-	for (int32 i = 0; i < 4; ++i)
-	{
-		FSlateApplication::Get().Tick();
-		CaptureViewportClient->Tick(0.033f);
-	}
-	// 直接调用 Draw 强制渲染新帧到 backbuffer
-	if (Viewport)
-	{
-		Viewport->Draw(false);
-		FlushRenderingCommands();
-		Viewport->Draw(true);
-		FlushRenderingCommands();
-	}
+	RefreshLevelViewportClient(CaptureViewportClient, Viewport);
 
 	TArray<FColor> Bitmap;
 	const int32 Width = Viewport->GetSizeXY().X;
@@ -954,13 +1139,13 @@ FMonolithActionResult FMonolithCaptureActions::HandleSetViewportCamera(const TSh
 		return FMonolithActionResult::Error(TEXT("GEditor 不可用"));
 	}
 
-	const TArray<FLevelEditorViewportClient*>& Clients = GEditor->GetLevelViewportClients();
-	if (Clients.Num() == 0)
+	FViewport* Viewport = nullptr;
+	FLevelEditorViewportClient* ViewportClient = ResolveTargetLevelViewportClient(Viewport);
+	if (!ViewportClient)
 	{
 		return FMonolithActionResult::Error(TEXT("没有可用的编辑器视口"));
 	}
 
-	FLevelEditorViewportClient* ViewportClient = Clients[0];
 	if (Params.IsValid())
 	{
 		if (const TSharedPtr<FJsonObject>* LocationObject = nullptr;
@@ -984,17 +1169,16 @@ FMonolithActionResult FMonolithCaptureActions::HandleSetViewportCamera(const TSh
 		}
 	}
 
-	ViewportClient->Tick(0.033f);
-	if (ViewportClient->Viewport)
+	if (!Viewport && ViewportClient->Viewport)
 	{
-		ViewportClient->Viewport->Invalidate();
-		ViewportClient->Viewport->InvalidateDisplay();
-		ViewportClient->Viewport->Draw();
-		FlushRenderingCommands();
+		Viewport = ViewportClient->Viewport;
 	}
+	RefreshLevelViewportClient(ViewportClient, Viewport);
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), true);
+	Result->SetObjectField(TEXT("location"), MakeVectorJson(ViewportClient->GetViewLocation()));
+	Result->SetObjectField(TEXT("rotation"), MakeRotatorJson(ViewportClient->GetViewRotation()));
 	return FMonolithActionResult::Success(Result);
 }
 
@@ -1663,81 +1847,113 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureScene(const TSharedP
 		return FMonolithActionResult::Error(TEXT("当前没有打开的地图"));
 	}
 
-	// 解析相机参数
-	FVector CameraLocation(0, 0, 500);
-	FRotator CameraRotation(-30, 0, 0);
+	FViewport* Viewport = nullptr;
+	FLevelEditorViewportClient* ViewportClient = ResolveTargetLevelViewportClient(Viewport);
+	if (!ViewportClient)
+	{
+		return FMonolithActionResult::Error(TEXT("没有可用的编辑器视口"));
+	}
+
+	if (!Viewport)
+	{
+		return FMonolithActionResult::Error(TEXT("视口不可用"));
+	}
+
+	// capture_scene is intended to be the programmatic camera API.
+	// Use the same viewport render path as capture_viewport so exposure matches
+	// what the user actually sees, then restore the previous camera afterward.
+	FVector CameraLocation = ViewportClient->GetViewLocation();
+	FRotator CameraRotation = ViewportClient->GetViewRotation();
 	float FOV = 60.0f;
-	if (Params.IsValid() && Params->HasField(TEXT("camera")))
+	if (Params.IsValid())
 	{
 		ParseCameraParams(Params, CameraLocation, CameraRotation, FOV);
 	}
 
-	// 解析分辨率
 	int32 ResX = 1280, ResY = 720;
 	if (Params.IsValid())
 	{
 		ParseResolutionParams(Params, ResX, ResY);
 	}
 
-	// 创建渲染目标
-	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
-		GetTransientPackage(), NAME_None, RF_Transient);
-	RT->InitAutoFormat(ResX, ResY);
-	RT->ClearColor = FLinearColor::Black;
-	RT->UpdateResourceImmediate(true);
+	const FVector OriginalLocation = ViewportClient->GetViewLocation();
+	const FRotator OriginalRotation = ViewportClient->GetViewRotation();
 
-	// 创建 SceneCaptureComponent2D — 渲染全部场景
-	USceneCaptureComponent2D* SCC = NewObject<USceneCaptureComponent2D>(
-		GetTransientPackage(), NAME_None, RF_Transient);
-	SCC->bTickInEditor = false;
-	SCC->SetComponentTickEnabled(false);
-	SCC->bCaptureEveryFrame = false;
-	SCC->bCaptureOnMovement = false;
-	SCC->TextureTarget = RT;
-	SCC->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
-	SCC->ProjectionType = ECameraProjectionMode::Perspective;
-	SCC->FOVAngle = FOV;
-
-	// 渲染场景中所有图元
-	SCC->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
-
-	SCC->RegisterComponentWithWorld(World);
-	SCC->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
-
-	// 确保着色器就绪
-	if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
-	FlushRenderingCommands();
-
-	// 双次捕获：第一次触发着色器编译，第二次产出最终图像
-	SCC->CaptureScene();
-	FlushRenderingCommands();
-
-	if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
-	FlushRenderingCommands();
-
-	SCC->CaptureScene();
-	FlushRenderingCommands();
-
-	// 读取像素
-	FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
-	if (!RTResource)
+	ViewportClient->SetViewLocation(CameraLocation);
+	ViewportClient->SetViewRotation(CameraRotation);
+	if (ViewportClient->Viewport)
 	{
-		SCC->TextureTarget = nullptr;
-		SCC->UnregisterComponent();
-		return FMonolithActionResult::Error(TEXT("无法获取 RenderTarget 资源"));
+		Viewport = ViewportClient->Viewport;
 	}
+
+	auto RestoreViewport = [&]()
+	{
+		ViewportClient->SetViewLocation(OriginalLocation);
+		ViewportClient->SetViewRotation(OriginalRotation);
+		if (ViewportClient->Viewport)
+		{
+			Viewport = ViewportClient->Viewport;
+		}
+		RefreshLevelViewportClient(ViewportClient, Viewport);
+	};
+
+	auto IsViewportReady = [&Viewport]() -> bool
+	{
+		return Viewport && Viewport->GetSizeXY().X > 0 && Viewport->GetSizeXY().Y > 0;
+	};
+
+	for (int32 i = 0; i < 20 && !IsViewportReady(); ++i)
+	{
+		if (FLevelEditorModule* LevelEditor = FModuleManager::GetModulePtr<FLevelEditorModule>(TEXT("LevelEditor")))
+		{
+			if (TSharedPtr<FTabManager> TabManager = LevelEditor->GetLevelEditorTabManager())
+			{
+				TabManager->TryInvokeTab(FTabId(TEXT("LevelEditorViewport")));
+			}
+		}
+		FSlateApplication::Get().Tick();
+		ViewportClient->Tick(0.033f);
+		GEditor->RedrawAllViewports(true);
+		FlushRenderingCommands();
+		if (ViewportClient->Viewport)
+		{
+			Viewport = ViewportClient->Viewport;
+		}
+	}
+
+	if (!IsViewportReady())
+	{
+		RestoreViewport();
+		return FMonolithActionResult::Error(TEXT("视口尺寸为零"));
+	}
+
+	RefreshLevelViewportClient(ViewportClient, Viewport);
 
 	TArray<FColor> Pixels;
-	if (!RTResource->ReadPixels(Pixels) || Pixels.Num() == 0)
+	const int32 CapturedWidth = Viewport->GetSizeXY().X;
+	const int32 CapturedHeight = Viewport->GetSizeXY().Y;
+	if (!Viewport->ReadPixels(Pixels) || Pixels.Num() == 0)
 	{
-		SCC->TextureTarget = nullptr;
-		SCC->UnregisterComponent();
-		return FMonolithActionResult::Error(TEXT("ReadPixels 失败"));
+		RestoreViewport();
+		return FMonolithActionResult::Error(TEXT("视口像素读取失败"));
 	}
 
-	// 清理 SCC
-	SCC->TextureTarget = nullptr;
-	SCC->UnregisterComponent();
+	RestoreViewport();
+
+	for (FColor& Pixel : Pixels)
+	{
+		Pixel.A = 255;
+	}
+
+	TArray<FColor> OutputPixels = Pixels;
+	int32 OutputWidth = CapturedWidth;
+	int32 OutputHeight = CapturedHeight;
+	if (CapturedWidth != ResX || CapturedHeight != ResY)
+	{
+		FImageUtils::ImageResize(CapturedWidth, CapturedHeight, Pixels, ResX, ResY, OutputPixels, true, true);
+		OutputWidth = ResX;
+		OutputHeight = ResY;
+	}
 
 	// 确定输出路径
 	FString OutputPath;
@@ -1762,12 +1978,15 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureScene(const TSharedP
 	FString Dir = FPaths::GetPath(OutputPath);
 	IFileManager::Get().MakeDirectory(*Dir, true);
 
-	// 编码 PNG
-	FImage Image;
-	Image.Init(ResX, ResY, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
-	FMemory::Memcpy(Image.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+	IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+	TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+	if (!ImageWrapper.IsValid() || !ImageWrapper->SetRaw(OutputPixels.GetData(), OutputPixels.Num() * sizeof(FColor), OutputWidth, OutputHeight, ERGBFormat::BGRA, 8))
+	{
+		return FMonolithActionResult::Error(TEXT("截图编码失败"));
+	}
 
-	if (!FImageUtils::SaveImageAutoFormat(*OutputPath, Image))
+	const TArray64<uint8>& CompressedData = ImageWrapper->GetCompressed();
+	if (!FFileHelper::SaveArrayToFile(CompressedData, *OutputPath))
 	{
 		return FMonolithActionResult::Error(TEXT("截图保存失败"));
 	}
@@ -1775,8 +1994,11 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureScene(const TSharedP
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), true);
 	Result->SetStringField(TEXT("path"), OutputPath);
-	Result->SetNumberField(TEXT("width"), ResX);
-	Result->SetNumberField(TEXT("height"), ResY);
+	Result->SetNumberField(TEXT("width"), OutputWidth);
+	Result->SetNumberField(TEXT("height"), OutputHeight);
 	Result->SetStringField(TEXT("map"), World->GetMapName());
+	Result->SetObjectField(TEXT("camera_location"), MakeVectorJson(CameraLocation));
+	Result->SetObjectField(TEXT("camera_rotation"), MakeRotatorJson(CameraRotation));
+	Result->SetNumberField(TEXT("fov"), FOV);
 	return FMonolithActionResult::Success(Result);
 }

@@ -1,4 +1,4 @@
-#include "MonolithAbpWriteActions.h"
+﻿#include "MonolithAbpWriteActions.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
 
@@ -15,6 +15,16 @@
 #include "AnimGraphNode_LayeredBoneBlend.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimGraphNode_StateResult.h"
+// Wave 11 — expanded whitelist for ABP write
+#include "AnimGraphNode_LinkedAnimLayer.h"
+#include "AnimGraphNode_LinkedAnimGraph.h"
+#include "AnimGraphNode_ModifyBone.h"
+#include "AnimGraphNode_TwoBoneIK.h"
+#include "AnimGraphNode_Fabrik.h"
+#include "AnimGraphNode_CopyBone.h"
+#include "AnimGraphNode_LookAt.h"
+#include "AnimGraphNode_Slot.h"
+#include "AnimGraphNode_SaveCachedPose.h"
 #include "AnimationGraph.h"
 #include "AnimationStateGraph.h"
 #include "AnimationStateMachineGraph.h"
@@ -77,6 +87,46 @@ void FMonolithAbpWriteActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("loop"), TEXT("bool"), TEXT("Set loop flag on the player node"), TEXT("false"))
 			.Optional(TEXT("clear_existing"), TEXT("bool"), TEXT("Remove existing animation nodes wired to the state result (default: true)"), TEXT("true"))
 			.Build());
+
+	// --- set_linked_layer --- (Wave 12)
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_linked_layer"),
+		TEXT("Configure a LinkedAnimLayer node: set which interface layer function it points to. "
+			"Call after add_anim_graph_node with node_type=LinkedAnimLayer."),
+		FMonolithActionHandler::CreateStatic(&HandleSetLinkedLayer),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("node_name"), TEXT("string"), TEXT("Node UObject name (from add_anim_graph_node response)"))
+			.Required(TEXT("layer_name"), TEXT("string"), TEXT("Layer function name (e.g. 'FullBody_Aiming', 'FullBody_SkeletalControls')"))
+			.Optional(TEXT("compile"), TEXT("bool"), TEXT("Compile ABP after change (default: true)"), TEXT("true"))
+			.Build());
+
+	// --- set_anim_node_property --- (Wave 12)
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_anim_node_property"),
+		TEXT("Set a property on an anim graph node's inner FAnimNode struct via UE reflection. "
+			"Supports bool, int, float, FName, FString, enum (by name), and FBoneReference (bone_name sub-field)."),
+		FMonolithActionHandler::CreateStatic(&HandleSetAnimNodeProperty),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("node_name"), TEXT("string"), TEXT("Node UObject name (from add_anim_graph_node response or get_graph_data)"))
+			.Required(TEXT("property_name"), TEXT("string"), TEXT("Property name on the FAnimNode struct (e.g. 'BoneToModify', 'TranslationMode', 'RotationMode')"))
+			.Required(TEXT("value"), TEXT("string"), TEXT("Value as string. For enums use display name (e.g. 'Replace Existing'). For FBoneReference pass the bone name directly."))
+			.Optional(TEXT("compile"), TEXT("bool"), TEXT("Compile ABP after change (default: false)"), TEXT("false"))
+			.Build());
+
+	// --- set_property_binding --- (Wave 13)
+	Registry.RegisterAction(TEXT("animation"), TEXT("set_property_binding"),
+		TEXT("Bind an anim graph node pin to an AnimInstance property via UE5 Property Access. "
+			"This is the programmatic equivalent of right-clicking a pin in the ABP editor and selecting "
+			"'Bind' → picking a property. Works for any pin on ModifyBone, LayeredBoneBlend, etc. "
+			"The property must be accessible from the AnimInstance context (including CPP parent fields)."),
+		FMonolithActionHandler::CreateStatic(&HandleSetPropertyBinding),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Animation Blueprint asset path"))
+			.Required(TEXT("node_name"), TEXT("string"), TEXT("Node UObject name"))
+			.Required(TEXT("binding_name"), TEXT("string"), TEXT("Binding name — usually the pin/property name (e.g. 'Alpha', 'Translation')"))
+			.Required(TEXT("property_path"), TEXT("string"), TEXT("Property path on AnimInstance to bind to (e.g. 'HandIK_Right_Alpha')"))
+			.Optional(TEXT("compile"), TEXT("bool"), TEXT("Compile ABP after change (default: true)"), TEXT("true"))
+			.Build());
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +139,7 @@ namespace
 /** Map a user-facing node type string to UClass. Returns nullptr on unknown type. */
 UClass* ResolveNodeClass(const FString& NodeType)
 {
+	// Original Wave 7 types
 	if (NodeType.Equals(TEXT("SequencePlayer"), ESearchCase::IgnoreCase))
 		return UAnimGraphNode_SequencePlayer::StaticClass();
 	if (NodeType.Equals(TEXT("BlendSpacePlayer"), ESearchCase::IgnoreCase))
@@ -101,6 +152,27 @@ UClass* ResolveNodeClass(const FString& NodeType)
 		return UAnimGraphNode_LayeredBoneBlend::StaticClass();
 	if (NodeType.Equals(TEXT("MotionMatching"), ESearchCase::IgnoreCase))
 		return UAnimGraphNode_MotionMatching::StaticClass();
+	// Wave 11 — Link / Post-process layer nodes
+	if (NodeType.Equals(TEXT("LinkedAnimLayer"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_LinkedAnimLayer::StaticClass();
+	if (NodeType.Equals(TEXT("LinkedAnimGraph"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_LinkedAnimGraph::StaticClass();
+	// Wave 11 — Skeletal Control nodes (IK / bone modification)
+	if (NodeType.Equals(TEXT("ModifyBone"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_ModifyBone::StaticClass();
+	if (NodeType.Equals(TEXT("TwoBoneIK"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_TwoBoneIK::StaticClass();
+	if (NodeType.Equals(TEXT("Fabrik"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_Fabrik::StaticClass();
+	if (NodeType.Equals(TEXT("CopyBone"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_CopyBone::StaticClass();
+	if (NodeType.Equals(TEXT("LookAt"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_LookAt::StaticClass();
+	// Wave 11 — Utility nodes
+	if (NodeType.Equals(TEXT("Slot"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_Slot::StaticClass();
+	if (NodeType.Equals(TEXT("SaveCachedPose"), ESearchCase::IgnoreCase))
+		return UAnimGraphNode_SaveCachedPose::StaticClass();
 	return nullptr;
 }
 
@@ -684,5 +756,562 @@ FMonolithActionResult FMonolithAbpWriteActions::HandleSetStateAnimation(const TS
 	Root->SetBoolField(TEXT("loop"), bLoop);
 	Root->SetBoolField(TEXT("cleared_existing"), bClearExisting);
 	Root->SetArrayField(TEXT("pins"), BuildPinList(SpawnedNode));
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Action: set_linked_layer (Wave 12)
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleSetLinkedLayer(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	FString NodeName  = Params->GetStringField(TEXT("node_name"));
+	FString LayerName = Params->GetStringField(TEXT("layer_name"));
+
+	bool bCompile = true;
+	if (Params->HasField(TEXT("compile")))
+	{
+		bCompile = Params->GetBoolField(TEXT("compile"));
+	}
+
+	if (NodeName.IsEmpty())  return FMonolithActionResult::Error(TEXT("Missing required parameter: node_name"));
+	if (LayerName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: layer_name"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UEdGraphNode* Node = FindNodeByName(ABP, NodeName);
+	if (!Node) return FMonolithActionResult::Error(FString::Printf(TEXT("Node '%s' not found in ABP"), *NodeName));
+
+	UAnimGraphNode_LinkedAnimLayer* LayerNode = Cast<UAnimGraphNode_LinkedAnimLayer>(Node);
+	if (!LayerNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Node '%s' is not a LinkedAnimLayer node (actual class: %s)"),
+			*NodeName, *Node->GetClass()->GetName()));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Linked Anim Layer")));
+	LayerNode->Modify();
+
+	// Set the Layer FName directly on the inner FAnimNode_LinkedAnimLayer struct.
+	// We avoid calling SetLayerName/UpdateGuidForLayer/GetLayerName since those
+	// are non-exported (MinimalAPI class) and would cause LNK2019 link errors.
+	LayerNode->Node.Layer = FName(*LayerName);
+
+	// Look up the interface GUID from the ABP's implemented interfaces.
+	// The LinkedAnimLayer node needs InterfaceGuid to match the layer function's graph GUID.
+	FGuid FoundGuid;
+	bool bFoundGuid = false;
+	for (UEdGraph* Graph : ABP->FunctionGraphs)
+	{
+		if (Graph && Graph->GetFName() == FName(*LayerName))
+		{
+			FoundGuid = Graph->GraphGuid;
+			bFoundGuid = true;
+			break;
+		}
+	}
+
+	// Also search the interface's graphs if this ABP implements an ALI
+	if (!bFoundGuid)
+	{
+		for (const FBPInterfaceDescription& InterfaceDesc : ABP->ImplementedInterfaces)
+		{
+			if (!InterfaceDesc.Interface) continue;
+			UBlueprint* InterfaceBP = Cast<UBlueprint>(InterfaceDesc.Interface->ClassGeneratedBy);
+			if (!InterfaceBP) continue;
+			for (UEdGraph* Graph : InterfaceBP->FunctionGraphs)
+			{
+				if (Graph && Graph->GetFName() == FName(*LayerName))
+				{
+					FoundGuid = Graph->GraphGuid;
+					bFoundGuid = true;
+					break;
+				}
+			}
+			if (bFoundGuid) break;
+		}
+	}
+
+	if (bFoundGuid)
+	{
+		LayerNode->InterfaceGuid = FoundGuid;
+	}
+
+	// Set the Interface class on the runtime node (so it knows which ALI to use)
+	// Find the ALI that contains this layer function
+	for (const FBPInterfaceDescription& InterfaceDesc : ABP->ImplementedInterfaces)
+	{
+		if (!InterfaceDesc.Interface) continue;
+		UBlueprint* InterfaceBP = Cast<UBlueprint>(InterfaceDesc.Interface->ClassGeneratedBy);
+		if (!InterfaceBP) continue;
+		for (UEdGraph* Graph : InterfaceBP->FunctionGraphs)
+		{
+			if (Graph && Graph->GetFName() == FName(*LayerName))
+			{
+				LayerNode->Node.Interface = TSubclassOf<UAnimLayerInterface>(InterfaceDesc.Interface);
+				break;
+			}
+		}
+	}
+
+	// Reconstruct the node to regenerate pins for the new layer
+	LayerNode->ReconstructNode();
+
+	GEditor->EndTransaction();
+
+	if (bCompile)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+		FKismetEditorUtilities::CompileBlueprint(ABP);
+	}
+
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("node_name"), NodeName);
+	Root->SetStringField(TEXT("layer_name"), LayerName);
+	Root->SetStringField(TEXT("actual_layer"), LayerNode->Node.Layer.ToString());
+	Root->SetBoolField(TEXT("compiled"), bCompile);
+	Root->SetArrayField(TEXT("pins"), BuildPinList(LayerNode));
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Action: set_anim_node_property (Wave 12)
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleSetAnimNodeProperty(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath    = Params->GetStringField(TEXT("asset_path"));
+	FString NodeName     = Params->GetStringField(TEXT("node_name"));
+	FString PropertyName = Params->GetStringField(TEXT("property_name"));
+	FString Value        = Params->GetStringField(TEXT("value"));
+
+	bool bCompile = false;
+	if (Params->HasField(TEXT("compile")))
+	{
+		bCompile = Params->GetBoolField(TEXT("compile"));
+	}
+
+	if (NodeName.IsEmpty())     return FMonolithActionResult::Error(TEXT("Missing required parameter: node_name"));
+	if (PropertyName.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing required parameter: property_name"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimBlueprint not found: %s"), *AssetPath));
+
+	UEdGraphNode* Node = FindNodeByName(ABP, NodeName);
+	if (!Node) return FMonolithActionResult::Error(FString::Printf(TEXT("Node '%s' not found in ABP"), *NodeName));
+
+	UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(Node);
+	if (!AnimNode)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Node '%s' is not an anim graph node (actual class: %s)"),
+			*NodeName, *Node->GetClass()->GetName()));
+	}
+
+	// Get the inner FAnimNode struct via reflection
+	FStructProperty* NodeProp = AnimNode->GetFNodeProperty();
+	if (!NodeProp)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Node '%s' has no FAnimNode property (GetFNodeProperty returned null)"), *NodeName));
+	}
+
+	void* NodePtr = NodeProp->ContainerPtrToValuePtr<void>(AnimNode);
+	UScriptStruct* NodeStruct = NodeProp->Struct;
+
+	// Find the property by name (search the full hierarchy)
+	FProperty* TargetProp = nullptr;
+	for (UScriptStruct* Current = NodeStruct; Current; Current = Cast<UScriptStruct>(Current->GetSuperStruct()))
+	{
+		TargetProp = Current->FindPropertyByName(FName(*PropertyName));
+		if (TargetProp) break;
+	}
+
+	if (!TargetProp)
+	{
+		// List available properties for debugging
+		FString AvailProps;
+		int32 Count = 0;
+		for (TFieldIterator<FProperty> It(NodeStruct); It; ++It)
+		{
+			if (Count++ > 40) { AvailProps += TEXT(", ..."); break; }
+			if (!AvailProps.IsEmpty()) AvailProps += TEXT(", ");
+			AvailProps += It->GetName();
+		}
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Property '%s' not found on %s. Available: [%s]"),
+			*PropertyName, *NodeStruct->GetName(), *AvailProps));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Anim Node Property")));
+	AnimNode->Modify();
+
+	FString ResultType;
+	FString ResultValue;
+	bool bSuccess = false;
+
+	// Handle FBoneReference — set BoneName sub-field
+	FStructProperty* StructProp = CastField<FStructProperty>(TargetProp);
+	if (StructProp && StructProp->Struct->GetFName() == FName(TEXT("BoneReference")))
+	{
+		void* StructPtr = StructProp->ContainerPtrToValuePtr<void>(NodePtr);
+		FProperty* BoneNameProp = StructProp->Struct->FindPropertyByName(FName(TEXT("BoneName")));
+		if (BoneNameProp)
+		{
+			FNameProperty* NameProp = CastField<FNameProperty>(BoneNameProp);
+			if (NameProp)
+			{
+				NameProp->SetPropertyValue(NameProp->ContainerPtrToValuePtr<void>(StructPtr), FName(*Value));
+				bSuccess = true;
+				ResultType = TEXT("FBoneReference");
+				ResultValue = Value;
+			}
+		}
+		if (!bSuccess)
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(TEXT("Failed to set BoneName on FBoneReference struct"));
+		}
+	}
+	// Handle bool
+	else if (FBoolProperty* BoolProp = CastField<FBoolProperty>(TargetProp))
+	{
+		bool bVal = Value.Equals(TEXT("true"), ESearchCase::IgnoreCase) || Value == TEXT("1");
+		BoolProp->SetPropertyValue(BoolProp->ContainerPtrToValuePtr<void>(NodePtr), bVal);
+		bSuccess = true;
+		ResultType = TEXT("bool");
+		ResultValue = bVal ? TEXT("true") : TEXT("false");
+	}
+	// Handle int
+	else if (FIntProperty* IntProp = CastField<FIntProperty>(TargetProp))
+	{
+		int32 IntVal = FCString::Atoi(*Value);
+		IntProp->SetPropertyValue(IntProp->ContainerPtrToValuePtr<void>(NodePtr), IntVal);
+		bSuccess = true;
+		ResultType = TEXT("int32");
+		ResultValue = FString::FromInt(IntVal);
+	}
+	// Handle float
+	else if (FFloatProperty* FloatProp = CastField<FFloatProperty>(TargetProp))
+	{
+		float FloatVal = FCString::Atof(*Value);
+		FloatProp->SetPropertyValue(FloatProp->ContainerPtrToValuePtr<void>(NodePtr), FloatVal);
+		bSuccess = true;
+		ResultType = TEXT("float");
+		ResultValue = FString::SanitizeFloat(FloatVal);
+	}
+	// Handle double
+	else if (FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(TargetProp))
+	{
+		double DoubleVal = FCString::Atod(*Value);
+		DoubleProp->SetPropertyValue(DoubleProp->ContainerPtrToValuePtr<void>(NodePtr), DoubleVal);
+		bSuccess = true;
+		ResultType = TEXT("double");
+		ResultValue = FString::Printf(TEXT("%f"), DoubleVal);
+	}
+	// Handle FName
+	else if (FNameProperty* NameProp = CastField<FNameProperty>(TargetProp))
+	{
+		NameProp->SetPropertyValue(NameProp->ContainerPtrToValuePtr<void>(NodePtr), FName(*Value));
+		bSuccess = true;
+		ResultType = TEXT("FName");
+		ResultValue = Value;
+	}
+	// Handle FString
+	else if (FStrProperty* StrProp = CastField<FStrProperty>(TargetProp))
+	{
+		StrProp->SetPropertyValue(StrProp->ContainerPtrToValuePtr<void>(NodePtr), Value);
+		bSuccess = true;
+		ResultType = TEXT("FString");
+		ResultValue = Value;
+	}
+	// Handle byte/enum (TEnumAsByte or raw uint8)
+	else if (FByteProperty* ByteProp = CastField<FByteProperty>(TargetProp))
+	{
+		if (ByteProp->Enum)
+		{
+			// Try exact name first, then display name
+			int64 EnumVal = ByteProp->Enum->GetValueByNameString(Value);
+			if (EnumVal == INDEX_NONE)
+			{
+				for (int32 i = 0; i < ByteProp->Enum->NumEnums() - 1; ++i)
+				{
+					if (ByteProp->Enum->GetDisplayNameTextByIndex(i).ToString() == Value)
+					{
+						EnumVal = ByteProp->Enum->GetValueByIndex(i);
+						break;
+					}
+				}
+			}
+			if (EnumVal == INDEX_NONE)
+			{
+				GEditor->EndTransaction();
+				FString EnumValues;
+				for (int32 i = 0; i < ByteProp->Enum->NumEnums() - 1; ++i)
+				{
+					if (!EnumValues.IsEmpty()) EnumValues += TEXT(", ");
+					EnumValues += FString::Printf(TEXT("'%s' (%s)"),
+						*ByteProp->Enum->GetNameStringByIndex(i),
+						*ByteProp->Enum->GetDisplayNameTextByIndex(i).ToString());
+				}
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Enum value '%s' not found in %s. Available: [%s]"),
+					*Value, *ByteProp->Enum->GetName(), *EnumValues));
+			}
+			ByteProp->SetPropertyValue(ByteProp->ContainerPtrToValuePtr<void>(NodePtr), static_cast<uint8>(EnumVal));
+			bSuccess = true;
+			ResultType = FString::Printf(TEXT("enum:%s"), *ByteProp->Enum->GetName());
+			ResultValue = ByteProp->Enum->GetNameStringByIndex(ByteProp->Enum->GetIndexByValue(EnumVal));
+		}
+		else
+		{
+			uint8 ByteVal = static_cast<uint8>(FCString::Atoi(*Value));
+			ByteProp->SetPropertyValue(ByteProp->ContainerPtrToValuePtr<void>(NodePtr), ByteVal);
+			bSuccess = true;
+			ResultType = TEXT("uint8");
+			ResultValue = FString::FromInt(ByteVal);
+		}
+	}
+	// Handle FEnumProperty (UE5 style enum)
+	else if (FEnumProperty* EnumProp = CastField<FEnumProperty>(TargetProp))
+	{
+		UEnum* Enum = EnumProp->GetEnum();
+		if (Enum)
+		{
+			int64 EnumVal = Enum->GetValueByNameString(Value);
+			if (EnumVal == INDEX_NONE)
+			{
+				for (int32 i = 0; i < Enum->NumEnums() - 1; ++i)
+				{
+					if (Enum->GetDisplayNameTextByIndex(i).ToString() == Value)
+					{
+						EnumVal = Enum->GetValueByIndex(i);
+						break;
+					}
+				}
+			}
+			if (EnumVal == INDEX_NONE)
+			{
+				GEditor->EndTransaction();
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("Enum value '%s' not found in %s"), *Value, *Enum->GetName()));
+			}
+			FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
+			void* PropAddr = EnumProp->ContainerPtrToValuePtr<void>(NodePtr);
+			UnderlyingProp->SetIntPropertyValue(PropAddr, EnumVal);
+			bSuccess = true;
+			ResultType = FString::Printf(TEXT("enum:%s"), *Enum->GetName());
+			ResultValue = Enum->GetNameStringByIndex(Enum->GetIndexByValue(EnumVal));
+		}
+	}
+
+	GEditor->EndTransaction();
+
+	if (!bSuccess)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Unsupported property type '%s' for property '%s'. Supported: bool, int, float, double, FName, FString, enum, FBoneReference."),
+			*TargetProp->GetClass()->GetName(), *PropertyName));
+	}
+
+	if (bCompile)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+		FKismetEditorUtilities::CompileBlueprint(ABP);
+	}
+
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("node_name"), NodeName);
+	Root->SetStringField(TEXT("property_name"), PropertyName);
+	Root->SetStringField(TEXT("property_type"), ResultType);
+	Root->SetStringField(TEXT("value_set"), ResultValue);
+	Root->SetBoolField(TEXT("compiled"), bCompile);
+	return FMonolithActionResult::Success(Root);
+}
+
+// ---------------------------------------------------------------------------
+// Action: set_property_binding (Wave 13) — Property Access binding via reflection
+// ---------------------------------------------------------------------------
+
+FMonolithActionResult FMonolithAbpWriteActions::HandleSetPropertyBinding(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath    = Params->GetStringField(TEXT("asset_path"));
+	FString NodeName     = Params->GetStringField(TEXT("node_name"));
+	FString BindingName  = Params->GetStringField(TEXT("binding_name"));
+	FString PropertyPath = Params->GetStringField(TEXT("property_path"));
+
+	bool bCompile = true;
+	if (Params->HasField(TEXT("compile")))
+	{
+		bCompile = Params->GetBoolField(TEXT("compile"));
+	}
+
+	if (NodeName.IsEmpty())     return FMonolithActionResult::Error(TEXT("Missing: node_name"));
+	if (BindingName.IsEmpty())  return FMonolithActionResult::Error(TEXT("Missing: binding_name"));
+	if (PropertyPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("Missing: property_path"));
+
+	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
+	if (!ABP) return FMonolithActionResult::Error(FString::Printf(TEXT("ABP not found: %s"), *AssetPath));
+
+	UEdGraphNode* Node = FindNodeByName(ABP, NodeName);
+	if (!Node) return FMonolithActionResult::Error(FString::Printf(TEXT("Node '%s' not found"), *NodeName));
+
+	UAnimGraphNode_Base* AnimNode = Cast<UAnimGraphNode_Base>(Node);
+	if (!AnimNode) return FMonolithActionResult::Error(FString::Printf(TEXT("'%s' is not an anim node"), *NodeName));
+
+	// Get the Binding sub-object via reflection (avoids needing Private header for UAnimGraphNodeBinding)
+	FObjectProperty* BindingProp = CastField<FObjectProperty>(
+		AnimNode->GetClass()->FindPropertyByName(FName(TEXT("Binding"))));
+	UObject* BindingObj = BindingProp
+		? BindingProp->GetObjectPropertyValue(BindingProp->ContainerPtrToValuePtr<void>(AnimNode))
+		: nullptr;
+	if (!BindingObj)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Node '%s' has no Binding sub-object (UPROPERTY 'Binding' not found or null)"), *NodeName));
+	}
+
+	// Access PropertyBindings TMap via reflection (no Private header include needed)
+	FMapProperty* MapProp = CastField<FMapProperty>(
+		BindingObj->GetClass()->FindPropertyByName(FName(TEXT("PropertyBindings"))));
+	if (!MapProp)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Binding object class '%s' has no 'PropertyBindings' map property"),
+			*BindingObj->GetClass()->GetName()));
+	}
+
+	GEditor->BeginTransaction(FText::FromString(TEXT("Set Property Access Binding")));
+	AnimNode->Modify();
+	BindingObj->Modify();
+
+	// Get map helper
+	FScriptMapHelper MapHelper(MapProp, MapProp->ContainerPtrToValuePtr<void>(BindingObj));
+
+	// Check if this binding already exists — if so, we'll update it
+	int32 TargetIndex = INDEX_NONE;
+	FNameProperty* KeyNameProp = CastField<FNameProperty>(MapProp->KeyProp);
+	for (int32 i = 0; i < MapHelper.Num(); ++i)
+	{
+		if (MapHelper.IsValidIndex(i))
+		{
+			FName ExistingKey;
+			KeyNameProp->GetValue_InContainer(MapHelper.GetKeyPtr(i), &ExistingKey);
+			if (ExistingKey == FName(*BindingName))
+			{
+				TargetIndex = i;
+				break;
+			}
+		}
+	}
+
+	if (TargetIndex == INDEX_NONE)
+	{
+		// Add new entry
+		TargetIndex = MapHelper.AddDefaultValue_Invalid_NeedsRehash();
+		MapHelper.Rehash();
+		// Set key
+		KeyNameProp->SetPropertyValue(MapHelper.GetKeyPtr(TargetIndex), FName(*BindingName));
+	}
+
+	// Now configure the value (FAnimGraphNodePropertyBinding struct) via reflection
+	FStructProperty* ValueStructProp = CastField<FStructProperty>(MapProp->ValueProp);
+	if (!ValueStructProp)
+	{
+		GEditor->EndTransaction();
+		return FMonolithActionResult::Error(TEXT("Map value is not a struct — unexpected"));
+	}
+
+	void* ValuePtr = MapHelper.GetValuePtr(TargetIndex);
+	UScriptStruct* BindingStruct = ValueStructProp->Struct;
+
+	// Set PropertyName = binding_name
+	{
+		FNameProperty* Prop = CastField<FNameProperty>(BindingStruct->FindPropertyByName(FName(TEXT("PropertyName"))));
+		if (Prop) Prop->SetPropertyValue(Prop->ContainerPtrToValuePtr<void>(ValuePtr), FName(*BindingName));
+	}
+
+	// Set bIsBound = true
+	{
+		FBoolProperty* Prop = CastField<FBoolProperty>(BindingStruct->FindPropertyByName(FName(TEXT("bIsBound"))));
+		if (Prop) Prop->SetPropertyValue(Prop->ContainerPtrToValuePtr<void>(ValuePtr), true);
+	}
+
+	// Set Type = Property (enum value 1)
+	{
+		FByteProperty* Prop = CastField<FByteProperty>(BindingStruct->FindPropertyByName(FName(TEXT("Type"))));
+		if (Prop)
+		{
+			Prop->SetPropertyValue(Prop->ContainerPtrToValuePtr<void>(ValuePtr), 1); // EAnimGraphNodePropertyBindingType::Property
+		}
+		else
+		{
+			// Might be an enum property in newer UE
+			FEnumProperty* EnumProp = CastField<FEnumProperty>(BindingStruct->FindPropertyByName(FName(TEXT("Type"))));
+			if (EnumProp)
+			{
+				FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
+				if (UnderlyingProp)
+				{
+					UnderlyingProp->SetIntPropertyValue(EnumProp->ContainerPtrToValuePtr<void>(ValuePtr), (int64)1);
+				}
+			}
+		}
+	}
+
+	// Set PathAsText = property_path
+	{
+		FTextProperty* Prop = CastField<FTextProperty>(BindingStruct->FindPropertyByName(FName(TEXT("PathAsText"))));
+		if (Prop)
+		{
+			FText PathText = FText::FromString(PropertyPath);
+			Prop->SetPropertyValue(Prop->ContainerPtrToValuePtr<void>(ValuePtr), PathText);
+		}
+	}
+
+	// Set PropertyPath = [property_path] (TArray<FString>)
+	{
+		FArrayProperty* ArrProp = CastField<FArrayProperty>(BindingStruct->FindPropertyByName(FName(TEXT("PropertyPath"))));
+		if (ArrProp)
+		{
+			FScriptArrayHelper ArrHelper(ArrProp, ArrProp->ContainerPtrToValuePtr<void>(ValuePtr));
+			ArrHelper.EmptyValues(); // Clear existing
+			ArrHelper.AddValue();
+			FStrProperty* StrProp = CastField<FStrProperty>(ArrProp->Inner);
+			if (StrProp)
+			{
+				StrProp->SetPropertyValue(ArrHelper.GetRawPtr(0), PropertyPath);
+			}
+		}
+	}
+
+	// Reconstruct node to apply the binding visually
+	AnimNode->ReconstructNode();
+
+	GEditor->EndTransaction();
+
+	if (bCompile)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(ABP);
+		FKismetEditorUtilities::CompileBlueprint(ABP);
+	}
+
+	ABP->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("node_name"), NodeName);
+	Root->SetStringField(TEXT("binding_name"), BindingName);
+	Root->SetStringField(TEXT("property_path"), PropertyPath);
+	Root->SetBoolField(TEXT("compiled"), bCompile);
 	return FMonolithActionResult::Success(Root);
 }

@@ -1,4 +1,4 @@
----
+﻿---
 name: unreal-ui
 description: Use when working with Unreal Engine UI via Monolith MCP — creating widget blueprints, building HUDs, menus, settings panels, styling, animations, data binding, save systems, and accessibility. Triggers on UI, HUD, widget, menu, settings, save game, accessibility, font, anchor, toast, dialog, loading screen.
 ---

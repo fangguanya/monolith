@@ -1,4 +1,4 @@
-#include "MonolithAnimationActions.h"
+﻿#include "MonolithAnimationActions.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithParamSchema.h"
 
@@ -2742,28 +2742,38 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddCurve(const TSharedPtr
 	FString CurveName = Params->GetStringField(TEXT("curve_name"));
 	FString CurveTypeStr = Params->HasField(TEXT("curve_type")) ? Params->GetStringField(TEXT("curve_type")) : TEXT("Float");
 
-	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
-	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
-
 	ERawCurveTrackTypes CurveType = CurveTypeStr.Equals(TEXT("Transform"), ESearchCase::IgnoreCase)
 		? ERawCurveTrackTypes::RCT_Transform
 		: ERawCurveTrackTypes::RCT_Float;
 
-	const FAnimationCurveIdentifier CurveId(FName(*CurveName), CurveType);
+	// Try AnimSequence first (has DataModel/Controller API), fall back to AnimSequenceBase (montages etc)
+	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
+	if (Seq)
+	{
+		const FAnimationCurveIdentifier CurveId(FName(*CurveName), CurveType);
+		if (Seq->GetDataModel()->FindCurve(CurveId))
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Curve '%s' already exists"), *CurveName));
 
-	// Check if curve already exists
-	if (Seq->GetDataModel()->FindCurve(CurveId))
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Curve '%s' already exists"), *CurveName));
+		IAnimationDataController& Controller = Seq->GetController();
+		Controller.OpenBracket(FText::FromString(TEXT("Add Curve")));
+		bool bSuccess = Controller.AddCurve(CurveId);
+		Controller.CloseBracket();
 
-	IAnimationDataController& Controller = Seq->GetController();
-	Controller.OpenBracket(FText::FromString(TEXT("Add Curve")));
-	bool bSuccess = Controller.AddCurve(CurveId);
-	Controller.CloseBracket();
+		if (!bSuccess)
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to add curve '%s'"), *CurveName));
 
-	if (!bSuccess)
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to add curve '%s'"), *CurveName));
+		Seq->MarkPackageDirty();
+	}
+	else
+	{
+		// Fallback: AnimMontage / AnimComposite via UAnimationBlueprintLibrary
+		UAnimSequenceBase* SeqBase = FMonolithAssetUtils::LoadAssetByPath<UAnimSequenceBase>(AssetPath);
+		if (!SeqBase)
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Animation asset not found (tried AnimSequence and AnimSequenceBase): %s"), *AssetPath));
 
-	Seq->MarkPackageDirty();
+		UAnimationBlueprintLibrary::AddCurve(SeqBase, FName(*CurveName), CurveType, false);
+		SeqBase->MarkPackageDirty();
+	}
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("curve_name"), CurveName);
@@ -2812,8 +2822,9 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetCurveKeys(const TShare
 	FString CurveName = Params->GetStringField(TEXT("curve_name"));
 	FString KeysJson = Params->GetStringField(TEXT("keys_json"));
 
-	UAnimSequence* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequence>(AssetPath);
-	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
+	// Wave 12: Use UAnimSequenceBase to support both AnimSequence and AnimMontage
+	UAnimSequenceBase* Seq = FMonolithAssetUtils::LoadAssetByPath<UAnimSequenceBase>(AssetPath);
+	if (!Seq) return FMonolithActionResult::Error(FString::Printf(TEXT("AnimSequenceBase not found: %s"), *AssetPath));
 
 	const FAnimationCurveIdentifier CurveId(FName(*CurveName), ERawCurveTrackTypes::RCT_Float);
 

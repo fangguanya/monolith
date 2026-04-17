@@ -1,4 +1,4 @@
----
+﻿---
 name: unreal-debugging
 description: Use when debugging Unreal Engine issues via Monolith MCP — build errors, editor log searching, crash context, Live Coding builds, and common UE error patterns. Triggers on build error, compile error, crash, log, debug, stack trace, assertion.
 ---

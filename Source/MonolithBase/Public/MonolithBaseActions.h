@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
 #include "MonolithToolRegistry.h"
@@ -36,6 +36,10 @@ public:
 	static FMonolithActionResult HandleGetObjectProperties(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetObjectProperty(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleFindAssets(const TSharedPtr<FJsonObject>& Params);
+
+	// DataTable 行操作
+	static FMonolithActionResult HandleGetDataTableRow(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetDataTableField(const TSharedPtr<FJsonObject>& Params);
 
 	// 组件管理
 	static FMonolithActionResult HandleAddComponent(const TSharedPtr<FJsonObject>& Params);

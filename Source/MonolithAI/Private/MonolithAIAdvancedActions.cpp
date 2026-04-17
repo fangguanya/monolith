@@ -1,4 +1,4 @@
-#include "MonolithAIAdvancedActions.h"
+﻿#include "MonolithAIAdvancedActions.h"
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
 
@@ -71,6 +71,147 @@ namespace
 
 		return Obj;
 	}
+
+#if WITH_ZONEGRAPH
+	bool ResolveLaneQuery(
+		const TSharedPtr<FJsonObject>& Params,
+		UZoneGraphSubsystem* ZGSubsystem,
+		int32& OutLaneIndex,
+		FZoneGraphDataHandle& OutDataHandle,
+		const FZoneGraphStorage*& OutStorage,
+		FString& OutError)
+	{
+		if (!Params.IsValid() || !Params->HasField(TEXT("lane_handle")))
+		{
+			OutError = TEXT("Missing required param 'lane_handle'");
+			return false;
+		}
+
+		int32 LaneIndex = INDEX_NONE;
+		int32 DataHandleIndex = INDEX_NONE;
+		bool bHasExplicitDataHandle = false;
+
+		if (const TSharedPtr<FJsonObject>* LaneHandleObject = nullptr;
+			Params->TryGetObjectField(TEXT("lane_handle"), LaneHandleObject) && LaneHandleObject && (*LaneHandleObject).IsValid())
+		{
+			const TSharedPtr<FJsonObject>& LaneHandleJson = *LaneHandleObject;
+			if (!LaneHandleJson->HasField(TEXT("lane_index")))
+			{
+				OutError = TEXT("lane_handle object must include lane_index");
+				return false;
+			}
+
+			LaneIndex = static_cast<int32>(LaneHandleJson->GetNumberField(TEXT("lane_index")));
+			if (LaneHandleJson->HasField(TEXT("data_handle")))
+			{
+				DataHandleIndex = static_cast<int32>(LaneHandleJson->GetNumberField(TEXT("data_handle")));
+				bHasExplicitDataHandle = true;
+			}
+		}
+		else
+		{
+			LaneIndex = static_cast<int32>(Params->GetNumberField(TEXT("lane_handle")));
+		}
+
+		if (Params->HasField(TEXT("data_handle")))
+		{
+			DataHandleIndex = static_cast<int32>(Params->GetNumberField(TEXT("data_handle")));
+			bHasExplicitDataHandle = true;
+		}
+
+		const TConstArrayView<FRegisteredZoneGraphData> AllData = ZGSubsystem->GetRegisteredZoneGraphData();
+		auto TryResolveStorageByIndex =
+			[&AllData, ZGSubsystem, LaneIndex, &OutError](int32 RequestedDataHandle, FZoneGraphDataHandle& ResolvedHandle, const FZoneGraphStorage*& ResolvedStorage) -> bool
+		{
+			if (RequestedDataHandle < 0 || RequestedDataHandle >= AllData.Num())
+			{
+				OutError = FString::Printf(TEXT("data_handle %d out of range"), RequestedDataHandle);
+				return false;
+			}
+
+			const FRegisteredZoneGraphData& RegisteredData = AllData[RequestedDataHandle];
+			if (!RegisteredData.bInUse)
+			{
+				OutError = FString::Printf(TEXT("data_handle %d is not active"), RequestedDataHandle);
+				return false;
+			}
+
+			ResolvedHandle = FZoneGraphDataHandle(
+				static_cast<uint16>(RequestedDataHandle),
+				static_cast<uint16>(RegisteredData.Generation));
+			ResolvedStorage = ZGSubsystem->GetZoneGraphStorage(ResolvedHandle);
+			if (!ResolvedStorage)
+			{
+				OutError = FString::Printf(TEXT("No ZoneGraph storage found for data_handle %d"), RequestedDataHandle);
+				return false;
+			}
+
+			if (LaneIndex < 0 || LaneIndex >= ResolvedStorage->Lanes.Num())
+			{
+				OutError = FString::Printf(
+					TEXT("Lane index %d out of range for data_handle %d (0-%d)"),
+					LaneIndex,
+					RequestedDataHandle,
+					ResolvedStorage->Lanes.Num() - 1);
+				return false;
+			}
+
+			return true;
+		};
+
+		if (bHasExplicitDataHandle)
+		{
+			if (!TryResolveStorageByIndex(DataHandleIndex, OutDataHandle, OutStorage))
+			{
+				return false;
+			}
+
+			OutLaneIndex = LaneIndex;
+			return true;
+		}
+
+		int32 MatchCount = 0;
+		for (int32 Idx = 0; Idx < AllData.Num(); ++Idx)
+		{
+			const FRegisteredZoneGraphData& RegisteredData = AllData[Idx];
+			if (!RegisteredData.bInUse)
+			{
+				continue;
+			}
+
+			FZoneGraphDataHandle CandidateHandle(
+				static_cast<uint16>(Idx),
+				static_cast<uint16>(RegisteredData.Generation));
+			const FZoneGraphStorage* CandidateStorage = ZGSubsystem->GetZoneGraphStorage(CandidateHandle);
+			if (!CandidateStorage || LaneIndex < 0 || LaneIndex >= CandidateStorage->Lanes.Num())
+			{
+				continue;
+			}
+
+			++MatchCount;
+			OutDataHandle = CandidateHandle;
+			OutStorage = CandidateStorage;
+		}
+
+		if (MatchCount == 0)
+		{
+			OutError = FString::Printf(TEXT("Lane index %d not found in any active ZoneGraph storage"), LaneIndex);
+			return false;
+		}
+
+		if (MatchCount > 1)
+		{
+			OutError = FString::Printf(
+				TEXT("Lane index %d exists in %d ZoneGraph storages; specify data_handle to disambiguate"),
+				LaneIndex,
+				MatchCount);
+			return false;
+		}
+
+		OutLaneIndex = LaneIndex;
+		return true;
+	}
+#endif // WITH_ZONEGRAPH
 }
 
 #endif // WITH_MASSENTITY
@@ -175,10 +316,11 @@ void FMonolithAIAdvancedActions::RegisterActions(FMonolithToolRegistry& Registry
 
 	// 229. get_zone_lane_info
 	Registry.RegisterAction(TEXT("ai"), TEXT("get_zone_lane_info"),
-		TEXT("Get detailed info about a specific zone graph lane by handle index"),
+		TEXT("Get detailed info about a specific zone graph lane handle"),
 		FMonolithActionHandler::CreateStatic(&HandleGetZoneLaneInfo),
 		FParamSchemaBuilder()
-			.Required(TEXT("lane_handle"), TEXT("number"), TEXT("Lane handle index"))
+			.Required(TEXT("lane_handle"), TEXT("any"), TEXT("Lane handle: lane index number or {lane_index, data_handle} object"))
+			.Optional(TEXT("data_handle"), TEXT("number"), TEXT("ZoneGraph data handle index when lane_handle is a plain lane index"))
 			.Build());
 #endif // WITH_ZONEGRAPH
 
@@ -735,6 +877,10 @@ FMonolithActionResult FMonolithAIAdvancedActions::HandleQueryZoneLanes(const TSh
 		TSharedPtr<FJsonObject> LaneObj = MakeShared<FJsonObject>();
 		LaneObj->SetNumberField(TEXT("lane_index"), Handle.Index);
 		LaneObj->SetNumberField(TEXT("data_handle"), Handle.DataHandle.Index);
+		TSharedPtr<FJsonObject> LaneHandleObj = MakeShared<FJsonObject>();
+		LaneHandleObj->SetNumberField(TEXT("lane_index"), Handle.Index);
+		LaneHandleObj->SetNumberField(TEXT("data_handle"), Handle.DataHandle.Index);
+		LaneObj->SetObjectField(TEXT("lane_handle"), LaneHandleObj);
 		LaneArr.Add(MakeShared<FJsonValueObject>(LaneObj));
 	}
 
@@ -749,13 +895,6 @@ FMonolithActionResult FMonolithAIAdvancedActions::HandleQueryZoneLanes(const TSh
 // 229. get_zone_lane_info
 FMonolithActionResult FMonolithAIAdvancedActions::HandleGetZoneLaneInfo(const TSharedPtr<FJsonObject>& Params)
 {
-	if (!Params->HasField(TEXT("lane_handle")))
-	{
-		return FMonolithActionResult::Error(TEXT("Missing required param 'lane_handle'"));
-	}
-
-	int32 LaneIndex = static_cast<int32>(Params->GetNumberField(TEXT("lane_handle")));
-
 	UWorld* World = MonolithAI::GetPIEWorld();
 	if (!World)
 	{
@@ -772,34 +911,20 @@ FMonolithActionResult FMonolithAIAdvancedActions::HandleGetZoneLaneInfo(const TS
 		return FMonolithActionResult::Error(TEXT("UZoneGraphSubsystem not found"));
 	}
 
-	// Get lane location data from the first registered zone graph data
+	int32 LaneIndex = INDEX_NONE;
+	FZoneGraphDataHandle DataHandle;
 	const FZoneGraphStorage* Storage = nullptr;
+	FString ResolveError;
+	if (!ResolveLaneQuery(Params, ZGSubsystem, LaneIndex, DataHandle, Storage, ResolveError))
 	{
-		TConstArrayView<FRegisteredZoneGraphData> AllData = ZGSubsystem->GetRegisteredZoneGraphData();
-		for (int32 Idx = 0; Idx < AllData.Num(); ++Idx)
-		{
-			if (AllData[Idx].bInUse)
-			{
-				FZoneGraphDataHandle Handle(static_cast<uint16>(Idx), static_cast<uint16>(AllData[Idx].Generation));
-				Storage = ZGSubsystem->GetZoneGraphStorage(Handle);
-				if (Storage) break;
-			}
-		}
-	}
-	if (!Storage)
-	{
-		return FMonolithActionResult::Error(TEXT("No ZoneGraph storage available"));
-	}
-
-	if (LaneIndex < 0 || LaneIndex >= Storage->Lanes.Num())
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Lane index %d out of range (0-%d)"), LaneIndex, Storage->Lanes.Num() - 1));
+		return FMonolithActionResult::Error(ResolveError);
 	}
 
 	const FZoneLaneData& Lane = Storage->Lanes[LaneIndex];
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetNumberField(TEXT("lane_index"), LaneIndex);
+	Result->SetNumberField(TEXT("data_handle"), DataHandle.Index);
 	Result->SetNumberField(TEXT("width"), Lane.Width);
 	Result->SetNumberField(TEXT("num_points"), Lane.PointsEnd - Lane.PointsBegin);
 	Result->SetNumberField(TEXT("tags"), static_cast<int32>(Lane.Tags.GetValue())); // raw bitmask value

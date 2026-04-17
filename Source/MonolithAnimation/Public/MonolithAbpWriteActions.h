@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
 #include "MonolithToolRegistry.h"
@@ -18,4 +18,7 @@ private:
 	static FMonolithActionResult HandleAddAnimGraphNode(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleConnectAnimGraphPins(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleSetStateAnimation(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetLinkedLayer(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetAnimNodeProperty(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleSetPropertyBinding(const TSharedPtr<FJsonObject>& Params);
 };
