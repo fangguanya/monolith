@@ -1,4 +1,4 @@
----
+﻿---
 name: unreal-animation
 description: Use when inspecting or editing Unreal animation assets via Monolith MCP — sequences, montages, blend spaces, animation blueprints, notifies, curves, sync markers, skeletons, IKRig, IK Retargeter, Control Rig. Triggers on animation, montage, ABP, blend space, notify, anim sequence, skeleton, IKRig, retargeter, control rig.
 ---

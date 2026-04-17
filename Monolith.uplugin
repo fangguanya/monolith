@@ -1,4 +1,4 @@
-{
+﻿{
 	"FileVersion": 3,
 	"Version": 1,
 	"VersionName": "0.12.1",
@@ -105,6 +105,16 @@
 			"Name": "ZoneGraph",
 			"Enabled": true,
 			"Optional": true
+		},
+		{
+			"Name": "MassCrowd",
+			"Enabled": true,
+			"Optional": true
+		},
+		{
+			"Name": "Traffic",
+			"Enabled": true,
+			"Optional": true
 		}
 	],
 	"Modules": [
@@ -200,6 +210,16 @@
 		},
 		{
 			"Name": "MonolithBase",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithMass",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithPerf",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
 		}

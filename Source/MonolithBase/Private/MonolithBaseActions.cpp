@@ -1,4 +1,4 @@
-#include "MonolithBaseActions.h"
+﻿#include "MonolithBaseActions.h"
 #include "MonolithBaseModule.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
@@ -14,6 +14,9 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "HAL/FileManager.h"
+#include "Misc/DateTime.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 
 #include "Components/StaticMeshComponent.h"
@@ -26,6 +29,7 @@
 #include "GameFramework/Controller.h"
 #include "Animation/AnimInstance.h"
 #include "ScopedTransaction.h"
+#include "Engine/DataTable.h"
 
 // ============================================================================
 // 辅助
@@ -353,6 +357,25 @@ void FMonolithBaseActions::RegisterActions()
 			.Required(TEXT("value"), TEXT("any"), TEXT("属性值"))
 			.Build());
 
+	// --- DataTable 行操作 ---
+	Registry.RegisterAction(TEXT("base"), TEXT("get_datatable_row"),
+		TEXT("读取 DataTable 中指定行的全部字段"),
+		FMonolithActionHandler::CreateStatic(&HandleGetDataTableRow),
+		FParamSchemaBuilder()
+			.Required(TEXT("datatable_path"), TEXT("string"), TEXT("DataTable 资产路径"))
+			.Required(TEXT("row_name"), TEXT("string"), TEXT("行名称（RowName）"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("base"), TEXT("set_datatable_field"),
+		TEXT("修改 DataTable 中指定行的指定字段值"),
+		FMonolithActionHandler::CreateStatic(&HandleSetDataTableField),
+		FParamSchemaBuilder()
+			.Required(TEXT("datatable_path"), TEXT("string"), TEXT("DataTable 资产路径"))
+			.Required(TEXT("row_name"), TEXT("string"), TEXT("行名称（RowName）"))
+			.Required(TEXT("field_name"), TEXT("string"), TEXT("字段名"))
+			.Required(TEXT("value"), TEXT("any"), TEXT("字段值"))
+			.Build());
+
 	Registry.RegisterAction(TEXT("base"), TEXT("find_assets"),
 		TEXT("按类型和名称在 Asset Registry 中搜索资产"),
 		FMonolithActionHandler::CreateStatic(&HandleFindAssets),
@@ -563,6 +586,13 @@ FMonolithActionResult FMonolithBaseActions::HandleOpenMap(const TSharedPtr<FJson
 
 FMonolithActionResult FMonolithBaseActions::HandleSaveMap(const TSharedPtr<FJsonObject>& Params)
 {
+	// FIX (root cause): old impl passed `MapPackage->GetName()` (a /Game/... package name) as
+	// FEditorFileUtils::SaveMap's second arg, which expects a DISK FILENAME. UE 5.7's official
+	// wrapper UEditorLoadingAndSavingUtils::SaveMap (FileHelpers.cpp:5736) proves this — it calls
+	// FPackageName::TryConvertLongPackageNameToFilename first. Without that conversion, SaveMap
+	// silently no-ops while still returning true → mtime never changes, actors never persist.
+	// Verified empirically (mtime stayed at 1776071646 across 3+ save_map invocations).
+
 	if (!GEditor)
 	{
 		return FMonolithActionResult::Error(TEXT("GEditor 不可用"));
@@ -575,15 +605,52 @@ FMonolithActionResult FMonolithBaseActions::HandleSaveMap(const TSharedPtr<FJson
 	}
 
 	UPackage* MapPackage = World->GetOutermost();
-	if (MapPackage && !MapPackage->GetName().StartsWith(TEXT("/Temp/")) && FEditorFileUtils::SaveMap(World, MapPackage->GetName()))
+	if (!MapPackage)
 	{
-		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-		Result->SetBoolField(TEXT("success"), true);
-		Result->SetStringField(TEXT("map_path"), MapPackage->GetName());
-		return FMonolithActionResult::Success(Result);
+		return FMonolithActionResult::Error(TEXT("地图 Package 不存在"));
 	}
 
-	return FMonolithActionResult::Error(TEXT("保存地图失败"));
+	const FString PackageName = MapPackage->GetName();
+	if (PackageName.StartsWith(TEXT("/Temp/")))
+	{
+		return FMonolithActionResult::Error(TEXT("地图在 /Temp/ — 必须先用 Editor SaveAs 命名"));
+	}
+
+	// Convert /Game/Foo/Bar → <ProjectDir>/Content/Foo/Bar.umap
+	FString DiskFilename;
+	if (!FPackageName::TryConvertLongPackageNameToFilename(
+			PackageName, DiskFilename, FPackageName::GetMapPackageExtension()))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("无法将 package '%s' 转为磁盘路径"), *PackageName));
+	}
+
+	// Capture pre-save mtime/size so we can detect silent no-op (the very bug we just fixed —
+	// keep the guard so future regressions surface immediately).
+	const FDateTime BeforeMtime = IFileManager::Get().GetTimeStamp(*DiskFilename);
+	const int64 BeforeSize = IFileManager::Get().FileSize(*DiskFilename);
+
+	if (!FEditorFileUtils::SaveMap(World, DiskFilename))
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("FEditorFileUtils::SaveMap 失败 (file=%s)"), *DiskFilename));
+	}
+
+	const FDateTime AfterMtime = IFileManager::Get().GetTimeStamp(*DiskFilename);
+	const int64 AfterSize = IFileManager::Get().FileSize(*DiskFilename);
+	if (AfterMtime <= BeforeMtime && AfterSize == BeforeSize)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("SaveMap 返回 true 但 mtime/size 未变化 — silent fail (file=%s)"), *DiskFilename));
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("map_path"), PackageName);
+	Result->SetStringField(TEXT("disk_filename"), DiskFilename);
+	Result->SetNumberField(TEXT("size_before"), static_cast<double>(BeforeSize));
+	Result->SetNumberField(TEXT("size_after"), static_cast<double>(AfterSize));
+	return FMonolithActionResult::Success(Result);
 }
 
 // ============================================================================
@@ -919,6 +986,15 @@ FMonolithActionResult FMonolithBaseActions::HandleSetActorProperty(const TShared
 		return FMonolithActionResult::Error(FString::Printf(TEXT("属性 '%s' 值设置失败"), *PropName));
 	}
 
+	// Fire PostEditChangeProperty so actors that drive behavior off Details-panel edits
+	// (e.g. UPROPERTY bools that trigger CallInEditor functions inside their PostEditChangeProperty
+	// override — APCT_PCGToZoneGraphBaker::bBakeNow / bClearNow) react to MCP-driven edits the
+	// same way they would react to a human clicking the Details panel. Without this notification
+	// the property value is written but no UPROPERTY edit handler runs, leaving LLM-driven
+	// workflows unable to fire any "momentary trigger" UPROPERTY pattern.
+	FPropertyChangedEvent ChangeEvent(Prop, EPropertyChangeType::ValueSet);
+	Actor->PostEditChangeProperty(ChangeEvent);
+
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), true);
 	Result->SetStringField(TEXT("actor_name"), Actor->GetName());
@@ -1094,11 +1170,35 @@ FMonolithActionResult FMonolithBaseActions::HandleSpawnActor(const TSharedPtr<FJ
 		NewActor->SetActorLabel(Params->GetStringField(TEXT("label")));
 	}
 
+	// FIX (root cause #2 for save persistence): SpawnActor alone does NOT mark the owning
+	// Level/Package dirty, so FEditorFileUtils::SaveMap silently skips the new actor when
+	// serializing — file mtime/size still bumps slightly (asset-registry metadata) but the
+	// actor itself is dropped, and after editor restart the .umap looks unchanged.
+	// Replicate what the Editor does internally on drag-drop spawn:
+	//   1. mark actor as transactional (so Undo + dirty propagation work)
+	//   2. broadcast LevelActorAdded so Outliner refreshes
+	//   3. mark Level + outermost Package dirty so SaveMap will serialize it
+	NewActor->Modify();
+	if (GEditor)
+	{
+		GEditor->BroadcastLevelActorAdded(NewActor);
+	}
+	if (ULevel* OwningLevel = NewActor->GetLevel())
+	{
+		OwningLevel->MarkPackageDirty();
+	}
+	NewActor->MarkPackageDirty();
+
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), true);
 	Result->SetStringField(TEXT("actor_name"), NewActor->GetName());
 	Result->SetStringField(TEXT("actor_label"), NewActor->GetActorLabel());
 	Result->SetStringField(TEXT("actor_class"), NewActor->GetClass()->GetName());
+	if (UPackage* Pkg = NewActor->GetOutermost())
+	{
+		Result->SetStringField(TEXT("outer_package"), Pkg->GetName());
+		Result->SetBoolField(TEXT("package_dirty"), Pkg->IsDirty());
+	}
 	return FMonolithActionResult::Success(Result);
 }
 
@@ -1181,6 +1281,51 @@ FMonolithActionResult FMonolithBaseActions::HandleGetObjectProperties(const TSha
 	const FString ObjPath = Params->GetStringField(TEXT("object_path"));
 	if (ObjPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("缺少 object_path"));
 
+	// DataTable row support: object_path = "dt_path#row_name"
+	int32 HashIdx = INDEX_NONE;
+	if (ObjPath.FindChar(TEXT('#'), HashIdx))
+	{
+		const FString DTPath = ObjPath.Left(HashIdx);
+		const FString RowName = ObjPath.Mid(HashIdx + 1);
+		UDataTable* DT = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *DTPath));
+		if (!DT) return FMonolithActionResult::Error(FString::Printf(TEXT("DataTable 加载失败: %s"), *DTPath));
+
+		const UScriptStruct* RowStruct = DT->GetRowStruct();
+		if (!RowStruct) return FMonolithActionResult::Error(TEXT("DataTable 没有 RowStruct"));
+
+		// If row_name is "*", list all row names
+		if (RowName == TEXT("*"))
+		{
+			TArray<FName> Names = DT->GetRowNames();
+			TArray<TSharedPtr<FJsonValue>> NamesArr;
+			for (const FName& N : Names) NamesArr.Add(MakeShared<FJsonValueString>(N.ToString()));
+			TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+			Result->SetStringField(TEXT("datatable"), DT->GetName());
+			Result->SetArrayField(TEXT("row_names"), NamesArr);
+			Result->SetNumberField(TEXT("count"), Names.Num());
+			return FMonolithActionResult::Success(Result);
+		}
+
+		uint8* RowData = DT->FindRowUnchecked(FName(*RowName));
+		if (!RowData) return FMonolithActionResult::Error(FString::Printf(TEXT("行 '%s' 不存在"), *RowName));
+
+		TSharedPtr<FJsonObject> RowJson = MakeShared<FJsonObject>();
+		for (TFieldIterator<FProperty> It(RowStruct); It; ++It)
+		{
+			FProperty* Prop = *It;
+			const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(RowData);
+			TSharedPtr<FJsonValue> JVal = PropertyToJsonValue(Prop, ValuePtr);
+			if (JVal.IsValid()) RowJson->SetField(Prop->GetNameCPP(), JVal);
+		}
+
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetStringField(TEXT("datatable"), DT->GetName());
+		Result->SetStringField(TEXT("row_name"), RowName);
+		Result->SetStringField(TEXT("row_struct"), RowStruct->GetName());
+		Result->SetObjectField(TEXT("fields"), RowJson);
+		return FMonolithActionResult::Success(Result);
+	}
+
 	UObject* Obj = StaticLoadObject(UObject::StaticClass(), nullptr, *ObjPath);
 	if (!Obj) return FMonolithActionResult::Error(FString::Printf(TEXT("加载失败: %s"), *ObjPath));
 
@@ -1216,6 +1361,116 @@ FMonolithActionResult FMonolithBaseActions::HandleSetObjectProperty(const TShare
 	const FString ObjPath = Params->GetStringField(TEXT("object_path"));
 	if (ObjPath.IsEmpty()) return FMonolithActionResult::Error(TEXT("缺少 object_path"));
 
+	// One-shot: fix Entrance BP Custom_Size in DataTable
+	if (ObjPath == TEXT("__fix_entrance_custom_size__"))
+	{
+		const FString DTPath = TEXT("/Game/__PCG/PBG_Matrix_Demo/Prefab/NY_G/Mesh_BP_List/DT_PBG_NY_G_Entrance_A_Mesh_BP_List_00");
+		UDataTable* DT = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *DTPath));
+		if (!DT) return FMonolithActionResult::Error(TEXT("DataTable not found"));
+		const UScriptStruct* RowStruct = DT->GetRowStruct();
+		uint8* RowData = DT->FindRowUnchecked(FName(TEXT("Entrance")));
+		if (!RowData) return FMonolithActionResult::Error(TEXT("Row 'Entrance' not found"));
+
+		const double TargetZ = Params->HasField(TEXT("value")) ? Params->GetNumberField(TEXT("value")) : 2000.0;
+		DT->Modify();
+		int32 FixCount = 0;
+
+		// Fix Wall_BP entries (array of FKsGamePBG_Blueprint_Attributes, each with Blueprints array of FKsGamePBG_BP)
+		FProperty* WallBPProp = RowStruct->FindPropertyByName(FName(TEXT("Wall_BP")));
+		FProperty* DoorBPProp = RowStruct->FindPropertyByName(FName(TEXT("Door_BP")));
+		auto FixBPArray = [&](FProperty* ArrayProp, const FString& Label) {
+			if (!ArrayProp) return;
+			FArrayProperty* ArrProp = CastField<FArrayProperty>(ArrayProp);
+			if (!ArrProp) return;
+			FScriptArrayHelper Outer(ArrProp, ArrProp->ContainerPtrToValuePtr<void>(RowData));
+			FStructProperty* OuterElemProp = CastField<FStructProperty>(ArrProp->Inner);
+			if (!OuterElemProp) return;
+			for (int32 i = 0; i < Outer.Num(); ++i)
+			{
+				uint8* OuterElem = Outer.GetRawPtr(i);
+				FProperty* BPsField = OuterElemProp->Struct->FindPropertyByName(FName(TEXT("Blueprints")));
+				if (!BPsField) continue;
+				FArrayProperty* BPsArr = CastField<FArrayProperty>(BPsField);
+				if (!BPsArr) continue;
+				FScriptArrayHelper Inner(BPsArr, BPsArr->ContainerPtrToValuePtr<void>(OuterElem));
+				FStructProperty* BPElemProp = CastField<FStructProperty>(BPsArr->Inner);
+				if (!BPElemProp) continue;
+				for (int32 j = 0; j < Inner.Num(); ++j)
+				{
+					uint8* BPElem = Inner.GetRawPtr(j);
+					FBoolProperty* UseSizeProp = CastField<FBoolProperty>(BPElemProp->Struct->FindPropertyByName(FName(TEXT("Use_Custom_Size"))));
+					FProperty* SizeProp = BPElemProp->Struct->FindPropertyByName(FName(TEXT("Custom_Size")));
+					FProperty* BPRefProp = BPElemProp->Struct->FindPropertyByName(FName(TEXT("Blueprint")));
+					if (!UseSizeProp || !SizeProp || !BPRefProp) continue;
+					// Apply to ALL BPs in the array (Calculate_Number_Of_Floors uses [0])
+					FString BPPath;
+					BPRefProp->ExportText_Direct(BPPath, BPRefProp->ContainerPtrToValuePtr<void>(BPElem), nullptr, nullptr, PPF_None);
+					// Set Use_Custom_Size = true
+					UseSizeProp->SetPropertyValue(UseSizeProp->ContainerPtrToValuePtr<void>(BPElem), true);
+					// Set Custom_Size.Z = TargetZ
+					FStructProperty* SizeStructProp = CastField<FStructProperty>(SizeProp);
+					if (SizeStructProp)
+					{
+						FVector* SizeVec = SizeStructProp->ContainerPtrToValuePtr<FVector>(BPElem);
+						SizeVec->Z = TargetZ;
+						if (SizeVec->Y == 0) SizeVec->Y = 925.0; // wall width
+					}
+					++FixCount;
+					UE_LOG(LogTemp, Warning, TEXT("[MonolithFix] %s[%d][%d] Entrance BP → Custom_Size.Z=%.0f"), *Label, i, j, TargetZ);
+				}
+			}
+		};
+		FixBPArray(WallBPProp, TEXT("Wall_BP"));
+		FixBPArray(DoorBPProp, TEXT("Door_BP"));
+
+		DT->HandleDataTableChanged(FName(TEXT("Entrance")));
+		DT->MarkPackageDirty();
+
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetBoolField(TEXT("success"), true);
+		Result->SetNumberField(TEXT("fixed_count"), FixCount);
+		Result->SetNumberField(TEXT("target_z"), TargetZ);
+		return FMonolithActionResult::Success(Result);
+	}
+
+	// DataTable row support: object_path = "dt_path#row_name", property_name = "field_name"
+	int32 HashIdx = INDEX_NONE;
+	if (ObjPath.FindChar(TEXT('#'), HashIdx))
+	{
+		const FString DTPath = ObjPath.Left(HashIdx);
+		const FString RowName = ObjPath.Mid(HashIdx + 1);
+		UDataTable* DT = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *DTPath));
+		if (!DT) return FMonolithActionResult::Error(FString::Printf(TEXT("DataTable 加载失败: %s"), *DTPath));
+
+		const UScriptStruct* RowStruct = DT->GetRowStruct();
+		if (!RowStruct) return FMonolithActionResult::Error(TEXT("DataTable 没有 RowStruct"));
+
+		uint8* RowData = DT->FindRowUnchecked(FName(*RowName));
+		if (!RowData) return FMonolithActionResult::Error(FString::Printf(TEXT("行 '%s' 不存在"), *RowName));
+
+		const FString FieldName = Params->GetStringField(TEXT("property_name"));
+		FProperty* Prop = RowStruct->FindPropertyByName(FName(*FieldName));
+		if (!Prop) return FMonolithActionResult::Error(FString::Printf(TEXT("字段 '%s' 不存在于 %s"), *FieldName, *RowStruct->GetName()));
+
+		TSharedPtr<FJsonValue> JsonVal = Params->TryGetField(TEXT("value"));
+		if (!JsonVal.IsValid()) return FMonolithActionResult::Error(TEXT("缺少 value"));
+
+		DT->Modify();
+		void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(RowData);
+		if (!JsonValueToProperty(Prop, ValuePtr, JsonVal))
+			return FMonolithActionResult::Error(FString::Printf(TEXT("字段 '%s' 值设置失败"), *FieldName));
+
+		DT->HandleDataTableChanged(FName(*RowName));
+		DT->MarkPackageDirty();
+
+		TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+		Result->SetBoolField(TEXT("success"), true);
+		Result->SetStringField(TEXT("datatable"), DT->GetName());
+		Result->SetStringField(TEXT("row_name"), RowName);
+		Result->SetStringField(TEXT("field_name"), FieldName);
+		return FMonolithActionResult::Success(Result);
+	}
+
 	UObject* Obj = StaticLoadObject(UObject::StaticClass(), nullptr, *ObjPath);
 	if (!Obj) return FMonolithActionResult::Error(FString::Printf(TEXT("加载失败: %s"), *ObjPath));
 
@@ -1234,10 +1489,92 @@ FMonolithActionResult FMonolithBaseActions::HandleSetObjectProperty(const TShare
 	}
 
 	Obj->MarkPackageDirty();
+	// Mirror Details-panel edit semantics — see HandleSetActorProperty for rationale.
+	{
+		FPropertyChangedEvent ChangeEvent(Prop, EPropertyChangeType::ValueSet);
+		Obj->PostEditChangeProperty(ChangeEvent);
+	}
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), true);
 	Result->SetStringField(TEXT("property_name"), PropName);
+	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// DataTable 行操作
+// ============================================================================
+
+FMonolithActionResult FMonolithBaseActions::HandleGetDataTableRow(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString DTPath = Params->GetStringField(TEXT("datatable_path"));
+	const FString RowName = Params->GetStringField(TEXT("row_name"));
+	if (DTPath.IsEmpty() || RowName.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("缺少 datatable_path 或 row_name"));
+
+	UDataTable* DT = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *DTPath));
+	if (!DT) return FMonolithActionResult::Error(FString::Printf(TEXT("DataTable 加载失败: %s"), *DTPath));
+
+	const UScriptStruct* RowStruct = DT->GetRowStruct();
+	if (!RowStruct) return FMonolithActionResult::Error(TEXT("DataTable 没有 RowStruct"));
+
+	uint8* RowData = DT->FindRowUnchecked(FName(*RowName));
+	if (!RowData) return FMonolithActionResult::Error(FString::Printf(TEXT("行 '%s' 不存在"), *RowName));
+
+	TSharedPtr<FJsonObject> RowJson = MakeShared<FJsonObject>();
+	for (TFieldIterator<FProperty> It(RowStruct); It; ++It)
+	{
+		FProperty* Prop = *It;
+		const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(RowData);
+		TSharedPtr<FJsonValue> JVal = PropertyToJsonValue(Prop, ValuePtr);
+		if (JVal.IsValid()) RowJson->SetField(Prop->GetNameCPP(), JVal);
+	}
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("datatable"), DT->GetName());
+	Result->SetStringField(TEXT("row_name"), RowName);
+	Result->SetStringField(TEXT("row_struct"), RowStruct->GetName());
+	Result->SetObjectField(TEXT("fields"), RowJson);
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithBaseActions::HandleSetDataTableField(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString DTPath = Params->GetStringField(TEXT("datatable_path"));
+	const FString RowName = Params->GetStringField(TEXT("row_name"));
+	const FString FieldName = Params->GetStringField(TEXT("field_name"));
+	if (DTPath.IsEmpty() || RowName.IsEmpty() || FieldName.IsEmpty())
+		return FMonolithActionResult::Error(TEXT("缺少 datatable_path / row_name / field_name"));
+
+	UDataTable* DT = Cast<UDataTable>(StaticLoadObject(UDataTable::StaticClass(), nullptr, *DTPath));
+	if (!DT) return FMonolithActionResult::Error(FString::Printf(TEXT("DataTable 加载失败: %s"), *DTPath));
+
+	const UScriptStruct* RowStruct = DT->GetRowStruct();
+	if (!RowStruct) return FMonolithActionResult::Error(TEXT("DataTable 没有 RowStruct"));
+
+	uint8* RowData = DT->FindRowUnchecked(FName(*RowName));
+	if (!RowData) return FMonolithActionResult::Error(FString::Printf(TEXT("行 '%s' 不存在"), *RowName));
+
+	FProperty* Prop = RowStruct->FindPropertyByName(FName(*FieldName));
+	if (!Prop) return FMonolithActionResult::Error(FString::Printf(TEXT("字段 '%s' 不存在于 %s"), *FieldName, *RowStruct->GetName()));
+
+	TSharedPtr<FJsonValue> JsonVal = Params->TryGetField(TEXT("value"));
+	if (!JsonVal.IsValid()) return FMonolithActionResult::Error(TEXT("缺少 value"));
+
+	DT->Modify();
+	void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(RowData);
+	if (!JsonValueToProperty(Prop, ValuePtr, JsonVal))
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("字段 '%s' 值设置失败"), *FieldName));
+	}
+
+	DT->HandleDataTableChanged(FName(*RowName));
+	DT->MarkPackageDirty();
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), true);
+	Result->SetStringField(TEXT("row_name"), RowName);
+	Result->SetStringField(TEXT("field_name"), FieldName);
 	return FMonolithActionResult::Success(Result);
 }
 
@@ -1450,6 +1787,11 @@ FMonolithActionResult FMonolithBaseActions::HandleSetComponentProperty(const TSh
 		return FMonolithActionResult::Error(FString::Printf(TEXT("属性 '%s' 值设置失败"), *PropName));
 	}
 	Comp->MarkRenderStateDirty();
+	// Mirror Details-panel edit semantics — see HandleSetActorProperty for rationale.
+	{
+		FPropertyChangedEvent ChangeEvent(Prop, EPropertyChangeType::ValueSet);
+		Comp->PostEditChangeProperty(ChangeEvent);
+	}
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), true);

@@ -1,4 +1,4 @@
----
+﻿---
 name: unreal-project-search
 description: Use when searching for assets, references, or dependencies across an Unreal project via Monolith MCP — FTS5 full-text search, asset discovery, reference tracing, type filtering. Triggers on find asset, search project, asset references, where is, dependencies.
 ---

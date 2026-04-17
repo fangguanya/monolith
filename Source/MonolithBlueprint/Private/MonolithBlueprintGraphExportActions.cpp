@@ -48,6 +48,19 @@ void FMonolithBlueprintGraphExportActions::RegisterActions(FMonolithToolRegistry
 			.Required(TEXT("graph_name"), TEXT("string"), TEXT("Name of the graph to duplicate"))
 			.Required(TEXT("new_name"), TEXT("string"), TEXT("Name for the duplicated graph"))
 			.Build());
+
+	Registry.RegisterAction(TEXT("blueprint"), TEXT("export_nodes_t3d"),
+		TEXT("Export nodes from a Blueprint graph as raw T3D text — same format as Ctrl+C in the editor. "
+			"Returns full node state including FAnimNode_ struct fields, property bindings, and everything "
+			"standard JSON serialization misses. Programmatic equivalent of Ctrl+A+Ctrl+C. "
+			"Omit node_ids to export ALL nodes in the graph. For ABP state machine inner graphs (states, "
+			"transitions), use animation.dump_abp_t3d instead — this action only sees top-level graphs."),
+		FMonolithActionHandler::CreateStatic(&HandleExportNodesT3D),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
+			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Graph name (defaults to first event graph)"))
+			.Optional(TEXT("node_ids"), TEXT("array"), TEXT("Specific node IDs to export. Omit to export ALL nodes (Ctrl+A semantics)"))
+			.Build());
 }
 
 // ============================================================
@@ -424,6 +437,89 @@ FMonolithActionResult FMonolithBlueprintGraphExportActions::HandleDuplicateGraph
 	Root->SetStringField(TEXT("new_graph"), DuplicatedGraph->GetName());
 	Root->SetStringField(TEXT("graph_type"), bIsFunction ? TEXT("function") : TEXT("macro"));
 	Root->SetNumberField(TEXT("node_count"), DuplicatedGraph->Nodes.Num());
+
+	return FMonolithActionResult::Success(Root);
+}
+
+// ============================================================
+//  export_nodes_t3d — programmatic Ctrl+A+Ctrl+C
+// ============================================================
+
+FMonolithActionResult FMonolithBlueprintGraphExportActions::HandleExportNodesT3D(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	UBlueprint* BP = MonolithBlueprintInternal::LoadBlueprintFromParams(Params, AssetPath);
+	if (!BP)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Blueprint not found: %s"), *AssetPath));
+	}
+
+	FString GraphName;
+	Params->TryGetStringField(TEXT("graph_name"), GraphName);
+	UEdGraph* Graph = MonolithBlueprintInternal::FindGraphByName(BP, GraphName);
+	if (!Graph)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("Graph not found: %s"), *GraphName));
+	}
+
+	// Collect nodes — if node_ids provided, filter; otherwise export all nodes in the graph
+	TSet<UObject*> NodesToExport;
+	TArray<FString> NotFound;
+
+	const TArray<TSharedPtr<FJsonValue>>* NodeIdValues = nullptr;
+	const bool bHasNodeIds = Params->TryGetArrayField(TEXT("node_ids"), NodeIdValues) && NodeIdValues && NodeIdValues->Num() > 0;
+
+	if (bHasNodeIds)
+	{
+		for (const TSharedPtr<FJsonValue>& IdVal : *NodeIdValues)
+		{
+			FString NodeId = IdVal->AsString();
+			bool bFound = false;
+			for (UEdGraphNode* N : Graph->Nodes)
+			{
+				if (N && N->GetName() == NodeId)
+				{
+					NodesToExport.Add(N);
+					bFound = true;
+					break;
+				}
+			}
+			if (!bFound) NotFound.Add(NodeId);
+		}
+	}
+	else
+	{
+		// Ctrl+A semantics — export every node in the graph
+		for (UEdGraphNode* N : Graph->Nodes)
+		{
+			if (N) NodesToExport.Add(N);
+		}
+	}
+
+	if (NodesToExport.Num() == 0)
+	{
+		return FMonolithActionResult::Error(TEXT("No nodes to export — graph is empty or all requested node_ids were not found"));
+	}
+
+	FString ExportedText;
+	FEdGraphUtilities::ExportNodesToText(NodesToExport, ExportedText);
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("asset_path"), AssetPath);
+	Root->SetStringField(TEXT("graph_name"), Graph->GetName());
+	Root->SetNumberField(TEXT("node_count"), NodesToExport.Num());
+	Root->SetNumberField(TEXT("text_bytes"), ExportedText.Len());
+	Root->SetStringField(TEXT("t3d_text"), ExportedText);
+
+	if (NotFound.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> NotFoundArr;
+		for (const FString& Id : NotFound)
+		{
+			NotFoundArr.Add(MakeShared<FJsonValueString>(Id));
+		}
+		Root->SetArrayField(TEXT("not_found"), NotFoundArr);
+	}
 
 	return FMonolithActionResult::Success(Root);
 }

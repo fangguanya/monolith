@@ -1,4 +1,4 @@
----
+﻿---
 name: unreal-combograph
 description: Use when working with ComboGraph plugin via Monolith MCP — creating and editing combo graphs, nodes, edges, effects, cues, and scaffolding combo abilities. Triggers on combo, combo graph, combo node, combo edge, combo ability, combo montage, attack chain, hit sequence.
 ---

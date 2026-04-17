@@ -1,4 +1,4 @@
-#include "MonolithBlueprintGraphActions.h"
+﻿#include "MonolithBlueprintGraphActions.h"
 #include "MonolithBlueprintInternal.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
@@ -9,13 +9,20 @@
 #include "K2Node_Event.h"
 #include "K2Node_CreateDelegate.h"
 #include "EdGraphSchema_K2.h"
+// Wave 11 — AnimationGraph schema + pose nodes for ALI layer function creation
+#include "AnimationGraph.h"
+#include "AnimationGraphSchema.h"
+#include "AnimGraphNode_Root.h"
+#include "AnimGraphNode_LinkedInputPose.h"
+#include "EdGraphSchema_K2_Actions.h"
 
 // --- Registration ---
 
 void FMonolithBlueprintGraphActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	Registry.RegisterAction(TEXT("blueprint"), TEXT("add_function"),
-		TEXT("Add a new function graph to a Blueprint"),
+		TEXT("Add a new function graph to a Blueprint. Set is_anim_layer=true to create an AnimationGraph "
+			"(pose in/out) instead of a K2 graph — required for ALI (AnimLayerInterface) pose functions."),
 		FMonolithActionHandler::CreateStatic(&HandleAddFunction),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Blueprint asset path"))
@@ -23,6 +30,7 @@ void FMonolithBlueprintGraphActions::RegisterActions(FMonolithToolRegistry& Regi
 			.Optional(TEXT("is_pure"), TEXT("bool"), TEXT("Mark as pure (no exec pins)"), TEXT("false"))
 			.Optional(TEXT("is_const"), TEXT("bool"), TEXT("Mark as const"), TEXT("false"))
 			.Optional(TEXT("is_static"), TEXT("bool"), TEXT("Mark as static"), TEXT("false"))
+			.Optional(TEXT("is_anim_layer"), TEXT("bool"), TEXT("Create as AnimationGraph with pose pins (InputPose→Result). Use for ALI interface functions."), TEXT("false"))
 			.Optional(TEXT("call_in_editor"), TEXT("bool"), TEXT("Show 'Call In Editor' button"), TEXT("false"))
 			.Optional(TEXT("category"), TEXT("string"), TEXT("Function category"))
 			.Optional(TEXT("description"), TEXT("string"), TEXT("Function tooltip/description"))
@@ -172,22 +180,75 @@ FMonolithActionResult FMonolithBlueprintGraphActions::HandleAddFunction(const TS
 		}
 	}
 
-	UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
-		BP, FName(*FuncName), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+	// Wave 11: is_anim_layer creates an AnimationGraph (pose in → pose out) instead of K2 graph.
+	// Used for ALI (AnimLayerInterface) functions that carry pose data through LinkedAnimLayer.
+	bool bIsAnimLayer = false;
+	Params->TryGetBoolField(TEXT("is_anim_layer"), bIsAnimLayer);
+
+	UEdGraph* NewGraph = nullptr;
+	if (bIsAnimLayer)
+	{
+		NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+			BP, FName(*FuncName), UAnimationGraph::StaticClass(), UAnimationGraphSchema::StaticClass());
+	}
+	else
+	{
+		NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+			BP, FName(*FuncName), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+	}
 
 	if (!NewGraph)
 	{
 		return FMonolithActionResult::Error(FString::Printf(TEXT("Failed to create function graph: %s"), *FuncName));
 	}
 
-	FBlueprintEditorUtils::AddFunctionGraph<UClass>(BP, NewGraph, /*bIsUserCreated=*/true, nullptr);
-
-	// Find the entry node to set metadata and flags
-	UK2Node_FunctionEntry* EntryNode = nullptr;
-	for (UEdGraphNode* Node : NewGraph->Nodes)
+	if (bIsAnimLayer)
 	{
-		EntryNode = Cast<UK2Node_FunctionEntry>(Node);
-		if (EntryNode) break;
+		// For anim layer functions: do NOT use AddFunctionGraph (it adds K2Node_FunctionEntry
+		// which conflicts with AnimGraphNode_Root, causing "RootNodes.Num() == 1" assertion).
+		// Instead, directly register the AnimationGraph in FunctionGraphs and populate manually.
+		BP->FunctionGraphs.Add(NewGraph);
+
+		// Spawn AnimGraphNode_Root (output pose) — the sole "root" of this animation graph
+		UAnimGraphNode_Root* RootNode = NewObject<UAnimGraphNode_Root>(NewGraph);
+		RootNode->CreateNewGuid();
+		RootNode->NodePosX = 200;
+		RootNode->NodePosY = 0;
+		NewGraph->AddNode(RootNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+		RootNode->AllocateDefaultPins();
+
+		// Spawn AnimGraphNode_LinkedInputPose (input pose)
+		UAnimGraphNode_LinkedInputPose* InputPoseNode = NewObject<UAnimGraphNode_LinkedInputPose>(NewGraph);
+		InputPoseNode->CreateNewGuid();
+		InputPoseNode->NodePosX = -300;
+		InputPoseNode->NodePosY = 0;
+		InputPoseNode->Node.Name = TEXT("InputPose");
+		NewGraph->AddNode(InputPoseNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+		InputPoseNode->AllocateDefaultPins();
+
+		// Wire: InputPose.Pose → Root.Result (default pass-through)
+		UEdGraphPin* PoseOutput = InputPoseNode->FindPin(TEXT("Pose"), EGPD_Output);
+		UEdGraphPin* ResultInput = RootNode->FindPin(TEXT("Result"), EGPD_Input);
+		if (PoseOutput && ResultInput)
+		{
+			const UEdGraphSchema* Schema = NewGraph->GetSchema();
+			Schema->TryCreateConnection(PoseOutput, ResultInput);
+		}
+	}
+	else
+	{
+		FBlueprintEditorUtils::AddFunctionGraph<UClass>(BP, NewGraph, /*bIsUserCreated=*/true, nullptr);
+	}
+
+	// Find the entry node to set metadata and flags (K2 path only — anim layer doesn't have K2 entry)
+	UK2Node_FunctionEntry* EntryNode = nullptr;
+	if (!bIsAnimLayer)
+	{
+		for (UEdGraphNode* Node : NewGraph->Nodes)
+		{
+			EntryNode = Cast<UK2Node_FunctionEntry>(Node);
+			if (EntryNode) break;
+		}
 	}
 
 	if (EntryNode)

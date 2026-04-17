@@ -1,4 +1,4 @@
----
+﻿---
 name: unreal-niagara
 description: Use when creating, editing, or inspecting Niagara particle systems via Monolith MCP. Covers systems, emitters, modules, parameters, renderers, DI, and HLSL. Triggers on Niagara, particle, VFX, emitter, particle system.
 ---

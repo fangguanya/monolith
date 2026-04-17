@@ -18,6 +18,7 @@ public class MonolithBlueprint : ModuleRules
 			"MonolithCore",
 			"UnrealEd",
 			"BlueprintGraph",
+			"AnimGraph",        // Wave 11: AnimationGraph schema + AnimGraphNode_Root/LinkedInputPose for ALI functions
 			"BlueprintEditorLibrary",
 			"SubobjectDataInterface",
 			"Kismet",
