@@ -37,8 +37,8 @@ bool FLevelIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset
 
 	// Get settings for batching
 	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
-	const int32 BatchSize = FMath::Max(1, Settings->PostPassBatchSize);
-	const SIZE_T MemoryBudgetMB = static_cast<SIZE_T>(Settings->MemoryBudgetMB);
+	const int32 BatchSize = FMath::Max(1, FMonolithMemoryHelper::GetResolvedPostPassBatchSize());
+	const SIZE_T MemoryBudgetMB = static_cast<SIZE_T>(FMonolithMemoryHelper::GetResolvedMemoryBudgetMB());
 	const bool bLogMemory = Settings->bLogMemoryStats;
 
 	UE_LOG(LogMonolithIndex, Log, TEXT("LevelIndexer: Found %d World assets to index (batch size: %d)"),

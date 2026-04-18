@@ -5,6 +5,7 @@
 #include "UObject/GarbageCollection.h"
 #include "Engine/Engine.h"
 #include "Framework/Application/SlateApplication.h"
+#include "MonolithSettings.h"
 
 DEFINE_LOG_CATEGORY(LogMonolithMemory);
 
@@ -120,4 +121,91 @@ bool FMonolithMemoryHelper::IsMemoryCritical()
 {
 	constexpr SIZE_T CriticalThresholdMB = 2048; // 2GB
 	return GetAvailableMemoryMB() < CriticalThresholdMB;
+}
+
+// ---- RAM tier auto-detect (v0.13.0) ----
+//
+// The v0.12.x PR-#17 defaults (24 GB budget, batch=8/4) were tuned for a 32+ GB
+// workstation. On 16 GB dev machines (UE 5.7 minimum spec) that pushed the
+// indexer straight back into OOM territory — reported in issue #16 by @MAYLYBY.
+//
+// These helpers auto-detect installed RAM and pick a conservative tier. Settings
+// fields default to 0 (sentinel) and resolve through these functions; users can
+// still override per-project via Project Settings > Monolith > Indexing > Performance.
+
+namespace
+{
+	int32 ComputeAutoMemoryBudgetMB(int32 RamGB)
+	{
+		if (RamGB >= 64) return 32768;
+		if (RamGB >= 32) return 16384;
+		if (RamGB >= 16) return  6144;
+		return 3072;
+	}
+
+	void ComputeAutoBatchSizes(int32 RamGB, int32& OutDeep, int32& OutPost)
+	{
+		if (RamGB >= 32)      { OutDeep = 8; OutPost = 4; }
+		else if (RamGB >= 16) { OutDeep = 4; OutPost = 2; }
+		else                  { OutDeep = 2; OutPost = 1; }
+	}
+}
+
+int32 FMonolithMemoryHelper::GetInstalledRamGB()
+{
+	const FPlatformMemoryStats Stats = FPlatformMemory::GetStats();
+	return static_cast<int32>(Stats.TotalPhysical / (1024ULL * 1024ULL * 1024ULL));
+}
+
+int32 FMonolithMemoryHelper::GetResolvedMemoryBudgetMB()
+{
+	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
+	if (Settings->MemoryBudgetMB > 0)
+	{
+		return Settings->MemoryBudgetMB;
+	}
+	return ComputeAutoMemoryBudgetMB(GetInstalledRamGB());
+}
+
+int32 FMonolithMemoryHelper::GetResolvedDeepIndexBatchSize()
+{
+	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
+	if (Settings->DeepIndexBatchSize > 0)
+	{
+		return Settings->DeepIndexBatchSize;
+	}
+	int32 Deep = 0, Post = 0;
+	ComputeAutoBatchSizes(GetInstalledRamGB(), Deep, Post);
+	return Deep;
+}
+
+int32 FMonolithMemoryHelper::GetResolvedPostPassBatchSize()
+{
+	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
+	if (Settings->PostPassBatchSize > 0)
+	{
+		return Settings->PostPassBatchSize;
+	}
+	int32 Deep = 0, Post = 0;
+	ComputeAutoBatchSizes(GetInstalledRamGB(), Deep, Post);
+	return Post;
+}
+
+void FMonolithMemoryHelper::LogTierStartupOnce()
+{
+	static bool bLogged = false;
+	if (bLogged)
+	{
+		return;
+	}
+	bLogged = true;
+
+	const int32 RamGB  = GetInstalledRamGB();
+	const int32 Budget = GetResolvedMemoryBudgetMB();
+	const int32 Deep   = GetResolvedDeepIndexBatchSize();
+	const int32 Post   = GetResolvedPostPassBatchSize();
+
+	UE_LOG(LogMonolithMemory, Log,
+		TEXT("Indexer tier: %d GB installed -> %d MB budget, batch(deep=%d, post=%d). Override in Project Settings > Monolith > Indexing > Performance."),
+		RamGB, Budget, Deep, Post);
 }

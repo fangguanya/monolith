@@ -131,20 +131,20 @@ public:
 
 	// --- Indexing Performance ---
 
-	/** Memory budget for indexing in megabytes. Indexing will pause and run GC when this limit is exceeded. */
+	/** Memory budget for indexing in megabytes. 0 = auto-detect from installed RAM. Indexing will pause and run GC when this limit is exceeded. */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Performance", DisplayName="Memory Budget (MB)",
-		meta=(ClampMin="1024", ClampMax="65536", ToolTip="Maximum memory usage during indexing before forcing garbage collection. Default 24GB - UE editor typically uses 8-12GB baseline."))
-	int32 MemoryBudgetMB = 24576;
+		meta=(ClampMin="0", ClampMax="65536", ToolTip="0 = auto-detect tier based on installed RAM (64+ GB -> 32 GB, 32+ GB -> 16 GB, 16 GB -> 6 GB, <16 GB -> 3 GB). Set explicitly to override."))
+	int32 MemoryBudgetMB = 0;
 
-	/** Number of assets to process per batch during deep indexing. Lower values reduce memory spikes but increase indexing time. */
+	/** Number of assets to process per batch during deep indexing. 0 = auto-detect from installed RAM. Lower values reduce memory spikes but increase indexing time. */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Performance", DisplayName="Deep Index Batch Size",
-		meta=(ClampMin="1", ClampMax="64", ToolTip="Assets processed per batch. Lower = less memory, slower indexing."))
-	int32 DeepIndexBatchSize = 8;
+		meta=(ClampMin="0", ClampMax="64", ToolTip="0 = auto-detect tier (32+ GB -> 8, 16 GB -> 4, <16 GB -> 2). Set explicitly to override. Lower = less memory, slower indexing."))
+	int32 DeepIndexBatchSize = 0;
 
-	/** Number of assets to process per batch for post-pass indexers (levels, meshes). These are memory-heavy so use smaller batches. */
+	/** Number of assets to process per batch for post-pass indexers (levels, meshes). 0 = auto-detect from installed RAM. These are memory-heavy so use smaller batches. */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Performance", DisplayName="Post-Pass Batch Size",
-		meta=(ClampMin="1", ClampMax="32", ToolTip="Batch size for level/mesh indexing. Lower for large assets."))
-	int32 PostPassBatchSize = 4;
+		meta=(ClampMin="0", ClampMax="32", ToolTip="0 = auto-detect tier (32+ GB -> 4, 16 GB -> 2, <16 GB -> 1). Set explicitly to override. Lower for large assets."))
+	int32 PostPassBatchSize = 0;
 
 	/** Run garbage collection every N batches during indexing. Lower values keep memory lower but slow down indexing. */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Performance", DisplayName="GC Frequency (Batches)",
@@ -161,10 +161,10 @@ public:
 		meta=(ToolTip="If true, first-time indexing won't run automatically. Use 'Monolith.StartIndex' console command to trigger."))
 	bool bDeferFirstTimeIndex = false;
 
-	/** Log memory statistics periodically during indexing. */
+	/** Log memory statistics periodically during indexing. Off by default to keep shipped-project logs quiet — opt in when debugging indexer behavior. */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Performance", DisplayName="Log Memory Stats",
-		meta=(ToolTip="Log memory usage during indexing for debugging."))
-	bool bLogMemoryStats = true;
+		meta=(ToolTip="Log memory usage during indexing for debugging. Default off — enable when investigating memory pressure."))
+	bool bLogMemoryStats = false;
 
 	// --- Module Toggles ---
 

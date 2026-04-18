@@ -62,4 +62,38 @@ struct MONOLITHINDEX_API FMonolithMemoryHelper
 	 * This is a critical threshold that may cause system instability.
 	 */
 	static bool IsMemoryCritical();
+
+	// ---- RAM tier auto-detect (v0.13.0) ----
+
+	/**
+	 * Get installed physical RAM in whole gigabytes. Used to auto-detect the
+	 * memory-budget tier for low-spec machines.
+	 */
+	static int32 GetInstalledRamGB();
+
+	/**
+	 * Returns the memory budget in MB, resolving the auto-detect sentinel (0)
+	 * via an RAM-based tier:
+	 *   64+ GB -> 32768 MB    32+ GB -> 16384 MB
+	 *   16+ GB -> 6144 MB     <16 GB -> 3072 MB
+	 * Override via Project Settings > Monolith > Indexing > Performance.
+	 */
+	static int32 GetResolvedMemoryBudgetMB();
+
+	/**
+	 * Returns the deep-index batch size, resolving the auto-detect sentinel (0)
+	 * via an RAM-based tier (32+ GB -> 8, 16 GB -> 4, <16 -> 2).
+	 */
+	static int32 GetResolvedDeepIndexBatchSize();
+
+	/**
+	 * Returns the post-pass batch size, resolving the auto-detect sentinel (0)
+	 * via an RAM-based tier (32+ GB -> 4, 16 GB -> 2, <16 -> 1).
+	 */
+	static int32 GetResolvedPostPassBatchSize();
+
+	/**
+	 * Log the resolved tier info once per editor session. Subsequent calls are no-ops.
+	 */
+	static void LogTierStartupOnce();
 };

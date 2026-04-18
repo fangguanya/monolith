@@ -557,9 +557,10 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	if (!bShouldStop && DeepIndexQueue.Num() > 0)
 	{
 		const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
-		const int32 DeepBatchSize = FMath::Max(1, Settings->DeepIndexBatchSize);
+		FMonolithMemoryHelper::LogTierStartupOnce();
+		const int32 DeepBatchSize = FMath::Max(1, FMonolithMemoryHelper::GetResolvedDeepIndexBatchSize());
 		const int32 GCFrequency = FMath::Max(1, Settings->GCFrequencyBatches);
-		const SIZE_T MemoryBudgetMB = static_cast<SIZE_T>(Settings->MemoryBudgetMB);
+		const SIZE_T MemoryBudgetMB = static_cast<SIZE_T>(FMonolithMemoryHelper::GetResolvedMemoryBudgetMB());
 		const float YieldTime = Settings->YieldTimeSeconds;
 
 		UE_LOG(LogMonolithIndex, Log, TEXT("Starting deep indexing pass for %d assets (batch size: %d, GC every %d batches, memory budget: %llu MB)..."),
