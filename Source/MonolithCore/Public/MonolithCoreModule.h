@@ -32,4 +32,7 @@ private:
 	void WriteSentinelFile(int32 Port);
 	void RemoveSentinelFile();
 	FString GetSentinelFilePath() const;
+
+	/** Touch plugin files if Monolith.uplugin shows a future mtime (cross-TZ ZIP extraction artifact). */
+	void NormalizeFutureMtimesIfNeeded();
 };
