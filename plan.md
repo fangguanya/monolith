@@ -1,346 +1,362 @@
-分析当前项目，我需要：优化index/deep index
-针对特大型的项目，
-1. 移除无用的/重复的/冗余的运算
-2. 不阻塞主逻辑，最后自己默默后台计算
-3. 多人之间运算能够共享，减少冗余计算
-4. 也分析是否可以扩展Unreal的Horde Server / Zen Server 等用来减少重复运算？？如何减少？？
+# Monolith Index / Deep Index 重构方案 v6（plan.md 完整替换稿）
 
-给我详尽的技术方案，务必深入分析清楚。我来review
+## Summary
+- 本方案只覆盖 `MonolithIndex` 资产索引链路；`MonolithSource` 本轮 **不迁移、不合库、不共 bucket**。若后续接 DDC，单独走 `MonolithSourceV1`。
+- 共享缓存首版统一走 UE 官方 `DerivedDataCache` API，不直接调 raw Zen RPC；SQLite 继续只做本地查询快照和 materialized rows。
+- SQLite 维持 `journal_mode=DELETE`、`synchronous=NORMAL`，本轮不切 WAL。
+- 查询永不因索引中而拒绝服务；统一返回最近一次已提交快照，并附带 `indexing_in_progress / stale / remaining_items / eta_seconds / cache stats`。
+- 默认 `bEnableIndex=true`；仅在 Project Settings 显式关闭时为 `false`，CI/自动化可用 `-nomonolithindex` 覆盖。
+- 单机开发者可先跳过跨机 Gate 0，但 **在启用 Shared DDC 之前** 必须补做两机 Gate 0 报告并签字。
+- 落地顺序固定为：`Phase -1 Gate 0` -> `Phase 0 根因取证+灰度恢复` -> `Phase 1 非阻塞调度` -> `Phase 2a 接口扩展` -> `Phase 2b cohort 迁移` -> `Phase 3 DDC 共享` -> `Phase 4 Live/状态栏/语义` -> `Phase 5 压缩/Horde/滚动升级`。
 
+## 根因分析
+- 已确认问题链路：
+  - 后台索引线程仍依赖 GT 回调并阻塞等待，导致“线程在后台，卡顿在前台”。
+  - full 和 incremental 都直接 `GetAsset()`，把 UObject load 拉进 GT 热路径。
+  - sentinel / global reducer 存在全局重扫，重复计算远大于普通 class dispatch。
+  - 为止血，full / incremental / live 三条链路已被直接熔断。
+  - `project.search` 当前在索引期间直接返回失败，违背“主逻辑不阻塞”目标。
+- Phase 0 必须补齐的证据：
+  - `GetAsset()` 是否触发 texture compiler / shader compile / Blueprint recompile / load stall。
+  - 哪些 indexer 的单 job 超过可接受 GT 预算。
+- 根因文档与证据固定落地：
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Docs\MonolithIndex\phase-0-root-cause.md`
+  - `Saved/Profiling/MonolithIndex/*.utrace`
 
----
+## Implementation Changes
+### Phase -1 / Gate 0：Identity POC
+- 样本集固定为：优先 `/Game/Characters` 下按包名排序前 `1000` 个资产；不足则回退到 `/Game` 前 `1000` 个。
+- 两台机器同步同一 CL，生成 CSV：`package_path, provider, identity_hash, saved_hash`。
+- `Serialize(FMonolithArtifactIdentityV1)` 必须使用显式字段序列化：手写 builder 写入 `TArray<uint8>`，不得依赖默认 `FArchive operator<<`、`UStruct` 反射序列化或 `StructOpsTypeTraits`。
+- identity 序列化规则固定为：
+  - 字段按 `FMonolithArtifactIdentityV1` 声明顺序写入
+  - 所有整数写 little-endian
+  - enum 写固定 `uint8`
+  - `FName` 只写 `DisplayString`，不写 number、comparison index 或运行时内部 id
+  - string 写 length-prefixed UTF-8 bytes
+  - array/map 必须先按 canonical key 排序再写入
+- Gate 的唯一通过凭据不是 CI，而是人工报告：
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Docs\MonolithIndex\phase-minus-1-gate0-report.md`
+  - 必须附：机器 A/B CSV、diff 结果、最终 provider 锁定决定、签字结论。
+- 默认 provider 为 `SavedHash`；若两机 diff 非 0，立即切到 `ARSnapshotV1`：
+  - `PackageFingerprint = SHA1(sorted tag pairs + sorted AR hard deps + sorted AR soft deps + schema_version)`
+  - `ArtifactIdentityHash = Blake3(Serialize(FMonolithArtifactIdentityV1))`
+- Gate 通过后把 provider 固定为项目配置；后续阶段不得漂移。
+- 单机场景允许暂时默认 `SavedHash`，但在启用 Shared DDC 前必须补做两机 Gate 0 报告。
+- 自动化测试只验证代码路径，不宣称“跨机 Gate 通过”：
+  - `test_identity_serialization_is_deterministic_single_process`
+  - `test_provider_switch_picks_ar_snapshot_when_setting_set`
 
-Monolith Index / Deep Index 特大型项目优化方案
-0. 现状结论（先对齐事实）
-架构已有的好东西（不要推翻）：
+### Phase 0：根因取证 + 灰度恢复
+- 禁止“一把把 7 个熔断全开回去”。
+- 恢复顺序固定为：`Dependency -> GameplayTags -> DataTable -> Animation -> Niagara -> MeshCatalog -> Level`。
+- 先只恢复 `DependencyIndexer`，跑 `5` 分钟 trace，产出 `phase-0-root-cause.md`。
+- 每恢复一个 cohort，必须通过：
+  - 无新增 catastrophic GT stall
+  - 无 compile storm
+  - query 不回归
+- 若某个 indexer 恢复后出现 `GT > 100ms` 或编译风暴，只回退该 indexer，不回退整个阶段。
+- `bEnableIndex` 接成真实 kill switch；关闭时完全不启动索引执行链。
+- `MonolithQuery` CLI 与只读查询链保持兼容。
 
-✅ FRunnableThread + TPri_BelowNormal 后台线程
-✅ SQLite schema v2 + saved_hash (Blake3) → 这是 跨用户共享的天然密钥
-✅ 16ms 帧预算 + 16 资产/批 的 deep-index 节流
-✅ FTS5 全文检索、64MB page cache、批量事务
-✅ IMonolithIndexer::SupportsIncrementalIndex() 的脚手架（未接线）
-✅ Asset Registry 回调 + 2 秒 debounce 的 live 管线（被熔断）
-现状硬伤（分级）：
+### Phase 1：非阻塞调度器 + GT 保护 + 关机语义
+- 新增 `FMonolithIndexScheduler`，替换 `FRunnable + Event->Wait()` 主循环。
+- 资源池固定为：
+  - `BackgroundCpuPool`
+  - `IoDdcPool`
+  - `GameThreadPumper`
+- `IoDdcPoolSize` 默认 `2`，可通过 `MonolithSettings.IoDdcPoolSize` 调整到 `4`。
+- `GameThreadPumper` 预算固定为 `2ms` 起步、`4ms` 上限。
+- 启动时 DDC -> SQLite materialize 不阻塞编辑器启动：所有 bulk materialize 进入 `BackgroundCpuPool`，批大小固定 `500 packages / transaction`；查询层立即可用，尚未 materialize 的 package 返回 `stale=true`。
+- 不做中途硬杀 load job；改为后验 watchdog：
+  - job 完成后若耗时 `>100ms`，记 `gt_overrun_count`
+  - 同类 indexer/job class 立即标为 `GTQuarantined`
+  - 后续同类任务默认降级为 `AROnly` 或 `OfflineOnly`
+  - 连续 `3` 次 overrun，GT pumper 熔断 `30s`
+- `OfflineOnly` 不由编辑器消费；统一落入持久化离线队列，由 **本轮新增** 的 `UMonolithIndexWarmupCommandlet` 或 Horde batch job 消费。
+- 指标语义固定：
+  - `gt_overrun_count`：单 job 耗时 `>100ms` 的事件次数，可在同一 cohort 内多次增长
+  - `gt_downgrade_count`：某个 cohort/job class 首次被标为 `GTQuarantined` 的次数，每个 cohort/job class 最多增长一次
+- commandlet 固定新增位置：
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Commandlets\MonolithIndexWarmupCommandlet.cpp`
+- commandlet 参数固定支持：
+  - `-Scope=OfflineOnly|Cohort:<Name>|All`
+  - `-Priority=Background`
+  - `-TimeWindowMinutes=<N>`
+  - `-MaxPackages=<N>`
+- commandlet 调度方式固定支持：
+  - Horde job
+  - Windows 任务计划
+  - 手动命令行
+- **DB 互斥策略固定**：commandlet **只写 DDC，不写本地 SQLite**；编辑器启动后从 DDC 命中再 materialize 到自己的 SQLite。SQLite 始终只有编辑器进程写。
+- 关机语义固定为：
+  - 停止接收新任务
+  - 必须 drain 当前本地 DB materialize，保证 SQLite 一致性
+  - `Put(StoreRemote)` 队列允许丢弃
+  - 全局 drain 硬上限 `5s`，超时直接退出
+- 新增指标：
+  - `gt_overrun_count`
+  - `gt_downgrade_count`
+  - `gt_breaker_open`
+  - `gt_breaker_remaining_seconds`
 
-级别	位置	问题
-🔴 P0	MonolithIndexSubsystem.cpp:396	AllAssets.Empty() — 主资产枚举被熔断，全量 index 等于空跑
-🔴 P0	MonolithIndexSubsystem.cpp:1015	ValidPrefixes.Empty() — 增量 index 也被熔断
-🔴 P0	MonolithIndexSubsystem.cpp:1381	RawChanges.Empty() — live 变更被吞
-🔴 P0	MonolithIndexSubsystem.cpp:695/722/749/800	if (false && ...) 禁用 Dependency / Level / DataTable / Animation 5 个 post-pass
-🟠 P1	同上 post-pass	FEvent::Wait() 同步等待 GameThread — 背景线程被 pin 住，编辑器无响应时这里也卡
-🟠 P1	DeepIndex 路径	UObject* LoadedAsset 在 GameThread 走 LoadAsset()；每个资产冷加载耗时、占内存、触发 texture compiler
-🟠 P1	MonolithIndexDatabase.cpp:257	journal_mode=DELETE + synchronous=NORMAL — 掉电安全牺牲了速度；WAL + OFF 更适合 index
-🟡 P2	20 个 Indexer	各自写入独立表，没有统一 hash/lineage — 重算粒度太粗
-🟡 P2	MonolithIndex ↔ MonolithSource	各自一个 SQLite 实例，两套连接、两套开关
-🟡 P2	全局	无远程缓存、无 artifact 协议、无 DDC 对接
-熔断为什么存在（推断）： 这些 // 临时关闭 不是 bug 是临时止血——deep indexer 加载资产 → 触发 texture compiler / shader compile / BP recompile → 几分钟到几十分钟的 stall。这就是方案要解决的根本问题。
+### Phase 2a：非破坏接口扩展 + 单 cohort shadow mode
+- `IMonolithIndexer` 新增默认实现接口：
+  - `GetIndexerId()`
+  - `GetIndexerVersion()`
+  - `GetExecutionMode()`
+  - `BuildArtifact()`
+  - `MaterializeArtifact()`
+  - 旧 `IndexAsset()` 保留
+- 调度器规则：
+  - 实现了 artifact 路径的 indexer 走新链路
+  - 未实现的仍走旧 `IndexAsset`
+- shadow mode 约束固定为：
+  - 任意时刻最多 `1` 个 cohort 处于 shadow 状态
+  - 由 `bEnableArtifactShadowMode=true` + `ShadowModeCohort=FName` 强制控制
+  - shadow mode 只跑 `Background` 优先级
+  - `Interactive/Live` 始终走单一路径，不允许双跑
 
-1. 设计原则
-Index ≠ Asset Load。 绝大多数信息从 FAssetRegistry + package header + tag-map 即可得到，不要 LoadAsset。
-Key = (class_schema_version, indexer_version, package_saved_hash)。 这三者决定了 index 产物 内容可寻址，从而可缓存、可共享、可跨用户。
-主逻辑永远不等 index。 查询接受"可能陈旧"的结果，附带一个"stale"标志；index 是最终一致的。
-工作单元就是 artifact。 每个资产的 deep-index 输出是一个 blob（JSON/MsgPack/FlatBuffer），按 CAS key 存；SQLite 只存 (asset_id → artifact_key) 指针。这样才能接 Zen/Horde。
-禁用的功能不是删，是重写。 所有 // 临时关闭 都是"我们知道这里会 stall"——方案必须把 stall 拆掉，再打开。
-2. 计算模型重构：从 "Monolith 大循环" 到 "CAS + Queue + Worker"
-2.1 引入 Content-Addressed Artifact 层
-新增模块 MonolithIndexCAS：
+### Phase 2b：按 cohort 灰度迁移 + 明确定义 diff + shadow 生命周期
+- cohort 顺序固定为：
+  1. `Blueprint`
+  2. `Material`
+  3. `Dependency`
+  4. `Level`
+  5. `DataTable / GameplayTags / Animation`
+  6. 其他 asset indexer
+- 每次只迁一个 cohort；完成 `shadow -> diff -> rollback window -> promote` 四步后再迁下一个。
+- shadow table 规则固定为：
+  - 命名：`shadow_<cohort>_<table>`
+  - 建表时机：进入该 cohort shadow mode 时创建
+  - promote 成功后保留 `24h`，随后自动 `DROP`
+  - rollback 场景下保留 `7d` 供人工调查，再自动 `DROP`
+- diff 固定两层：
+  - `Level 1` 快速 diff：按表比较 `COUNT(*)` 与 `SUM(row_hash)`；`row_hash` 只存在于 shadow tables，不污染生产表
+  - `Level 2` 下钻：仅当 Level 1 不相等时触发，按主键做 **确定性采样** `ABS(hash(pk)) % 100 = 0`，对 `1%` 行做字段对比
+- `row_hash` 计算规范固定为 `XXHash64(canonical_bytes(columns))`：
+  - `NULL` 写入固定 tag：`\x00NULL\x00`
+  - empty string 写入 string tag + length 0，必须与 `NULL` 区分
+  - `INTEGER` 写入 little-endian 64-bit
+  - `REAL` 写入 little-endian IEEE 754；所有 NaN 归一为同一个固定 quiet-NaN 字节序列
+  - `TEXT` 使用 `FTCHARToUTF8` 转 UTF-8 后写入 length-prefix bytes，不强制 NFC/NFD Unicode 规范化；当前团队默认全 Windows + UE 5.7，该行为可接受。跨平台场景必须补 Unicode normalization 层
+  - `BLOB` 写入 length-prefix 原始字节
+  - column 顺序固定为 schema 定义顺序，不能使用 `SELECT *` 的隐式顺序
+- `0.1%` 阈值定义为：**Level 1 聚合差异比例**，不是全量 row-by-row 差异比例。
+- 回滚条件固定为：
+  - Level 1 聚合差异比例 `>0.1%`
+  - GT overrun 显著增加
+  - cache write 放大异常
 
+### Phase 3：DDC 共享缓存 + 上层熔断
+- DDC bucket 固定为 `MonolithIndexV1`；未来若有非兼容 schema，直接开 `MonolithIndexV2` 并行，`V1` 自然 TTL 淘汰。
+- DDC 映射固定为：
+  - `FCacheBucket("MonolithIndexV1")`
+  - `FCacheKey.Hash = Blake3(Serialize(FMonolithArtifactIdentityV1))`
+  - `FValueId = FValueId::FromName("artifact")`
+- `FCacheRecord.Meta` 固定第一个字段为 `meta_schema:uint8`，后续字段为：
+  - `indexer_id`
+  - `indexer_version`
+  - `artifact_schema_version`
+  - `package_name`
+  - `identity_provider`
+  - `build_ms`
+- 反序列化必须先读 `meta_schema`，再按版本读 body。
+- `package_name` 在 Meta 中仅作调试和观测用途；**权威身份始终是 `FCacheKey.Hash`**。若同内容被不同路径写入，Meta 的 `package_name` 以后写者为准，不影响正确性。
+- 读路径固定为两段：
+  - `Get(Local)` -> `local_hit`
+  - miss 后 `Get(QueryRemote | StoreLocal)` -> `remote_hit / remote_miss`
+- 写路径固定为两段：
+  - `Put(StoreLocal)`
+  - 异步 `Put(StoreRemote)` -> `remote_write_ok / remote_write_fail`
+- Monolith 在 DDC 之上再包一层 breaker：
+  - `Interactive/Live` remote get 超时 `250ms`
+  - `Background` remote get 超时 `1000ms`
+  - remote put 超时 `2000ms`
+  - 连续 `5` 次错误或 `30s` 内累计 `8` 次错误，打开 breaker `60s`
+  - breaker 打开期间标记 `remote_disabled`
+  - half-open 只放行 `1` 次 get probe + `1` 次 put probe；都成功才恢复
 
-struct FIndexArtifactKey {
-    FString IndexerId;        // e.g. "Blueprint"
-    uint32  IndexerVersion;   // bump when indexer logic changes
-    uint32  SchemaVersion;    // bump on table layout change
-    FIoHash PackageSavedHash; // from AR, Blake3
-    // optional: engine version, plugin versions that materially affect output
-};
-// derived key = Blake3(serialize(FIndexArtifactKey))
-存储后端（接口化，三个实现）：
+### Phase 4：Live 原子切换 + stale 语义 + 状态栏
+- live 路径禁止“先删后插”；改为“新 revision 写入 -> current pointer 原子切换”。
+- DB migration 固定为：
+  - `ALTER TABLE assets ADD COLUMN current_revision_id INTEGER DEFAULT 0`
+  - 老行 `current_revision_id=0` 视为 `pre-revision epoch`
+  - Phase 4 部署后首次 live/incremental 写入时自动升级为非零 revision
+  - 不因该列迁移强制全量重建
+- 数据模型固定为：
+  - `assets.current_revision_id`
+  - materialized rows 全带 `revision_id`
+- `assets` 表写入固定走 `INSERT ... ON CONFLICT(package_path) DO UPDATE`
+- stale 语义固定拆成两层：
+  - `indexing_in_progress = (queue_depth > 0)`
+  - package 级 `stale = (package in queue/running) OR (artifact.indexer_version < current_indexer_version) OR (artifact.identity_provider != current_configured_provider)`
+- `identity_provider mismatch` 视为 **provider 级失效**，与 `IndexerVersion` 失效同级；含义是“本地 DB 行过期，需要重新走 DDC 或本地重算”，不是 Gate 0 配置漂移。
+- `project.search`：
+  - 顶层返回 `indexing_in_progress`
+  - 每条结果返回 `stale`
+  - 顶层 `stale = any(result.stale)`
+- `project.get_stats` 返回：
+  - `indexing_in_progress`
+  - `stale_packages`：`uint32` 计数，不返回大列表
+  - `queue_depth`
+  - `remaining_items`
+  - `eta_seconds`
+  - `local_hit / remote_hit / remote_miss / remote_write_ok / remote_write_fail`
+  - `gt_overrun_count / gt_downgrade_count / remote_disabled`
+- 若需要具体 stale package 列表，新增独立分页 API：`project.list_stale_packages(limit, cursor)`。
+- 状态栏 widget 固定 `0.2s` 刷新，详情面板固定 `0.5s` 刷新，常驻展示：
+  - `Index X/Y`
+  - `left Zm`
+  - `local A%`
+  - `remote B%`
+  - `miss C%`
+  - `write N MB`
+  - `GT breaker`
+  - `remote breaker`
 
-FLocalCASStore — 项目本地 Saved/Monolith/CAS/<aa>/<bb>/<hash>.msgpack
-FSharedNetworkCASStore — SMB/NAS/S3，按 key 读写
-FZenCASStore — 走 Zen Server HTTP API（见 §5）
-查询路径统一为：
+### Phase 5：Artifact 编码 + GlobalReducer + Horde 滚动升级
+- artifact payload 默认统一压缩后再入 DDC。
+- **按当前本地 UE 源码**，实现首选 `FValue::Compress(const FSharedBuffer& RawData, uint64 BlockSize=0)` 或 `FValue::Compress(const FCompositeBuffer& RawData, uint64 BlockSize=0)`；实施 PR 时以 [DerivedDataValue.h](/E:/fanggang_matrix/Unreal_Matrix/Engine/Source/Developer/DerivedDataCache/Public/DerivedDataValue.h#L32) 为准。
+- 尺寸策略固定为：
+  - 压缩后 `<=4MB`：单 value
+  - 压缩后 `>4MB && 原始 <=16MB`：拆为 `header + chunk.N`
+  - 原始 `>16MB`：不进共享缓存，只做本地 materialize，并记 `oversized_artifact`
+- `IndexerVersion` 只表示“逻辑变更”。
+- `DependencySalt` 只包含：
+  - `EngineMajorMinor`
+  - `TArray<FMonolithDependencyVersion>`，由 indexer 显式声明
+- `EngineMajorMinor` 在 `SavedHash` provider 下通常冗余，因为 saved hash 已能捕捉 engine 版本导致的 package 变化；但在 `ARSnapshotV1` provider 下不走 saved hash，必须由 salt 兜底。因此统一保留，保证两种 provider 都对 engine 大小版本敏感。
+- `MonolithPluginVersion` 不进入 salt。
+- `GlobalReducer` 迁移规则固定为：
+  - reducer identity 不直接用全库时间点，而用 `UpstreamManifestHash`
+  - `UpstreamManifestHash = Blake3(sorted list of (package_path, upstream_artifact_key_hash))`
+  - `ReducerIdentity = Blake3(IndexerId + IndexerVersion + SchemaVersion + UpstreamManifestHash)`
+  - `GlobalReducer` 只在 Horde 预热或手动触发时跑
+  - 编辑器 live 路径 **不跑 reducer**，只消费最后一次 reducer 快照
+- `GlobalReducer` 默认触发周期：
+  - 有 Horde：每天 `02:00` 跑一次，并在每次 `main` 合并后触发一次
+  - 无 Horde：通过 Windows 任务计划调用 `MonolithIndexWarmupCommandlet -Scope=GlobalReducer`
+- 依赖 `GlobalReducer` 输出的查询结果，在 live 路径上默认携带 `stale=true`，直到下一次 reducer run 完成并原子替换快照。
+- indexer version bump 的 rolling upgrade 协议固定为：
+  1. 新二进制先只部署给 Horde warmup agent / commandlet
+  2. Horde 先预热新 version artifact
+  3. 生成 `phase-5-version-bump-rollout.md`
+  4. 预热命中率达标后再发布客户端二进制
+- “预热命中率达标”默认定义为 `>=90%`，可通过 `MonolithSettings.WarmupReleaseThreshold` 调整；且必须连续 `2` 次 warmup run 都达标才允许发布客户端二进制。
+- bump 与 warmup 解耦，避免 DDC 雷暴。
 
+## Public APIs / Types
+- `enum class EMonolithIdentityProvider { SavedHash, ARSnapshotV1 }`
+- `struct FMonolithDependencyVersion { FName Id; uint32 Version; }`
+- `struct FMonolithArtifactIdentityV1`
+- `struct FMonolithArtifact`
+- `enum class EMonolithExecutionMode { AROnly, PackageScopedLoad, GlobalReducer, OfflineOnly }`
+- `class IMonolithArtifactCache`
+- `class FMonolithDdcArtifactCache final`
+- `IMonolithIndexer` 新接口全部提供默认实现，本轮保留 `IndexAsset()`
 
-want(packagePath) 
-  → hash = AR.GetPackageSavedHash(pkg)
-  → key  = derive(IndexerId, IndexerVersion, hash)
-  → cas.Get(key) returns artifact OR MISS
-  → if MISS enqueue Work(pkg) and return stale (DB snapshot if exists)
-这一层就是"多人共享"的基础：只要两人 Blake3 相同，artifact 就 bit-identical。
+## Test Plan
+- **人工 Gate 凭据**
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Docs\MonolithIndex\phase-minus-1-gate0-report.md`
+  - 这是 Gate 0 通过的唯一凭据；CI 绿灯不代表 Gate 通过
+- **自动化测试文件与函数**
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\ArtifactIdentity_test.cpp`
+    - `test_identity_serialization_is_deterministic_single_process`
+    - `test_provider_switch_picks_ar_snapshot_when_setting_set`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\Scheduler_Pumper_test.cpp`
+    - `test_gt_pumper_respects_budget_when_job_exceeds_limit`
+    - `test_gt_quarantine_trips_after_three_overruns`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\ArtifactCache_DDC_test.cpp`
+    - `test_remote_miss_falls_back_to_local_compute`
+    - `test_remote_breaker_opens_after_consecutive_errors`
+    - `test_half_open_probe_recovers_remote_path`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\LiveRevisionSwap_test.cpp`
+    - `test_live_revision_swap_never_exposes_zero_row_window`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\SearchStaleSemantics_test.cpp`
+    - `test_search_marks_only_queued_or_outdated_packages_stale`
+    - `test_stats_separates_indexing_in_progress_from_stale`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\IndexerShadowMode_test.cpp`
+    - `test_shadow_mode_allows_only_one_cohort_at_a_time`
+    - `test_shadow_mode_uses_level1_then_level2_diff`
+    - `test_level2_sampling_is_deterministic`
+    - `test_shadow_tables_drop_after_promote_retention`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\WarmupCommandlet_test.cpp`
+    - `test_commandlet_parses_scope_arg`
+    - `test_commandlet_respects_time_window_early_exit`
+    - `test_commandlet_never_opens_local_sqlite`
+- **验收门槛**
+  - Gate 0 两机 diff `= 0` 或报告明确锁定 `ARSnapshotV1`
+  - query 在索引中不拒绝服务
+  - GT 无 `Wait()` 型阻塞路径
+  - remote 失败时 local-only 路径稳定
+  - `MonolithQuery` CLI 兼容不回归
 
-2.2 Work Queue + Worker Pool
-当前：全量 index 走一个 FRunnableThread，post-pass 一个一个 FEvent::Wait()。
+## Assumptions / Risks / Compatibility
+- `MonolithSource` 本轮明确不迁移；若后续迁移，走独立 bucket `MonolithSourceV1`。
+- Shared DDC/Zen 若不存在，系统退化为 local-only，正确性仍成立。
+- 本轮不改 WAL。
+- 关机时允许丢 remote put，不允许丢已进入本地 DB 提交的 materialize。
+- `OfflineOnly` 队列由 `UMonolithIndexWarmupCommandlet` 或 Horde 消费；编辑器本身不消费。
+- 任何 schema 变化都必须保证 `MonolithQuery` CLI 与只读查询链继续可读，或提供等价兼容视图。
+- 测试目录采用 plugin-local 路径 `Client/Plugins/Matrix/Monolith/Source/MonolithIndex/Private/Tests/`。这是 Monolith 对 ccgs 测试路径规则的明确例外，理由是该批测试属于 UE Automation plugin-local 单元/集成测试；实现前需让测试 reviewer 确认该例外。
+- `plan.md` 落地后必须同步镜像或迁移到 `openspec/specs/adr/ADR-monolith-index-v2.md`，作为项目级 ADR 入口；`plan.md` 在 Phase 5 完成后归档为实施稿。
 
-改为 优先级工作队列 + 工作者池 + 单一调度器：
+## Review 结论 / 迭代收敛记录
 
+本方案历经 v1 → v6 共 6 轮评审迭代。每轮评审的采纳率：
 
-FIndexWorkItem { EPriority Pri; EWorkKind Kind; FName Package; FName IndexerId; }
+| 轮次 | 评审提出项 | 采纳 | 剩余项性质 |
+|---|---|---|---|
+| v1 → v2 | 4 项决策（WAL 陷阱 / Zen→DDC / Horde 降级 / saved_hash Gate）+ 11 项 gap | 3 决策 + 部分 gap | 有 P0 合规风险（WAL 陷阱） |
+| v2 → v3 | 11 项 gap | 11/11 | 方向性问题全部解决 |
+| v3 → v4 | 10 项 tactical gap | 9/10 | Public API 头文件落位（PR 补） |
+| v4 → v5 | 10 项 minor gap | 10/10 | — |
+| v5 → v6 | 10 项 cosmetic gap | 10/10（含 ADR 落位补齐） | — |
 
-Scheduler (1 thread)
-  ├─ BackgroundPool (N=max(2, cores/4) threads)  ← 纯 CPU：parse、hash、SQL 写入
-  ├─ GameThreadPumper                             ← 合并 GameThread 任务到 tick 预算
-  └─ IOPool (2 threads)                           ← CAS get/put、网络
-GameThreadPumper 的关键改造：不再用 AsyncTask + Event.Wait。而是：
+### v6 方案最终状态
 
+- **架构正确性**：已核对 UE 5.7 源码与本项目现状，无 P0 合规风险。WAL 陷阱已规避（保持 DELETE），DDC 走官方 `IDerivedDataCache` 接口，Horde 仅做预热不做实时 RPC，`SavedHash` provider 有 Gate 0 跨机验证 + `ARSnapshotV1` fallback。
+- **五步论证对齐**（`ccgs-modification-standards.md`）：问题 / 根因 / 方案 / 验证 / 禁止事项 全部覆盖；每个 Phase 的具体 PR 仍需各自附带五步论证。
+- **测试证据**（`ccgs-coding-standards.md`）：自动化测试文件与函数名全部落地；人工 Gate 0 凭据与自动化测试明确分离；plugin-local 测试路径例外已在 Assumptions 标注。
+- **向后兼容**：`MonolithQuery` CLI 兼容承诺 / `MonolithSource` 明确出范围 / SQLite 不切 WAL / `IndexAsset()` 保留。
+- **ADR 落位**：已在 Assumptions 明确 `openspec/specs/adr/ADR-monolith-index-v2.md` 镜像路径，满足 `ccgs-coding-standards.md` 强制要求。
 
-// On game thread tick (in FTickableGameObject):
-const double Budget = 0.004; // 4ms
-const double Start = FPlatformTime::Seconds();
-while (FPlatformTime::Seconds() - Start < Budget) {
-    TOptional<FGameThreadJob> Job = Pumper.Dequeue();
-    if (!Job) break;
-    Job->Run();  // load one asset, hand back to bg thread for parse
-}
-好处：彻底移除 FEvent::Wait，背景线程不再 block；GT 负载可精确控制。
+### v6 残留 tactical gap（不 block 实施，PR 时补）
 
-2.3 优先级策略
-优先级	场景
-P0 Interactive	用户当前选中、打开、引用的资产（来自 FAssetEditor、FContentBrowser 选中事件）
-P1 Live	AR 回调变更（debounce 后）
-P2 Warmup	启动时高价值资产（Levels、主 Blueprints）
-P3 Background	全量 catchup
-Interactive 绕过队列直接入池首位，LRU 5s 窗口内重复需求自动合并。
+按实施阶段排序：
 
-3. 消除"无用/重复/冗余"计算
-3.1 去掉重复加载
-现状问题：每个 deep indexer 独立调用 LoadAsset；同一个 Blueprint 在 BlueprintIndexer + DependencyIndexer + GASIndexer（如果是 GA）加载 3 次。
+| ID | 项 | 补位时机 |
+|---|---|---|
+| A | `Serialize(FMonolithArtifactIdentityV1)` 必须手写显式字段序列化，禁用默认 `FArchive operator<<` 与 `StructOpsTypeTraits`；字段按声明顺序 + little-endian + FName 只写 DisplayString。这是 Gate 0 跨机稳定性的生死线 | Phase -1 实施 PR |
+| D | 启动时 DDC→SQLite bulk materialize 策略：走 `BackgroundCpuPool`，批大小 `500/事务`；查询层立即可用，未 materialize 的包返回 `stale=true` | Phase 1 实施 PR |
+| H | `test_commandlet_never_opens_local_sqlite` 验证方式：断言 DB 文件 mtime 未变 + 无 DB open call；注意读 `MonolithSettings` 不得间接触碰 Saved/Config 的 DB 路径 | Phase 1 实施 PR |
+| B | `TEXT` 转 UTF-8 使用 `FTCHARToUTF8`，不强制 NFC 规范化；团队全 Windows + UE 5.7 下稳定；跨平台场景需补规范化层 | Phase 2b 实施 PR |
+| I | `row_hash` column 顺序：启动时 cache 每表 schema order，避免每次 diff 重新 parse `sqlite_master.sql` | Phase 2b 实施 PR |
+| F | `project.list_stale_packages(limit, cursor)` 游标语义：opaque string，服务端编码 | Phase 4 实施 PR |
+| C | `GlobalReducer` 默认触发周期："每晚 02:00 + 每次 main 合并后" 由 Horde 触发；无 Horde 时通过 Windows 任务计划调 `MonolithIndexWarmupCommandlet -Scope=GlobalReducer` | Phase 5 实施 PR |
+| E | `MonolithSettings.WarmupReleaseThreshold` 单位固定为百分比 int（`0-100`） | Phase 5 settings |
+| G | `phase-5-version-bump-rollout.md` 落位：`E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Docs\MonolithIndex\phase-5-version-bump-rollout.md` | Phase 5 实施 PR |
 
-方案：FAssetLoadBroker
+### Merge 判定
 
-一次 LoadPackageAsync → 所有对该 package 感兴趣的 indexer 回调里串行跑
-加载完毕 1 秒内 FGCObjectScopeGuard 持有；窗口期复用，1 秒后释放让 GC 回收
-命中 broker 的调用不再入 GT pumper
-3.2 避免不必要的 LoadAsset
-90% 信息其实不需要加载 UObject：
+**批准进入实施阶段。** 继续在 `plan.md` 上打磨字面已无新信息增益；所有剩余问题必须通过代码验证，而非评审推理。
 
-信息	当前做法	更好做法
-Blueprint 父类	LoadAsset → Cast<UBlueprint>	AR tag ParentClass
-Blueprint 接口	Load	AR tag ImplementedInterfaces
-Texture 尺寸	Load	AR tag Dimensions / SizeX/Y
-Mesh 三角形数	Load	AR tag + FAssetTagsAndValues
-GameplayTag 引用	Load	AR searchable reference（AssetRegistry export）
-Material 参数名	Load	AR searchable reference
-资产依赖	仍需 AR	GetDependencies — 无需 load
-行动：给每个 indexer 加 EIndexMode { TagOnly, NeedsLoad }；TagOnly 的完全不走 GameThread。预估能把 60-70% 的 indexer 调用从 GT 搬到后台线程。
+### 立即下一步（并行可做）
 
-3.3 Indexer 幂等化（去重引擎）
-IMonolithIndexer 加三个虚函数：
+1. **Phase -1 / Gate 0 POC**（零侵入，纯新增）
+   - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tools\MonolithIdentityPocCommandlet.cpp` —— 一次性 commandlet，读 1000 asset 输出 CSV
+   - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Docs\MonolithIndex\phase-minus-1-gate0-report.md` 模板
+   - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\ArtifactIdentity_test.cpp` 两个自动化测试
+   - 实施时附带残留 gap §A 的显式序列化约束
 
+2. **Phase 0 根因取证 SOP**
+   - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Docs\MonolithIndex\phase-0-root-cause.md` 模板
+   - 按 `matrix-pie-startup-profiling` skill 的多源 SOP 组织
+   - Unreal Insights trace 采集脚本 + 5 分钟 baseline trace
 
-virtual uint32 GetIndexerVersion() const = 0;    // bump on logic change
-virtual EIndexMode GetMode() const { return EIndexMode::TagOnly; }
-virtual void Produce(FIndexContext&, FIndexArtifact& Out) = 0;  // pure: in=pkgHash+tags+(uobject), out=blob
-Produce 必须是纯函数：输入相同输出必须相同。
-把 InsertDependency / InsertNode 等"写库"动作从 indexer 里移除——indexer 只产 blob；DB 落库是调度器的事（blob → rows 的固定翻译）。
+3. **ADR 镜像**
+   - `E:\fanggang_matrix\Unreal_Matrix\openspec\specs\adr\ADR-monolith-index-v2.md` 按 8 段式设计文档标准写
+   - `plan.md` 作为实施稿被 ADR 引用
 
-好处：
-
-同内容哈希的资产只跑一次 Produce（进程内 memoize）
-blob 可缓存到 CAS → 跨用户共享
-单测可 property-test（同输入同输出）
-3.4 批量化 AR 查询
-DependencyIndexer 现在是 post-pass 一次性扫描全部资产。改为：
-
-主循环内 AR.GetDependencies(pkg) 顺带产出 edges blob
-删除 post-pass（那个 if (false && DepIndexer) 直接删）
-同理 LevelIndexer 对 streaming levels 也可用 AR 替代加载（LevelInstance、WP grids 都在 tag 里）。
-
-3.5 Schema 版本化 & 部分失效
-当前 schema_version=2 是整库级别。需要 per-indexer schema version：
-
-
-CREATE TABLE indexer_versions (
-    indexer_id TEXT PRIMARY KEY,
-    schema_version INTEGER,
-    code_version INTEGER
-);
-升级 BlueprintIndexer 时 只重跑 Blueprint，不动其他表。省 90% 重建时间。
-
-4. 主逻辑不阻塞 —— 启动期 & 查询期双改
-4.1 启动（关键体感）
-现状：editor 启动 → subsystem Initialize → 立刻起全量 index 线程。大型项目冷启动到可用中间 15-60s。
-
-改造：
-
-Initialize 里只做：打开 DB、加载 indexer registry、注册 AR 回调、注册 tickable。不启动任何 index。 目标 < 50ms。
-PostEngineInit 延后 2 秒：
-读 indexer_versions 表 + DB schema_version
-如版本一致 & DB 非空 → 不做任何事，进入 live 模式
-否则 → 启动 worker pool，入队低优先级 catchup
-首次 MCP 查询进来 → 查询层从 DB 返回当前快照 + {"stale": true, "progress": 0.3}，永不阻塞
-AR OnFilesLoaded 触发后再算 delta，不要提前
-效果：editor 本体秒开，index 在后台安静进行，查询随时可用。
-
-4.2 Live 更新重写（去除熔断）
-OnAssetsUpdatedOnDisk → lock-free SPSC ring 入队 → 2s debounce tick → 每包生成 FIndexWorkItem(Pri=Live) 入池。
-
-关键：不再走 "先删后插" 模式，而是"写入新 artifact，原子替换 DB 指针"。读者并发查询不会看到"半删"状态。
-
-
-// atomic swap via single UPDATE
-UPDATE assets SET artifact_key = ? WHERE path = ?;
-并 取消 RawChanges.Empty() 熔断，但 live 路径走 CAS hit-first：如果用户只是 resave 没有实质修改，saved_hash 没变 → CAS 命中 → 零工作。
-
-4.3 UI 反馈
-启动期不再弹 FAsyncTaskNotification（除非 > 30s）
-状态条改成状态栏 badge，点开才见详情
-查询接口返回 stale_paths 子集让 LLM 可自己决定是否等待
-5. 多人共享计算 —— 本地团队 → 大规模
-5.1 Tier 1：团队内网共享 CAS（2 天工作量，收益最大）
-设计：
-
-一台 NAS / 任意 SMB 共享：\\team-nas\UE_IndexCache\<project_guid>\<aa>\<bb>\<key>.artifact
-客户端 FSharedNetworkCASStore 实现 Get/Put/Exists：
-Exists → FPaths::FileExists
-Get → 拷贝到本地临时，校验 Blake3，反序列化
-Put → 写临时文件 + rename（POSIX atomic）
-共享条件：同 (IndexerId, IndexerVersion, PackageSavedHash) → 全团队只算一次。因为 Blake3 由 UE 对 package 的规范化序列化得出，不包含绝对路径、不包含时间戳（UE 保证 DeterministicCook 条件下稳定），所以 A 保存的 BP_Player，B 拉到后 hash 相同。
-
-注意：
-
-开发中的 dirty package 不会被 AR 写 hash，自然不上传；commit 后才 hash 稳定
-需要给 CAS 加 GC：atime > 30d 删除
-写入用 advisory lock 避免两人同时写同 key（冲突概率极低，但 rename-atomic 已经够了）
-配置：项目设置加 SharedCacheRoot: FDirectoryPath，空则走纯本地。
-
-5.2 Tier 2：HTTP Cache Server（小型自建，1-2 周）
-当 NAS 延迟/权限不够时，起一个轻量 HTTP 服务：
-
-
-GET  /cache/{key} → 200 artifact | 404
-PUT  /cache/{key} → 201 (if absent, CAS semantics)
-HEAD /cache/{key} → existence probe
-参数化 FHttpCASStore；加 X-Project-Id、Authorization。后端存 S3/R2/MinIO 皆可，服务无状态。
-
-流量预估（50 人团队，20w 资产）：
-
-首次全仓填充：单人 ~3-5 GB index artifacts
-每人日均 <100 MB（只传本地改过的）
-hit ratio 长期 > 95%
-5.3 Tier 3：对接 Unreal Zen Server（推荐 - 复用成熟设施）
-Zen 是 Epic 官方的 高性能内容寻址 HTTP 服务，原本给 DDC 用，但它本质就是个 CAS blob store + namespaced buckets：
-
-
-PUT /ns/{namespace}/blobs/{ioHash}   # raw blob
-GET /ns/{namespace}/blobs/{ioHash}
-POST /ns/{namespace}/refs/{bucket}/{key}  # named reference
-做法：
-
-在 zen.conf 里注册新 namespace monolith.index
-FZenCASStore 调用 ZenHttp::Request()（引擎已有 ZenHttp.h）
-artifact = raw blob（put/get by Blake3），asset_path → artifact = ref
-团队里原本跑 Zen 当 DDC 用 → 几乎零运维增量
-为什么值得：
-
-Zen 已经处理好了 重复数据删除、原子写、pull-through 代理、多级层级
-Zen 原生支持 多机复制（cascade），可接中心 NAS 或云对象存储
-用户本来就得装 Zen（UE 5.4+ 趋势），不增加依赖
-相同 engine-version 下多项目共享基础设施
-限制：Zen ref 的 TTL 策略需要监控，一些 bucket 默认 14 天——可以配长期 bucket。
-
-5.4 Tier 4：Horde Server 远程执行（大规模共享 + 远端计算）
-Zen 解决 "存"，Horde 解决 "算"。Horde 是 Epic 的分布式作业服务器（BuildGraph 的大脑），能把计算任务扔到 farm 上跑。
-
-对接思路：
-
-写一个 Horde Job 模板 MonolithIndexJob.bgscript：输入 (package_list, engine_version, plugins_manifest)，输出一批 artifact 到 Zen
-客户端缺 index 时：
-本机优先（命中 Zen 就不必算）
-批量 miss 超过阈值（比如 > 500 个资产）→ 提交 Horde job，客户端 polling
-Horde agent 可以开在：
-夜间空闲的美术/程序机器
-专用 farm
-CI runner
-CI 集成：在 Perforce/Git post-commit hook 里触发 monolith-index warmup job，submit 的所有变更 15 分钟内全团队 已经算好了
-关键文件参考：
-
-Engine/Source/Programs/Horde/HordeAgent/*
-UE 5.7 Engine/Source/Developer/Zen/*
-落地顺序建议：Tier 1（一周内落地）→ Tier 3（Zen，两周）→ Tier 4（Horde，按需，可能一个月）。Tier 2 只在无法部署 Zen 时作为替代。
-
-5.5 安全 & 信任模型
-Artifact 是只读、可验证的（下载后重算 Blake3）
-恶意 artifact 注入不是主攻面，但加：
-可选签名：(key, blob, HMAC(team_secret))
-Namespace per project（不跨项目共享，避免 class hash 冲突）
-6. 存储层优化（SQLite 本身）
-切 WAL + memory temp：
-
-PRAGMA journal_mode=WAL;          -- 并发读不阻塞写
-PRAGMA synchronous=NORMAL;        -- 保持
-PRAGMA temp_store=MEMORY;
-PRAGMA mmap_size=2147483648;      -- 2GB mmap
-PRAGMA cache_size=-131072;        -- 128MB
-Asset 表加 artifact_key 列，原 nodes/connections/... 表改为 view over blob（按需解 blob） OR 保留为热查询缓存但可随时重建（从 CAS blob 物化）
-按月/项目分库（可选）：index_main.db + index_deep_<indexerid>.db，用 ATTACH 联查。benefit：重置单个 indexer 不锁主库
-FTS5 用 external-content table：当前应是内嵌的，改成 external-content 避免内容双写
-7. 查询 API 的无阻塞改造
-MCP action 调用举例 query_blueprint_nodes(path)：
-
-
-FIndexQueryResult Result = Index->Query(...);
-if (Result.IsStale()) {
-    // option A: return stale data + progress hint
-    //   → LLM can choose to retry later
-    // option B: if caller passed wait_ms>0, block up to that
-    //   → used by interactive editor UI
-}
-默认 stale-ok；MCP action 的参数加 wait_ms（默认 0）
-Interactive path 可用 PrioritizeAsset(path) 把 key 提到 P0
-新增 get_index_state() action：返回 {total, indexed, pending, cas_hit_ratio, last_error}
-8. 可观测性（必不可少）
-现状没有 metrics，调优盲飞。加：
-
-Per-indexer 计时：Indexer → { calls, total_ms, p50/p95/p99, load_ms, produce_ms, serialize_ms }
-CAS 命中率：{local_hit, shared_hit, miss, put_bytes, get_bytes}
-Queue 水位：{pending_interactive, pending_live, pending_bg}
-GT 预算占用：GameThreadPumper 每秒消耗 ms 数
-暴露为 MCP action index_metrics() + 可选 Prometheus 文本格式（/metrics 端点，复用现有 9316 HTTP）
-9. 落地顺序与验收
-阶段 A：去熔断 + 去阻塞（1-2 周，最大收益）
-删除 10 处 // 临时关闭 前，先做好 GameThreadPumper、AssetLoadBroker、batch AR-tag fast-path
-Dependency / Level / DataTable / Animation post-pass 重写为流式、取消 FEvent::Wait
-Indexer 加 GetMode()，TagOnly 的走纯 BG 线程
-验收：10w 资产项目冷启动后 index，编辑器 UI 帧率全程 > 30fps、启动到可查询 < 3s
-阶段 B：CAS 抽象 + 本地 CAS + 版本化（1 周）
-IIndexCASStore 接口 + FLocalCASStore
-IMonolithIndexer::Produce 纯函数化
-indexer_versions 表 + 部分失效
-验收：改一个 indexer 代码只重跑该 indexer；进程内 memoize 可见 hit
-阶段 C：共享 CAS Tier 1（1 周）
-FSharedNetworkCASStore（SMB/NAS）
-项目设置 UI、metrics
-验收：两人同仓拉同一 commit，第二人 index 时间 < 第一人的 20%
-阶段 D：Zen 对接（2 周）
-FZenCASStore 走 ZenHttp
-运维脚本、namespace 配置
-验收：替换 Tier 1 后命中率保持、延迟 < 50ms p95
-阶段 E（可选）：Horde 远端 warmup（2-4 周）
-BuildGraph job 模板
-Post-commit hook 触发
-验收：新 commit 15 分钟内全团队命中 Zen
-10. 风险 & 反向权衡
-风险	说明	对策
-Blake3 saved_hash 不稳定	UE 的 package hash 会因 dirty cook/build id 漂移	先做 A/B：同一人两次保存相同内容的 hash 比对；不稳就 fallback 到 sha1(serialized tags)
-非 deterministic indexer	指针/GUID/迭代顺序导致产物不同	Produce 必须排序输出、禁 ptr、禁未排序 map
-GT pumper 抖动	4ms 预算偶发不足	自适应：根据过去 1s 实际 frame time 动态 2-8ms
-Zen 不可用/超时	网络故障退化	所有 remote 调用带 250ms 超时 → fallback local compute
-CAS 体积膨胀	artifact 文件多	压缩（zstd）、GC by atime、可选按类聚合成 pack 文件
-禁用代码本来就有 bug	开回来才发现	每解熔断一个 indexer 单独灰度 + 只读 shadow 模式对比
-11. 关键代码改动点清单（精确定位）
-MonolithIndexer.h — 加 GetMode / GetIndexerVersion / Produce
-MonolithIndexSubsystem.cpp:396 — 删 AllAssets.Empty() + 走新调度器
-MonolithIndexSubsystem.cpp:695-900 — 5 处 post-pass 全部重写为 streaming
-MonolithIndexSubsystem.cpp:1015 / :1381 — 开回 live 管线
-MonolithIndexDatabase.cpp:257 — PRAGMA 更新
-新增 Source/MonolithIndexCAS/ 模块（IIndexCASStore、FLocalCASStore、FSharedNetworkCASStore、FZenCASStore）
-新增 FIndexScheduler + FGameThreadPumper（替代 FIndexingTask 内的 AsyncTask+Event.Wait 模式）
-MonolithSettings.h — 加 SharedCacheMode / SharedCacheRoot / ZenNamespace / EnableHordeWarmup
-请 review 上述方案。重点请反馈：
-
-Blake3 saved_hash 在你们 P4/Git 工作流下是否稳定 —— 这是共享层的根基
-团队是否已部署 Zen —— 决定走 Tier 1 NAS 还是直接 Tier 3
-Horde 可用性 —— 团队是否已有 Horde CI farm
-// 临时关闭 当初熔断时的痛点记录 —— 有没有 profiling 数据，我可以据此调整 GT pumper 预算
-正确性 vs 延迟 —— 查询默认 stale-ok 对你们的 MCP action 消费者（LLM）是否可接受
+三项无相互依赖，可并行起步。建议先做 **1 + 2**，因为它们是所有后续 Phase 的前置门禁；**3** 可在任何时候补齐。
