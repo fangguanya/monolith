@@ -5,8 +5,6 @@
 
 DECLARE_LOG_CATEGORY_EXTERN(LogMonolithComboGraph, Log, All);
 
-DECLARE_LOG_CATEGORY_EXTERN(LogMonolithComboGraph, Log, All);
-
 class FMonolithComboGraphModule : public IModuleInterface
 {
 public:
