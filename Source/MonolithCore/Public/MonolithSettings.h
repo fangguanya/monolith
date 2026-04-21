@@ -234,6 +234,16 @@ public:
 	bool bEnableAI = true;
 
 	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Inventory System X Module",
+			  ToolTip="Registers inventory_query actions for InventorySystemX integration (items, equipment, storage, crafting, runtime PIE, AI, accessibility)."))
+	bool bEnableInventorySystemX = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Audio Module",
+			  ToolTip="Registers audio_query actions for audio asset creation, inspection, batch management, Sound Cue graph building, and MetaSound graph building."))
+	bool bEnableAudio = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
 		meta=(DisplayName="Enable Light Module",
 			  ToolTip="When enabled, registers light namespace actions for light components, IES profiles, post-process, sky atmosphere, Lumen, height fog, and volumetric clouds."))
 	bool bEnableLight = true;
