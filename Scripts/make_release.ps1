@@ -8,15 +8,18 @@
 #   1. Sets MONOLITH_RELEASE_BUILD=1 (forces BA/GBA optional deps OFF in Build.cs)
 #   2. Runs UBT to produce clean release binaries
 #   3. Packages tracked files + binaries into a zip with Installed=true
-#   4. Strips non-redistributable modules (MonolithISX, MonolithSteamBridge) from
+#   4. Strips non-redistributable modules (MonolithSteamBridge) from
 #      source, binaries, and the uplugin module list
 #   5. Unsets env var (your next dev build auto-detects deps normally)
 #
 # Source users (GitHub clones) are unaffected — Build.cs auto-detects at compile time.
 #
 # Non-redistributable modules:
-#   - MonolithISX: paid marketplace plugin integration, not for redistribution
 #   - MonolithSteamBridge: solo-dev only, Steam Integration Kit bridge (not public)
+#
+# Note: MonolithISX was extracted to a sibling plugin at Plugins/MonolithISX/ on
+# 2026-04-21 — it no longer lives in this repo, so release packaging does not need
+# to strip it here.
 
 param(
     [Parameter(Mandatory=$true)]
@@ -61,9 +64,10 @@ finally {
 }
 
 # Modules stripped from every public release zip.
-# - MonolithISX: paid marketplace plugin (InventorySystemX) integration -- redistribution not permitted
 # - MonolithSteamBridge: solo-dev only, Steam Integration Kit bridge -- not public
-$StrippedModules = @("MonolithISX", "MonolithSteamBridge")
+# (MonolithISX was extracted to a sibling plugin at Plugins/MonolithISX/ on 2026-04-21 —
+#  it no longer lives in this repo and therefore does not need stripping here.)
+$StrippedModules = @("MonolithSteamBridge")
 
 $ProjectDir = Split-Path -Parent (Split-Path -Parent $PluginDir)
 $OutputZip = Join-Path $ProjectDir "Monolith-v$Version.zip"
@@ -82,7 +86,9 @@ if (-not $SkipBuild) {
     Write-Host "    MONOLITH_RELEASE_BUILD=1 (BA/GBA/ComboGraph forced off)" -ForegroundColor DarkGray
 
     try {
-        & $UBT LeviathanEditor Win64 Development "-Project=$UProject" -waitmutex
+        # Non-unity build catches missing includes and unity-only symbol collisions
+        # before they reach public releases (feedback_non_unity_build_releases.md).
+        & $UBT LeviathanEditor Win64 Development "-Project=$UProject" -waitmutex -DisableUnity
         if ($LASTEXITCODE -ne 0) {
             throw "UBT failed with exit code $LASTEXITCODE. Is the editor closed?"
         }
@@ -139,7 +145,7 @@ if (Test-Path $binDir) {
     New-Item -ItemType Directory -Path $destBin -Force | Out-Null
     $binCount = 0
     $binStripCount = 0
-    # Build a regex that matches any stripped module's binary (e.g. "UnrealEditor-MonolithISX.")
+    # Build a regex that matches any stripped module's binary (e.g. "UnrealEditor-MonolithSteamBridge.")
     $stripModuleRegex = "(" + (($StrippedModules | ForEach-Object { [regex]::Escape($_) }) -join "|") + ")"
     Get-ChildItem $binDir -Recurse -File |
         Where-Object { $_.Extension -ne '.pdb' -and $_.Name -notmatch '\.patch_' } |
