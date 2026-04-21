@@ -1,4 +1,4 @@
-# Monolith API Reference
+﻿# Monolith API Reference
 
 **Total Actions: 815** across 12 namespaces (13 modules; MonolithBABridge is integration-only with 0 MCP actions)
 
@@ -24,6 +24,59 @@
 | [mesh](#mesh) | 242 | Mesh inspection, scene manipulation, spatial queries, level blockout, GeometryScript, procedural geometry, lighting, audio, performance, town gen (experimental) |
 | [ui](#ui) | 42 | UI widget Blueprint CRUD, templates, styling, animation, settings scaffolding, accessibility |
 | [gas](#gas) | 130 | Gameplay Ability System: abilities, attributes, effects, ASC, tags, cues, targeting, input, inspect, scaffold |
+| [python](#python) | 3 | **Editor-only Python execution**. Run `unreal`-module scripts and capture stdout/stderr. Gated by `bEnablePython` (off by default). |
+
+---
+
+## python
+
+Execute UE Editor Python code over MCP with captured log output. **Gated by `UMonolithSettings::bEnablePython`** — off by default because this is effectively remote-code-execution. Enable in Project Settings → Monolith → Modules|Optional, or by writing `bEnablePython=True` to `[/Script/MonolithCore.MonolithSettings]` in `Saved/Config/WindowsEditor/Monolith.ini`. Requires the engine-bundled `PythonScriptPlugin`.
+
+Common response shape:
+```json
+{
+  "success": true,
+  "command_result": "None",
+  "stdout": "hello from print()\n",
+  "stderr": "",
+  "warnings": "",
+  "log_output": [{ "type": "info", "text": "..." }],
+  "log_count": 2,
+  "elapsed_ms": 9.45
+}
+```
+
+### `python_query` action `execute`
+
+Run a multi-statement Python source string (supports `import`, loops, functions — internally uses `EPythonCommandExecutionMode::ExecuteFile`).
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `command` | string | required | Python source to run |
+| `scope` | string | optional | `"private"` (default, isolated globals) or `"public"` (shared with the console session so successive calls see each other's imports) |
+| `unattended` | bool | optional | Suppress UI dialogs. Default `true`. Set `false` only if the script deliberately needs interactive UI (rare). |
+
+### `python_query` action `execute_file`
+
+Read a `.py` file from disk and run its contents. Use this for longer scripts so you don't have to JSON-escape the entire source.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `path` | string | required | Absolute path to a `.py` file |
+| `scope` | string | optional | `"private"` (default) or `"public"` |
+| `unattended` | bool | optional | Default `true` |
+
+Response adds `"path"` (the resolved path) and `"source_length"` (character count of the file).
+
+### `python_query` action `evaluate`
+
+Evaluate a single Python expression and return its repr in `command_result`. **Statements will error** — use `execute` for anything other than pure expressions.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `expression` | string | required | Single Python expression (e.g. `1+2`, `unreal.SystemLibrary.get_engine_version()`) |
+
+Response adds `"expression"` (echo of input).
 
 ---
 

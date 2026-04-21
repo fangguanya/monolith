@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
 #include "Engine/DeveloperSettings.h"
@@ -242,6 +242,11 @@ public:
 		meta=(DisplayName="Enable Capture Module",
 			  ToolTip="When enabled, registers capture namespace actions for viewport capture, scene preview (Niagara/Material/StaticMesh/SkeletalMesh/Animation/Widget), map management, and multi-frame sequence capture."))
 	bool bEnableCapture = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Python Execution Module (DANGEROUS)",
+			  ToolTip="When enabled, registers python namespace actions for executing arbitrary Python code in the editor. This is effectively a remote-code-execution surface — only enable on trusted local dev machines."))
+	bool bEnablePython = false;
 
 	// --- Modules|Mesh ---
 

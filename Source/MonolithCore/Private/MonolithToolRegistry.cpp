@@ -1,4 +1,4 @@
-#include "MonolithToolRegistry.h"
+﻿#include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 
 FMonolithToolRegistry& FMonolithToolRegistry::Get()
@@ -112,9 +112,39 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 
 	// Release lock before executing handler (handlers may take time)
 	FMonolithActionHandler HandlerCopy = RegAction->Handler;
+
+	// MCP-1307 fix: Per-asset re-entrancy guard.
+	// Some handlers (e.g., CompileBlueprint, SaveLoadedAsset) pump the message loop,
+	// which can allow the HTTP server to dispatch another request for the same asset
+	// before the first one completes. This guard prevents interleaved operations.
+	FString AssetPath;
+	if (Params.IsValid())
+	{
+		Params->TryGetStringField(TEXT("asset_path"), AssetPath);
+	}
+	bool bGuarded = !AssetPath.IsEmpty();
+	if (bGuarded)
+	{
+		if (InFlightAssets.Contains(AssetPath))
+		{
+			Lock.Unlock();
+			return FMonolithActionResult::Error(
+				FString::Printf(TEXT("Asset '%s' is currently being modified by another in-flight operation. "
+					"Wait for the previous operation to complete before retrying."), *AssetPath));
+		}
+		InFlightAssets.Add(AssetPath);
+	}
 	Lock.Unlock();
 
-	return HandlerCopy.Execute(Params.IsValid() ? Params : MakeShared<FJsonObject>());
+	FMonolithActionResult Result = HandlerCopy.Execute(Params.IsValid() ? Params : MakeShared<FJsonObject>());
+
+	if (bGuarded)
+	{
+		FScopeLock Guard(&RegistryLock);
+		InFlightAssets.Remove(AssetPath);
+	}
+
+	return Result;
 }
 
 TArray<FString> FMonolithToolRegistry::GetNamespaces() const
