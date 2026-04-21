@@ -1,8 +1,11 @@
 @echo off
 :: Monolith MCP Proxy launcher
 :: Finds Python automatically and runs the proxy.
-:: Usage in .mcp.json:
-::   {"mcpServers": {"monolith": {"command": "Plugins/Monolith/Scripts/monolith_proxy.bat"}}}
+:: Usage:
+::   Matrix repo root (.mcp.json):
+::     {"mcpServers": {"monolith": {"command": "Client/Plugins/Matrix/Monolith/Scripts/monolith_proxy.bat", "args": []}}}
+::   Standalone plugin layout:
+::     {"mcpServers": {"monolith": {"command": "Plugins/Monolith/Scripts/monolith_proxy.bat", "args": []}}}
 
 setlocal
 

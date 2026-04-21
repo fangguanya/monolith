@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Monolith MCP stdio-to-HTTP proxy.
 
@@ -7,8 +7,12 @@ Handles initialize locally, forwards tool calls to Monolith.
 Survives editor restarts — proxy process never dies.
 Background health poll auto-detects when the editor comes online.
 
-Usage (in .mcp.json):
-  {"mcpServers": {"monolith": {"command": "python", "args": ["Plugins/Monolith/Scripts/monolith_proxy.py"]}}}
+Usage:
+  Matrix repo root (.mcp.json):
+    {"mcpServers": {"monolith": {"command": "Client/Plugins/Matrix/Monolith/Scripts/monolith_proxy.bat", "args": []}}}
+
+  Standalone plugin layout:
+    {"mcpServers": {"monolith": {"command": "Plugins/Monolith/Scripts/monolith_proxy.bat", "args": []}}}
 
 Requirements: Python 3.8+ (stdlib only, no pip install needed)
 """
