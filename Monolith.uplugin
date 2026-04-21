@@ -117,6 +117,11 @@
 			"Optional": true
 		},
 		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true,
+			"Optional": true
+		},
+		{
 			"Name": "Metasound",
 			"Enabled": true,
 			"Optional": true
@@ -230,6 +235,11 @@
 		},
 		{
 			"Name": "MonolithPerf",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MonolithPython",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
 		}

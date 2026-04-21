@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
@@ -101,6 +101,10 @@ private:
 
 	/** Map of namespace → list of action keys */
 	TMap<FString, TArray<FString>> NamespaceActions;
+
+	/** Per-asset re-entrancy guard: tracks asset_path currently being operated on.
+	 *  Prevents interleaved operations when handlers pump the message loop (e.g., CompileBlueprint). */
+	TSet<FString> InFlightAssets;
 
 	static FString MakeKey(const FString& Namespace, const FString& Action)
 	{
