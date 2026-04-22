@@ -1,208 +1,113 @@
 #include "Indexers/AnimationIndexer.h"
-#include "MonolithSettings.h"
-#include "MonolithMemoryHelper.h"
+#include "Indexers/MonolithSimpleArtifactSerialization.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/BlendSpace.h"
 #include "Animation/PoseAsset.h"
 #include "Animation/AnimNotifies/AnimNotify.h"
 #include "Animation/AnimNotifies/AnimNotifyState.h"
-#include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 
-#if PLATFORM_WINDOWS
-#include "Windows/AllowWindowsPlatformTypes.h"
-#include <excpt.h>
-#include "Windows/HideWindowsPlatformTypes.h"
+/*
+ * 这份实现文件把多种动画资产统一压成“单 node 摘要”。
+ *
+ * 这么做的原因是：
+ * - 查询侧通常更关心动画的关键元数据，而不是逐帧内容；
+ * - 单 node 载荷更适合 artifact cache 和 shadow diff；
+ * - 不同动画类型虽然长得不一样，但都能收口成一个 properties JSON。
+ */
 
-// Isolated SEH wrapper — can't use __try in functions with C++ objects
-static bool SafeCallWithSEH(void(*Func)(void*), void* Context)
+bool FAnimationIndexer::BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact)
 {
-	__try
-	{
-		Func(Context);
-		return true;
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
+	(void)AssetRegistry;
+	MonolithSimpleArtifactSerialization::FNodePayload Payload;
+	if (!BuildPayload(LoadedAsset, Payload.Node))
 	{
 		return false;
 	}
-}
-#endif
 
-/** Context struct for SEH-safe load+index calls */
-struct FAnimIndexCallContext
-{
-	FAnimationIndexer* Self;
-	FMonolithIndexDatabase* DB;
-	int64 AssetId;
-	FSoftObjectPath ObjectPath;  // Load happens inside SEH guard
-	bool bSuccess;               // Set to true if load+index succeeded
-	enum EType { Sequence, Montage, BlendSp, Pose } Type;
-};
-
-static void LoadAndIndexAnimAsset(void* Ctx)
-{
-	auto* C = static_cast<FAnimIndexCallContext*>(Ctx);
-	C->bSuccess = false;
-
-	// TryLoad inside SEH guard — this is where the crash was happening
-	UObject* Loaded = C->ObjectPath.TryLoad();
-	if (!Loaded) return;
-
-	switch (C->Type)
-	{
-	case FAnimIndexCallContext::Sequence:
-		if (UAnimSequence* A = Cast<UAnimSequence>(Loaded))
-		{ C->Self->IndexAnimSequencePublic(A, *C->DB, C->AssetId); C->bSuccess = true; }
-		break;
-	case FAnimIndexCallContext::Montage:
-		if (UAnimMontage* A = Cast<UAnimMontage>(Loaded))
-		{ C->Self->IndexAnimMontagePublic(A, *C->DB, C->AssetId); C->bSuccess = true; }
-		break;
-	case FAnimIndexCallContext::BlendSp:
-		if (UBlendSpace* A = Cast<UBlendSpace>(Loaded))
-		{ C->Self->IndexBlendSpacePublic(A, *C->DB, C->AssetId); C->bSuccess = true; }
-		break;
-	case FAnimIndexCallContext::Pose:
-		if (UPoseAsset* A = Cast<UPoseAsset>(Loaded))
-		{ C->Self->IndexPoseAssetPublic(A, *C->DB, C->AssetId); C->bSuccess = true; }
-		break;
-	}
+	OutArtifact = FMonolithArtifact();
+	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
+	OutArtifact.IndexerId = GetIndexerId();
+	OutArtifact.IndexerVersion = GetIndexerVersion();
+	OutArtifact.ExecutionMode = GetExecutionMode();
+	OutArtifact.PackageName = AssetData.PackageName.ToString();
+	MonolithSimpleArtifactSerialization::SerializeNodePayload(Payload, OutArtifact.Payload);
+	return OutArtifact.Payload.Num() > 0;
 }
 
-bool FAnimationIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FAnimationIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
 {
-	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-
-	// Get settings for batching
-	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
-	const int32 BatchSize = FMath::Max(1, FMonolithMemoryHelper::GetResolvedPostPassBatchSize());
-	const SIZE_T MemoryBudgetMB = static_cast<SIZE_T>(FMonolithMemoryHelper::GetResolvedMemoryBudgetMB());
-	const bool bLogMemory = Settings->bLogMemoryStats;
-
-	int32 TotalIndexed = 0;
-
-	// Helper lambda: scan registry for type T, safely load and index each asset with batching and GC
-	auto IndexAllOfType = [&](UClass* Class, FAnimIndexCallContext::EType Type, const TCHAR* TypeName) -> int32
+	MonolithSimpleArtifactSerialization::FNodePayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeNodePayload(Artifact.Payload, Payload))
 	{
-		TArray<FAssetData> Assets;
-		FARFilter Filter;
-		for (const FName& ContentPath : UMonolithSettings::GetIndexedContentPaths())
-		{
-			Filter.PackagePaths.Add(ContentPath);
-		}
-		Filter.bRecursivePaths = true;
-		Filter.ClassPaths.Add(Class->GetClassPathName());
-		Registry.GetAssets(Filter, Assets);
-
-		if (Assets.Num() == 0) return 0;
-
-		UE_LOG(LogMonolithIndex, Log, TEXT("AnimationIndexer: Processing %d %s assets"), Assets.Num(), TypeName);
-
-		int32 Count = 0;
-		int32 BatchNumber = 0;
-
-		for (int32 i = 0; i < Assets.Num(); i += BatchSize)
-		{
-			// Memory budget check before each batch
-			if (FMonolithMemoryHelper::ShouldThrottle(MemoryBudgetMB))
-			{
-				UE_LOG(LogMonolithIndex, Log, TEXT("AnimationIndexer: Memory budget exceeded, forcing GC..."));
-				FMonolithMemoryHelper::ForceGarbageCollection(true);
-				FMonolithMemoryHelper::YieldToEditor();
-			}
-
-			int32 BatchEnd = FMath::Min(i + BatchSize, Assets.Num());
-
-			// Process batch
-			for (int32 j = i; j < BatchEnd; ++j)
-			{
-				const FAssetData& AD = Assets[j];
-
-				int64 AId = DB.GetAssetId(AD.PackageName.ToString());
-				if (AId < 0) continue;
-
-				FAnimIndexCallContext Ctx;
-				Ctx.Self = this;
-				Ctx.DB = &DB;
-				Ctx.AssetId = AId;
-				Ctx.ObjectPath = AD.GetSoftObjectPath();
-				Ctx.bSuccess = false;
-				Ctx.Type = Type;
-
-#if PLATFORM_WINDOWS
-				if (SafeCallWithSEH(&LoadAndIndexAnimAsset, &Ctx))
-				{
-					if (Ctx.bSuccess) Count++;
-				}
-				else
-				{
-					UE_LOG(LogMonolithIndex, Warning, TEXT("AnimationIndexer: crashed loading/indexing '%s' - skipping"), *AD.GetSoftObjectPath().ToString());
-				}
-#else
-				LoadAndIndexAnimAsset(&Ctx);
-				if (Ctx.bSuccess) Count++;
-#endif
-			}
-
-			BatchNumber++;
-
-			// GC after each batch
-			FMonolithMemoryHelper::ForceGarbageCollection(false);
-			FMonolithMemoryHelper::YieldToEditor();
-
-			// Log progress periodically
-			if (BatchNumber % 10 == 0 || BatchEnd == Assets.Num())
-			{
-				UE_LOG(LogMonolithIndex, Log, TEXT("AnimationIndexer: %s progress %d / %d"), TypeName, BatchEnd, Assets.Num());
-			}
-		}
-
-		return Count;
-	};
-
-	if (bLogMemory)
-	{
-		FMonolithMemoryHelper::LogMemoryStats(TEXT("AnimationIndexer start"));
+		return false;
 	}
 
-	TotalIndexed += IndexAllOfType(UAnimSequence::StaticClass(), FAnimIndexCallContext::Sequence, TEXT("AnimSequence"));
-	TotalIndexed += IndexAllOfType(UAnimMontage::StaticClass(), FAnimIndexCallContext::Montage, TEXT("AnimMontage"));
-	TotalIndexed += IndexAllOfType(UBlendSpace::StaticClass(), FAnimIndexCallContext::BlendSp, TEXT("BlendSpace"));
-	TotalIndexed += IndexAllOfType(UPoseAsset::StaticClass(), FAnimIndexCallContext::Pose, TEXT("PoseAsset"));
-
-	// Final GC
-	FMonolithMemoryHelper::ForceGarbageCollection(true);
-
-	UE_LOG(LogMonolithIndex, Log, TEXT("AnimationIndexer: indexed %d animation assets"), TotalIndexed);
-
-	if (bLogMemory)
-	{
-		FMonolithMemoryHelper::LogMemoryStats(TEXT("AnimationIndexer complete"));
-	}
-
-	return true;
+	return MonolithSimpleArtifactSerialization::MaterializeNodePayload(Payload, DB, AssetId);
 }
 
-void FAnimationIndexer::IndexAnimSequence(UAnimSequence* AnimSeq, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FAnimationIndexer::MaterializeArtifactToShadow(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName)
 {
+	MonolithSimpleArtifactSerialization::FNodePayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeNodePayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeNodePayloadToShadow(Payload, DB, AssetId, CohortName);
+}
+
+bool FAnimationIndexer::BuildPayload(UObject* LoadedAsset, FIndexedNode& OutNode) const
+{
+	// 这里按“更具体的类型优先”往下分发，
+	// 因为像 Montage/BlendSpace 都可能同时也是更宽泛动画类体系的一员。
+	if (UAnimMontage* Montage = Cast<UAnimMontage>(LoadedAsset))
+	{
+		return BuildAnimMontageNode(Montage, OutNode);
+	}
+
+	if (UBlendSpace* BlendSpace = Cast<UBlendSpace>(LoadedAsset))
+	{
+		return BuildBlendSpaceNode(BlendSpace, OutNode);
+	}
+
+	if (UPoseAsset* PoseAsset = Cast<UPoseAsset>(LoadedAsset))
+	{
+		return BuildPoseAssetNode(PoseAsset, OutNode);
+	}
+
+	if (UAnimSequence* AnimSeq = Cast<UAnimSequence>(LoadedAsset))
+	{
+		return BuildAnimSequenceNode(AnimSeq, OutNode);
+	}
+
+	return false;
+}
+
+bool FAnimationIndexer::BuildAnimSequenceNode(UAnimSequence* AnimSeq, FIndexedNode& OutNode) const
+{
+	if (!AnimSeq)
+	{
+		return false;
+	}
+
 	USkeleton* Skeleton = AnimSeq->GetSkeleton();
 	const FString SkeletonName = Skeleton ? Skeleton->GetPathName() : TEXT("None");
 
-	// Build properties JSON
 	auto Props = MakeShared<FJsonObject>();
 	Props->SetStringField(TEXT("skeleton"), SkeletonName);
 	Props->SetNumberField(TEXT("length"), AnimSeq->GetPlayLength());
 	Props->SetNumberField(TEXT("num_frames"), AnimSeq->GetNumberOfSampledKeys());
 	Props->SetNumberField(TEXT("rate_scale"), AnimSeq->RateScale);
 
-	// Bone tracks
 	TArray<TSharedPtr<FJsonValue>> TracksArr;
 	if (Skeleton)
 	{
+		// 这里记录的是骨骼名字列表，不是每条轨道的完整关键帧数据。
+		// 目的是给搜索和结构摘要用，而不是做动画重建。
 		const FReferenceSkeleton& RefSkeleton = Skeleton->GetReferenceSkeleton();
 		const int32 NumBones = RefSkeleton.GetNum();
 		for (int32 BoneIdx = 0; BoneIdx < NumBones; ++BoneIdx)
@@ -212,37 +117,35 @@ void FAnimationIndexer::IndexAnimSequence(UAnimSequence* AnimSeq, FMonolithIndex
 	}
 	Props->SetArrayField(TEXT("bone_tracks"), TracksArr);
 
-	// Curves
 	TArray<TSharedPtr<FJsonValue>> CurvesArr;
 	const FRawCurveTracks& RawCurves = AnimSeq->GetCurveData();
 	for (const FFloatCurve& Curve : RawCurves.FloatCurves)
 	{
+		// 曲线只保留“名字 + key 数量”这类轻量摘要，避免 payload 过大。
 		auto CurveObj = MakeShared<FJsonObject>();
 		CurveObj->SetStringField(TEXT("name"), Curve.GetName().ToString());
 		CurveObj->SetNumberField(TEXT("num_keys"), Curve.FloatCurve.GetNumKeys());
 		CurvesArr.Add(MakeShared<FJsonValueObject>(CurveObj));
 	}
 	Props->SetArrayField(TEXT("curves"), CurvesArr);
-
-	// Notifies
 	Props->SetStringField(TEXT("notifies"), NotifiesToJson(AnimSeq->Notifies));
 
-	// Serialize properties
-	FString PropsStr;
-	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&PropsStr);
-	FJsonSerializer::Serialize(Props, *Writer, true);
+	OutNode = FIndexedNode();
+	OutNode.NodeType = TEXT("AnimSequence");
+	OutNode.NodeName = AnimSeq->GetName();
+	OutNode.NodeClass = TEXT("UAnimSequence");
 
-	FIndexedNode Node;
-	Node.AssetId = AssetId;
-	Node.NodeType = TEXT("AnimSequence");
-	Node.NodeName = AnimSeq->GetName();
-	Node.NodeClass = TEXT("UAnimSequence");
-	Node.Properties = PropsStr;
-	DB.InsertNode(Node);
+	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutNode.Properties);
+	return FJsonSerializer::Serialize(Props, *Writer, true);
 }
 
-void FAnimationIndexer::IndexAnimMontage(UAnimMontage* Montage, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FAnimationIndexer::BuildAnimMontageNode(UAnimMontage* Montage, FIndexedNode& OutNode) const
 {
+	if (!Montage)
+	{
+		return false;
+	}
+
 	USkeleton* Skeleton = Montage->GetSkeleton();
 	const FString SkeletonName = Skeleton ? Skeleton->GetPathName() : TEXT("None");
 
@@ -250,10 +153,10 @@ void FAnimationIndexer::IndexAnimMontage(UAnimMontage* Montage, FMonolithIndexDa
 	Props->SetStringField(TEXT("skeleton"), SkeletonName);
 	Props->SetNumberField(TEXT("length"), Montage->GetPlayLength());
 
-	// Sections
 	TArray<TSharedPtr<FJsonValue>> SectionsArr;
 	for (const FCompositeSection& Section : Montage->CompositeSections)
 	{
+		// Montage 的 section 信息对“跳转逻辑”很关键，所以这里会单独记下来。
 		auto SectionObj = MakeShared<FJsonObject>();
 		SectionObj->SetStringField(TEXT("name"), Section.SectionName.ToString());
 		SectionObj->SetNumberField(TEXT("start_time"), Section.GetTime());
@@ -262,42 +165,40 @@ void FAnimationIndexer::IndexAnimMontage(UAnimMontage* Montage, FMonolithIndexDa
 	}
 	Props->SetArrayField(TEXT("sections"), SectionsArr);
 
-	// Slots
 	TArray<TSharedPtr<FJsonValue>> SlotsArr;
 	for (const FSlotAnimationTrack& Slot : Montage->SlotAnimTracks)
 	{
+		// slot 里不展开全部 segment，只先记录 slot 名和段数。
 		auto SlotObj = MakeShared<FJsonObject>();
 		SlotObj->SetStringField(TEXT("name"), Slot.SlotName.ToString());
 		SlotObj->SetNumberField(TEXT("num_segments"), Slot.AnimTrack.AnimSegments.Num());
 		SlotsArr.Add(MakeShared<FJsonValueObject>(SlotObj));
 	}
 	Props->SetArrayField(TEXT("slots"), SlotsArr);
-
-	// Notifies
 	Props->SetStringField(TEXT("notifies"), NotifiesToJson(Montage->Notifies));
 
-	FString PropsStr;
-	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&PropsStr);
-	FJsonSerializer::Serialize(Props, *Writer, true);
+	OutNode = FIndexedNode();
+	OutNode.NodeType = TEXT("AnimMontage");
+	OutNode.NodeName = Montage->GetName();
+	OutNode.NodeClass = TEXT("UAnimMontage");
 
-	FIndexedNode Node;
-	Node.AssetId = AssetId;
-	Node.NodeType = TEXT("AnimMontage");
-	Node.NodeName = Montage->GetName();
-	Node.NodeClass = TEXT("UAnimMontage");
-	Node.Properties = PropsStr;
-	DB.InsertNode(Node);
+	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutNode.Properties);
+	return FJsonSerializer::Serialize(Props, *Writer, true);
 }
 
-void FAnimationIndexer::IndexBlendSpace(UBlendSpace* BlendSpace, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FAnimationIndexer::BuildBlendSpaceNode(UBlendSpace* BlendSpace, FIndexedNode& OutNode) const
 {
+	if (!BlendSpace)
+	{
+		return false;
+	}
+
 	USkeleton* Skeleton = BlendSpace->GetSkeleton();
 	const FString SkeletonName = Skeleton ? Skeleton->GetPathName() : TEXT("None");
 
 	auto Props = MakeShared<FJsonObject>();
 	Props->SetStringField(TEXT("skeleton"), SkeletonName);
 
-	// Axes
 	const FBlendParameter& AxisX = BlendSpace->GetBlendParameter(0);
 	const FBlendParameter& AxisY = BlendSpace->GetBlendParameter(1);
 
@@ -315,11 +216,11 @@ void FAnimationIndexer::IndexBlendSpace(UBlendSpace* BlendSpace, FMonolithIndexD
 	AxisYObj->SetNumberField(TEXT("grid_num"), AxisY.GridNum);
 	Props->SetObjectField(TEXT("axis_y"), AxisYObj);
 
-	// Sample points
 	TArray<TSharedPtr<FJsonValue>> SamplesArr;
 	const TArray<FBlendSample>& Samples = BlendSpace->GetBlendSamples();
 	for (const FBlendSample& Sample : Samples)
 	{
+		// BlendSpace 的采样点是理解动画混合布局最重要的摘要之一。
 		auto SampleObj = MakeShared<FJsonObject>();
 		SampleObj->SetStringField(TEXT("animation"), Sample.Animation ? Sample.Animation->GetPathName() : TEXT("None"));
 		SampleObj->SetNumberField(TEXT("x"), Sample.SampleValue.X);
@@ -329,25 +230,23 @@ void FAnimationIndexer::IndexBlendSpace(UBlendSpace* BlendSpace, FMonolithIndexD
 	}
 	Props->SetArrayField(TEXT("sample_points"), SamplesArr);
 
-	FString PropsStr;
-	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&PropsStr);
-	FJsonSerializer::Serialize(Props, *Writer, true);
+	OutNode = FIndexedNode();
+	OutNode.NodeType = TEXT("BlendSpace");
+	OutNode.NodeName = BlendSpace->GetName();
+	OutNode.NodeClass = TEXT("UBlendSpace");
 
-	FIndexedNode Node;
-	Node.AssetId = AssetId;
-	Node.NodeType = TEXT("BlendSpace");
-	Node.NodeName = BlendSpace->GetName();
-	Node.NodeClass = TEXT("UBlendSpace");
-	Node.Properties = PropsStr;
-	DB.InsertNode(Node);
+	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutNode.Properties);
+	return FJsonSerializer::Serialize(Props, *Writer, true);
 }
 
-void FAnimationIndexer::IndexPoseAsset(UPoseAsset* PoseAsset, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FAnimationIndexer::BuildPoseAssetNode(UPoseAsset* PoseAsset, FIndexedNode& OutNode) const
 {
-	if (!PoseAsset) return;
+	if (!PoseAsset)
+	{
+		return false;
+	}
 
 	auto Props = MakeShared<FJsonObject>();
-
 	if (PoseAsset->GetSkeleton())
 	{
 		Props->SetStringField(TEXT("skeleton"), PoseAsset->GetSkeleton()->GetPathName());
@@ -363,7 +262,6 @@ void FAnimationIndexer::IndexPoseAsset(UPoseAsset* PoseAsset, FMonolithIndexData
 		Props->SetStringField(TEXT("retarget_source"), PoseAsset->RetargetSource.ToString());
 	}
 
-	// Pose names (using GetPoseFNames — GetPoseNames is deprecated since 5.3)
 	const TArray<FName>& PoseNames = PoseAsset->GetPoseFNames();
 	TArray<TSharedPtr<FJsonValue>> PoseNameArray;
 	for (const FName& Name : PoseNames)
@@ -372,17 +270,13 @@ void FAnimationIndexer::IndexPoseAsset(UPoseAsset* PoseAsset, FMonolithIndexData
 	}
 	Props->SetArrayField(TEXT("pose_names"), PoseNameArray);
 
-	FString PropsStr;
-	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&PropsStr);
-	FJsonSerializer::Serialize(Props, *Writer, true);
+	OutNode = FIndexedNode();
+	OutNode.NodeType = TEXT("PoseAsset");
+	OutNode.NodeName = PoseAsset->GetName();
+	OutNode.NodeClass = TEXT("PoseAsset");
 
-	FIndexedNode PoseNode;
-	PoseNode.AssetId = AssetId;
-	PoseNode.NodeName = PoseAsset->GetName();
-	PoseNode.NodeClass = TEXT("PoseAsset");
-	PoseNode.NodeType = TEXT("PoseAsset");
-	PoseNode.Properties = PropsStr;
-	DB.InsertNode(PoseNode);
+	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutNode.Properties);
+	return FJsonSerializer::Serialize(Props, *Writer, true);
 }
 
 FString FAnimationIndexer::NotifiesToJson(const TArray<FAnimNotifyEvent>& Notifies)

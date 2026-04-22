@@ -1,27 +1,25 @@
 #include "Actions/ProjectFindReferencesAction.h"
+#include "Actions/MonolithProjectActionUtils.h"
 #include "MonolithIndexSubsystem.h"
 #include "MonolithParamSchema.h"
-#include "Editor.h"
+#include "Serialization/JsonTypes.h"
 
 FMonolithActionResult FProjectFindReferencesAction::Execute(const TSharedPtr<FJsonObject>& Params)
 {
-	FString PackagePath = Params->GetStringField(TEXT("asset_path"));
-	if (PackagePath.IsEmpty())
+	// 统一使用 package_path，避免 action 层继续扩散“asset_path / package_path”双名字分叉。
+	FString PackagePath;
+	if (!MonolithProjectActionUtils::TryGetRequiredStringParam(Params, TEXT("package_path"), PackagePath))
 	{
-		PackagePath = Params->GetStringField(TEXT("package_path"));
-	}
-	if (PackagePath.IsEmpty())
-	{
-		return FMonolithActionResult::Error(TEXT("'asset_path' (or 'package_path') parameter is required"), -32602);
+		return MonolithProjectActionUtils::MakeMissingStringParamError(TEXT("package_path"));
 	}
 
-	UMonolithIndexSubsystem* Subsystem = GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>();
+	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
 	if (!Subsystem)
 	{
-		return FMonolithActionResult::Error(TEXT("Index subsystem not available"));
+		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
 	}
 
-	TSharedPtr<FJsonObject> Refs = Subsystem->FindReferences(PackagePath);
+	const TSharedPtr<FJsonObject> Refs = Subsystem->FindReferences(PackagePath);
 	if (!Refs.IsValid())
 	{
 		return FMonolithActionResult::Error(TEXT("Asset not found in index"));
@@ -29,7 +27,7 @@ FMonolithActionResult FProjectFindReferencesAction::Execute(const TSharedPtr<FJs
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), true);
-	Result->SetStringField(TEXT("asset_path"), PackagePath);
+	Result->SetStringField(TEXT("package_path"), PackagePath);
 	Result->SetObjectField(TEXT("references"), Refs);
 	return FMonolithActionResult::Success(Result);
 }
@@ -37,6 +35,6 @@ FMonolithActionResult FProjectFindReferencesAction::Execute(const TSharedPtr<FJs
 TSharedPtr<FJsonObject> FProjectFindReferencesAction::GetSchema()
 {
 	return FParamSchemaBuilder()
-		.Required(TEXT("asset_path"), TEXT("string"), TEXT("Package path of the asset (e.g. /Game/Characters/BP_Hero)"))
+		.Required(TEXT("package_path"), TEXT("string"), TEXT("Package path of the asset (e.g. /Game/Characters/BP_Hero)"))
 		.Build();
 }

@@ -1,112 +1,164 @@
 #include "Indexers/ConfigIndexer.h"
-#include "Misc/Paths.h"
-#include "Misc/FileHelper.h"
-#include "HAL/FileManager.h"
 
-bool FConfigIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
+#include "MonolithIndexLog.h"
+
+namespace ConfigIndexerInternal
 {
-	// Collect .ini files from the project Config directory
-	TArray<FString> IniFiles;
-	FString ProjectConfigDir = FPaths::ProjectConfigDir();
-	IFileManager::Get().FindFilesRecursive(IniFiles, *ProjectConfigDir, TEXT("*.ini"), true, false);
+	/** 这份全局 artifact 在 identity 里对应的逻辑“包名”。 */
+	static const FName GlobalPackageName(TEXT("/Monolith/Global/Config"));
+}
 
-	// Also include Engine config directory
-	FString EngineConfigDir = FPaths::EngineConfigDir();
-	IFileManager::Get().FindFilesRecursive(IniFiles, *EngineConfigDir, TEXT("*.ini"), true, false);
+bool FConfigIndexer::IndexGlobal(FMonolithIndexDatabase& DB)
+{
+	// Config reducer 现在只保留 artifact 主链这一种实现。
+	return MonolithGlobalArtifactHelpers::ExecuteIndexGlobalFromArtifact(*this, DB);
+}
 
-	int32 TotalEntries = 0;
+bool FConfigIndexer::BuildGlobalArtifactIdentity(FMonolithArtifactIdentityV1& OutIdentity) const
+{
+	return MonolithGlobalArtifactHelpers::BuildInputFileManifestIdentity(
+		*this,
+		ConfigIndexerInternal::GlobalPackageName,
+		[](TArray<MonolithGlobalArtifactHelpers::FInputFile>& OutFiles)
+		{
+			CollectConfigFiles(OutFiles);
+		},
+		OutIdentity);
+}
 
-	for (const FString& IniFile : IniFiles)
+bool FConfigIndexer::BuildGlobalArtifact(FMonolithArtifact& OutArtifact)
+{
+	return MonolithGlobalArtifactHelpers::BuildGlobalPayloadArtifact<MonolithSimpleArtifactSerialization::FConfigPayload>(
+		*this,
+		ConfigIndexerInternal::GlobalPackageName,
+		[](MonolithSimpleArtifactSerialization::FConfigPayload& Payload)
+		{
+			return BuildPayload(Payload);
+		},
+		[](const MonolithSimpleArtifactSerialization::FConfigPayload& Payload, TArray<uint8>& OutBytes)
+		{
+			MonolithSimpleArtifactSerialization::SerializeConfigPayload(Payload, OutBytes);
+		},
+		[](const MonolithSimpleArtifactSerialization::FConfigPayload& Payload)
+		{
+			return Payload.Entries.Num();
+		},
+		OutArtifact);
+}
+
+bool FConfigIndexer::MaterializeGlobalArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB)
+{
+	return MonolithGlobalArtifactHelpers::MaterializeGlobalPayloadArtifact<MonolithSimpleArtifactSerialization::FConfigPayload>(
+		Artifact,
+		DB,
+		[](const TArray<uint8>& Bytes, MonolithSimpleArtifactSerialization::FConfigPayload& Payload)
+		{
+			return MonolithSimpleArtifactSerialization::DeserializeConfigPayload(Bytes, Payload);
+		},
+		[](const MonolithSimpleArtifactSerialization::FConfigPayload& Payload, FMonolithIndexDatabase& InDB)
+		{
+			return MonolithSimpleArtifactSerialization::MaterializeConfigPayload(Payload, InDB);
+		},
+		[](const MonolithSimpleArtifactSerialization::FConfigPayload& Payload)
+		{
+			return Payload.Entries.Num();
+		},
+		TEXT("ConfigIndexer"),
+		TEXT("config entries"));
+}
+
+void FConfigIndexer::CollectConfigFiles(TArray<MonolithGlobalArtifactHelpers::FInputFile>& OutFiles)
+{
+	OutFiles.Reset();
+	MonolithGlobalArtifactHelpers::AppendFilesRecursive(OutFiles, FPaths::ProjectConfigDir(), TEXT("*.ini"));
+	MonolithGlobalArtifactHelpers::AppendFilesRecursive(OutFiles, FPaths::EngineConfigDir(), TEXT("*.ini"));
+	MonolithGlobalArtifactHelpers::SortAndUniqueInputFiles(OutFiles);
+}
+
+bool FConfigIndexer::BuildPayload(MonolithSimpleArtifactSerialization::FConfigPayload& OutPayload)
+{
+	OutPayload = MonolithSimpleArtifactSerialization::FConfigPayload();
+
+	TArray<MonolithGlobalArtifactHelpers::FInputFile> InputFiles;
+	CollectConfigFiles(InputFiles);
+
+	for (const MonolithGlobalArtifactHelpers::FInputFile& InputFile : InputFiles)
 	{
-		TotalEntries += ParseAndInsertIniFile(IniFile, DB);
+		if (!ParseIniFileToPayload(InputFile, OutPayload))
+		{
+			return false;
+		}
 	}
 
-	UE_LOG(LogMonolithIndex, Log, TEXT("ConfigIndexer: indexed %d entries from %d .ini files"), TotalEntries, IniFiles.Num());
+	OutPayload.Entries.Sort([](
+		const MonolithSimpleArtifactSerialization::FConfigPayloadEntry& A,
+		const MonolithSimpleArtifactSerialization::FConfigPayloadEntry& B)
+	{
+		if (A.FilePath != B.FilePath)
+		{
+			return A.FilePath < B.FilePath;
+		}
+		if (A.Section != B.Section)
+		{
+			return A.Section < B.Section;
+		}
+		return A.Key == B.Key ? A.Value < B.Value : A.Key < B.Key;
+	});
+
+	UE_LOG(
+		LogMonolithIndex,
+		Log,
+		TEXT("ConfigIndexer: prepared %d config entries from %d .ini files"),
+		OutPayload.Entries.Num(),
+		InputFiles.Num());
 	return true;
 }
 
-FString FConfigIndexer::ClassifyLayer(const FString& FilePath)
-{
-	FString Filename = FPaths::GetCleanFilename(FilePath);
-
-	if (FilePath.Contains(TEXT("/Saved/")) || FilePath.Contains(TEXT("\\Saved\\")))
-	{
-		return TEXT("User");
-	}
-	if (FilePath.Contains(TEXT("/Platform/")) || FilePath.Contains(TEXT("\\Platform\\")))
-	{
-		return TEXT("Platform");
-	}
-	if (Filename.StartsWith(TEXT("Base")))
-	{
-		return TEXT("Base");
-	}
-	if (Filename.StartsWith(TEXT("Default")))
-	{
-		return TEXT("Default");
-	}
-	// Engine configs that don't match other patterns
-	if (FilePath.Contains(TEXT("/Engine/")) || FilePath.Contains(TEXT("\\Engine\\")))
-	{
-		return TEXT("Base");
-	}
-
-	return TEXT("Default");
-}
-
-int32 FConfigIndexer::ParseAndInsertIniFile(const FString& FilePath, FMonolithIndexDatabase& DB)
+bool FConfigIndexer::ParseIniFileToPayload(
+	const MonolithGlobalArtifactHelpers::FInputFile& InputFile,
+	MonolithSimpleArtifactSerialization::FConfigPayload& OutPayload)
 {
 	TArray<FString> Lines;
-	if (!FFileHelper::LoadFileToStringArray(Lines, *FilePath))
+	if (!FFileHelper::LoadFileToStringArray(Lines, *InputFile.AbsolutePath))
 	{
-		return 0;
+		return false;
 	}
 
-	// Make the path relative to the project root for cleaner storage
-	FString RelativePath = FilePath;
-	FPaths::MakePathRelativeTo(RelativePath, *FPaths::ProjectDir());
-
 	FString CurrentSection;
-	int32 Inserted = 0;
-
 	for (const FString& RawLine : Lines)
 	{
-		FString Line = RawLine.TrimStartAndEnd();
+		const FString Line = RawLine.TrimStartAndEnd();
 
-		// Skip empty lines and comments
+		// 空行和注释不应该进入索引，否则查询结果会被噪声污染。
 		if (Line.IsEmpty() || Line.StartsWith(TEXT(";")) || Line.StartsWith(TEXT("#")))
 		{
 			continue;
 		}
 
-		// Section header: [SectionName]
 		if (Line.StartsWith(TEXT("[")) && Line.EndsWith(TEXT("]")))
 		{
 			CurrentSection = Line.Mid(1, Line.Len() - 2);
 			continue;
 		}
 
-		// Key=Value pair (handle +Key, -Key, .Key, !Key prefixes used by UE config system)
-		FString Key;
-		FString Value;
-		int32 EqualsIdx;
-		if (Line.FindChar(TEXT('='), EqualsIdx))
+		int32 EqualsIndex = INDEX_NONE;
+		if (!Line.FindChar(TEXT('='), EqualsIndex) || CurrentSection.IsEmpty())
 		{
-			Key = Line.Left(EqualsIdx).TrimStartAndEnd();
-			Value = Line.Mid(EqualsIdx + 1).TrimStartAndEnd();
-
-			if (!Key.IsEmpty() && !CurrentSection.IsEmpty())
-			{
-				FIndexedConfig Entry;
-				Entry.FilePath = RelativePath;
-				Entry.Section = CurrentSection;
-				Entry.Key = Key;
-				Entry.Value = Value;
-				DB.InsertConfig(Entry);
-				Inserted++;
-			}
+			continue;
 		}
+
+		MonolithSimpleArtifactSerialization::FConfigPayloadEntry Entry;
+		Entry.FilePath = InputFile.LogicalPath;
+		Entry.Section = CurrentSection;
+		Entry.Key = Line.Left(EqualsIndex).TrimStartAndEnd();
+		Entry.Value = Line.Mid(EqualsIndex + 1).TrimStartAndEnd();
+		if (Entry.Key.IsEmpty())
+		{
+			continue;
+		}
+
+		OutPayload.Entries.Add(MoveTemp(Entry));
 	}
 
-	return Inserted;
+	return true;
 }

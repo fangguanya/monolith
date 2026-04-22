@@ -35,6 +35,11 @@ struct MONOLITHINDEX_API FMonolithMemoryHelper
 	 *                   If false, performs incremental GC which is faster but less thorough.
 	 */
 	static void ForceGarbageCollection(bool bFullPurge = false);
+	/**
+	 * Request garbage collection on the game thread, but不阻塞当前后台调用方。
+	 * 这让后台索引可以“发起 GC 请求”而不是“同步等 GT 做完 GC”。
+	 */
+	static void RequestGarbageCollection(bool bFullPurge = false, bool bPumpEditor = false);
 
 	/**
 	 * Attempt to unload the package containing the given asset.

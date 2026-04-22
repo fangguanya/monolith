@@ -2,31 +2,49 @@
 
 #include "MonolithIndexer.h"
 
-/**
- * 索引行为树资产：UBehaviorTree（节点层级）和 UBlackboardData（键定义）。
- * 采用 Sentinel 模式自行枚举 AssetRegistry，magic class "__BehaviorTrees__"。
- * 包含 BT→Blackboard 和 BT→NodeClass 交叉引用。
+namespace MonolithSimpleArtifactSerialization
+{
+	struct FGraphPayload;
+}
+
+/*
+ * FBehaviorTreeIndexer 现在负责两类 AI 资产：
+ * - BehaviorTree：真正的行为树图
+ * - BlackboardData：行为树使用的键定义
+ *
+ * 这轮改造前，它靠一个 magic sentinel 自己重新扫项目，
+ * 结果 full / incremental / live 主链都不真正经过它。
+ *
+ * 现在它改成标准 package-scoped indexer：
+ * - 直接按真实资产类分发；
+ * - artifact / shadow / warmup 都复用同一套 payload；
+ * - 不再保留“全局重扫一遍”的死分叉逻辑。
  */
 class FBehaviorTreeIndexer : public IMonolithIndexer
 {
 public:
+	/** 只处理真实存在的 BehaviorTree 和 BlackboardData 资产类。 */
 	virtual TArray<FString> GetSupportedClasses() const override
 	{
-		return { TEXT("__BehaviorTrees__") };
+		return { TEXT("BehaviorTree"), TEXT("BlackboardData") };
 	}
 
-	virtual bool IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId) override;
+	/** 给日志和调试面板看的名字。 */
 	virtual FString GetName() const override { return TEXT("BehaviorTreeIndexer"); }
-	virtual bool IsSentinel() const override { return true; }
-
-	// SEH 安全调用的公共入口
-	void IndexBehaviorTreePublic(class UBehaviorTree* BT, FMonolithIndexDatabase& DB, int64 AssetId) { IndexBehaviorTree(BT, DB, AssetId); }
-	void IndexBlackboardPublic(class UBlackboardData* BB, FMonolithIndexDatabase& DB, int64 AssetId) { IndexBlackboard(BB, DB, AssetId); }
+	/** 稳定 cohort 名。 */
+	virtual FName GetIndexerId() const override { return FName(TEXT("BehaviorTree")); }
+	/** 构建可缓存的 artifact。 */
+	virtual bool BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact) override;
+	/** 把 artifact 回放到正式表。 */
+	virtual bool MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId) override;
+	/** 把 artifact 回放到 shadow 表。 */
+	virtual bool MaterializeArtifactToShadow(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName) override;
 
 private:
-	void IndexBehaviorTree(class UBehaviorTree* BT, FMonolithIndexDatabase& DB, int64 AssetId);
-	void IndexBlackboard(class UBlackboardData* BB, FMonolithIndexDatabase& DB, int64 AssetId);
-
-	/** 序列化 JSON 对象为紧凑字符串 */
-	static FString JsonToString(TSharedPtr<FJsonObject> JsonObj);
+	/** 根据运行时对象类型分发到行为树或黑板的 payload 构建逻辑。 */
+	bool BuildPayload(UObject* LoadedAsset, MonolithSimpleArtifactSerialization::FGraphPayload& OutPayload) const;
+	/** 把行为树对象整理成稳定的图 payload。 */
+	bool BuildBehaviorTreePayload(class UBehaviorTree* BehaviorTree, MonolithSimpleArtifactSerialization::FGraphPayload& OutPayload) const;
+	/** 把黑板对象整理成“1 个节点 + 多个变量”的 payload。 */
+	bool BuildBlackboardPayload(class UBlackboardData* Blackboard, MonolithSimpleArtifactSerialization::FGraphPayload& OutPayload) const;
 };

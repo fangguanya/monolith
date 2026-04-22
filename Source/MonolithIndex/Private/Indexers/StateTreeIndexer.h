@@ -5,31 +5,44 @@
 
 #include "MonolithIndexer.h"
 
-/**
- * 索引 StateTree 资产：UStateTree。
- * 提取每个 State 和 Task 信息，建立状态转换和任务类交叉引用。
- * 采用 Sentinel 模式，magic class "__StateTrees__"。
- * 条件编译：仅在 WITH_STATETREE 定义时启用。
+namespace MonolithSimpleArtifactSerialization
+{
+	struct FGraphPayload;
+}
+
+/*
+ * FStateTreeIndexer 把 UStateTree 转成真正的状态图快照：
+ * - State 节点
+ * - Task 节点
+ * - State -> State 的 transition
+ * - State -> Task 的附属关系
+ *
+ * 旧实现是 sentinel，而且主要保留“状态列表 + 任务类名”。
+ * 现在改成 package-scoped 后，shadow diff 能比较真正的状态机结构。
  */
 class FStateTreeIndexer : public IMonolithIndexer
 {
 public:
+	/** 只处理真实的 StateTree 资产类。 */
 	virtual TArray<FString> GetSupportedClasses() const override
 	{
-		return { TEXT("__StateTrees__") };
+		return { TEXT("StateTree") };
 	}
 
-	virtual bool IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId) override;
+	/** 日志展示名。 */
 	virtual FString GetName() const override { return TEXT("StateTreeIndexer"); }
-	virtual bool IsSentinel() const override { return true; }
-
-	// SEH 安全调用的公共入口
-	void IndexStateTreePublic(class UStateTree* ST, FMonolithIndexDatabase& DB, int64 AssetId) { IndexStateTree(ST, DB, AssetId); }
+	/** 稳定 cohort 名。 */
+	virtual FName GetIndexerId() const override { return FName(TEXT("StateTree")); }
+	/** 构建 artifact。 */
+	virtual bool BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact) override;
+	/** 回放 artifact 到正式表。 */
+	virtual bool MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId) override;
+	/** 回放 artifact 到 shadow 表。 */
+	virtual bool MaterializeArtifactToShadow(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName) override;
 
 private:
-	void IndexStateTree(class UStateTree* ST, FMonolithIndexDatabase& DB, int64 AssetId);
-
-	static FString JsonToString(TSharedPtr<FJsonObject> JsonObj);
+	/** 把 StateTree 运行时对象整理成 graph payload。 */
+	bool BuildPayload(class UStateTree* StateTree, MonolithSimpleArtifactSerialization::FGraphPayload& OutPayload) const;
 };
 
 #endif // WITH_STATETREE

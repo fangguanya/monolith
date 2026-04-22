@@ -1,12 +1,10 @@
 #include "MonolithMeshInspectionActions.h"
 #include "MonolithMeshUtils.h"
-#include "MonolithMeshCatalog.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithIndexSubsystem.h"
-#include "MonolithIndexDatabase.h"
 
 #include "Engine/StaticMesh.h"
 #include "Engine/SkeletalMesh.h"
@@ -16,7 +14,6 @@
 #include "StaticMeshResources.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
-#include "SQLiteDatabase.h"
 #include "Editor.h"
 
 // ============================================================================
@@ -162,16 +159,11 @@ namespace MeshInspectionHelpers
 		return Arr;
 	}
 
-	/** Get the index subsystem database, or nullptr */
-	FSQLiteDatabase* GetCatalogDB()
+	/** 拿到 MonolithIndex 子系统。
+	 * Mesh catalog 的唯一权威入口在子系统里，调用侧不再自己摸 raw SQLite。 */
+	UMonolithIndexSubsystem* GetIndexSubsystem()
 	{
-		UMonolithIndexSubsystem* IndexSub = GEditor ?
-			GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>() : nullptr;
-		if (!IndexSub || !IndexSub->GetDatabase())
-		{
-			return nullptr;
-		}
-		return IndexSub->GetDatabase()->GetRawDatabase();
+		return GEditor ? GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>() : nullptr;
 	}
 
 	/** Collision trace flag to string */
@@ -1395,13 +1387,20 @@ FMonolithActionResult FMonolithMeshInspectionActions::SearchMeshesBySize(const T
 		Limit = static_cast<int32>(Params->GetNumberField(TEXT("limit")));
 	}
 
-	FSQLiteDatabase* DB = MeshInspectionHelpers::GetCatalogDB();
-	if (!DB)
+	UMonolithIndexSubsystem* IndexSubsystem = MeshInspectionHelpers::GetIndexSubsystem();
+	if (!IndexSubsystem)
 	{
 		return FMonolithActionResult::Error(TEXT("Mesh catalog not available — run monolith_reindex() first"));
 	}
 
-	return FMonolithActionResult::Success(FMonolithMeshCatalog::SearchBySize(*DB, MinBounds, MaxBounds, Category, ExcludeSizeClass, Limit));
+	const TSharedPtr<FJsonObject> Result = IndexSubsystem->SearchMeshCatalogBySize(
+		MinBounds, MaxBounds, Category, ExcludeSizeClass, Limit);
+	if (!Result.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Mesh catalog query failed"));
+	}
+
+	return FMonolithActionResult::Success(Result);
 }
 
 // ============================================================================
@@ -1410,11 +1409,17 @@ FMonolithActionResult FMonolithMeshInspectionActions::SearchMeshesBySize(const T
 
 FMonolithActionResult FMonolithMeshInspectionActions::GetMeshCatalogStats(const TSharedPtr<FJsonObject>& Params)
 {
-	FSQLiteDatabase* DB = MeshInspectionHelpers::GetCatalogDB();
-	if (!DB)
+	UMonolithIndexSubsystem* IndexSubsystem = MeshInspectionHelpers::GetIndexSubsystem();
+	if (!IndexSubsystem)
 	{
 		return FMonolithActionResult::Error(TEXT("Mesh catalog not available — run monolith_reindex() first"));
 	}
 
-	return FMonolithActionResult::Success(FMonolithMeshCatalog::GetStats(*DB));
+	const TSharedPtr<FJsonObject> Result = IndexSubsystem->GetMeshCatalogStats();
+	if (!Result.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Mesh catalog stats query failed"));
+	}
+
+	return FMonolithActionResult::Success(Result);
 }

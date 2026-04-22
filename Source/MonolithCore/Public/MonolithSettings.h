@@ -174,6 +174,29 @@ public:
 		meta=(ToolTip="Log memory usage during indexing for debugging. Default off — enable when investigating memory pressure."))
 	bool bLogMemoryStats = false;
 
+	/** Identity provider used for artifact cache keys: SavedHash or ARSnapshotV1. */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Artifacts", DisplayName="Artifact Identity Provider",
+		meta=(ToolTip="Identity provider used for artifact cache keys. Supported values: SavedHash, ARSnapshotV1."))
+	FString IndexIdentityProvider = TEXT("SavedHash");
+
+	/** Enable artifact shadow mode for a single cohort. */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Artifacts", DisplayName="Enable Artifact Shadow Mode")
+	bool bEnableArtifactShadowMode = false;
+
+	/** Cohort allowed to use the artifact shadow path. Empty disables cohort matching. */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Artifacts", DisplayName="Shadow Mode Cohort")
+	FString ShadowModeCohort;
+
+	/** Number of IO/DDC workers used by MonolithIndex. */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Artifacts", DisplayName="IO/DDC Pool Size",
+		meta=(ClampMin="1", ClampMax="4"))
+	int32 IoDdcPoolSize = 2;
+
+	/** Warmup release threshold in percent for rolling upgrades. */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Artifacts", DisplayName="Warmup Release Threshold",
+		meta=(ClampMin="0", ClampMax="100"))
+	int32 WarmupReleaseThreshold = 90;
+
 	// --- Module Toggles ---
 
 	UPROPERTY(config, EditAnywhere, Category="Modules")
@@ -193,6 +216,9 @@ public:
 
 	UPROPERTY(config, EditAnywhere, Category="Modules")
 	bool bEnableConfig = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules")
+	bool bEnableAudio = true;
 
 	UPROPERTY(config, EditAnywhere, Category="Modules")
 	bool bEnableIndex = true;

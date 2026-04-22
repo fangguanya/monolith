@@ -64,15 +64,14 @@
 - 资源池固定为：
   - `BackgroundCpuPool`
   - `IoDdcPool`
-  - `GameThreadPumper`
+- 不再保留独立 `GameThreadPumper`；生产索引链禁止通过专用 GT wait/pump 通道回切主线程。
 - `IoDdcPoolSize` 默认 `2`，可通过 `MonolithSettings.IoDdcPoolSize` 调整到 `4`。
-- `GameThreadPumper` 预算固定为 `2ms` 起步、`4ms` 上限。
 - 启动时 DDC -> SQLite materialize 不阻塞编辑器启动：所有 bulk materialize 进入 `BackgroundCpuPool`，批大小固定 `500 packages / transaction`；查询层立即可用，尚未 materialize 的 package 返回 `stale=true`。
 - 不做中途硬杀 load job；改为后验 watchdog：
   - job 完成后若耗时 `>100ms`，记 `gt_overrun_count`
   - 同类 indexer/job class 立即标为 `GTQuarantined`
   - 后续同类任务默认降级为 `AROnly` 或 `OfflineOnly`
-  - 连续 `3` 次 overrun，GT pumper 熔断 `30s`
+  - 连续 `3` 次 overrun，GT breaker 打开 `30s`
 - `OfflineOnly` 不由编辑器消费；统一落入持久化离线队列，由 **本轮新增** 的 `UMonolithIndexWarmupCommandlet` 或 Horde batch job 消费。
 - 指标语义固定：
   - `gt_overrun_count`：单 job 耗时 `>100ms` 的事件次数，可在同一 cohort 内多次增长
@@ -149,9 +148,9 @@
   - cache write 放大异常
 
 ### Phase 3：DDC 共享缓存 + 上层熔断
-- DDC bucket 固定为 `MonolithIndexV1`；未来若有非兼容 schema，直接开 `MonolithIndexV2` 并行，`V1` 自然 TTL 淘汰。
+- 当前非兼容 artifact 编码升级后的 DDC bucket 固定为 `MonolithIndexV2`；未来若再有非兼容 schema，直接开 `MonolithIndexV3` 并行，旧 bucket 自然 TTL 淘汰。
 - DDC 映射固定为：
-  - `FCacheBucket("MonolithIndexV1")`
+  - `FCacheBucket("MonolithIndexV2")`
   - `FCacheKey.Hash = Blake3(Serialize(FMonolithArtifactIdentityV1))`
   - `FValueId = FValueId::FromName("artifact")`
 - `FCacheRecord.Meta` 固定第一个字段为 `meta_schema:uint8`，后续字段为：
@@ -264,27 +263,50 @@
   - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\ArtifactIdentity_test.cpp`
     - `test_identity_serialization_is_deterministic_single_process`
     - `test_provider_switch_picks_ar_snapshot_when_setting_set`
-  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\Scheduler_Pumper_test.cpp`
-    - `test_gt_pumper_respects_budget_when_job_exceeds_limit`
-    - `test_gt_quarantine_trips_after_three_overruns`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\MonolithIndexScheduler_test.cpp`
+    - `ClampConfig`
+    - `DrainHonorsCooperativeStop`
+    - `HardCapTimeoutCanBeRecovered`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\MonolithIndexGtBudget_test.cpp`
+    - `BreakerOpensAfterThreeOverruns`
+    - `DowngradeCountsPerIndexer`
+    - `ThrottleAppliesToQuarantinedIndexer`
   - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\ArtifactCache_DDC_test.cpp`
-    - `test_remote_miss_falls_back_to_local_compute`
-    - `test_remote_breaker_opens_after_consecutive_errors`
-    - `test_half_open_probe_recovers_remote_path`
-  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\LiveRevisionSwap_test.cpp`
-    - `test_live_revision_swap_never_exposes_zero_row_window`
-  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\SearchStaleSemantics_test.cpp`
-    - `test_search_marks_only_queued_or_outdated_packages_stale`
-    - `test_stats_separates_indexing_in_progress_from_stale`
+    - `LocalRoundTrip`
+    - `ChunkedRoundTrip`
+    - `OversizedArtifactsSkipCache`
+    - `BreakerOpensAfterConsecutiveErrors`
+    - `HalfOpenProbeRecoversRemotePath`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\MonolithIndexDatabaseRevision_test.cpp`
+    - `RevisionSwitchKeepsPreviousSnapshotVisibleUntilPromote`
+    - `RevisionDiscardPreservesPreviousSnapshot`
+    - `ActorRevisionSwitchKeepsPreviousSnapshotVisibleUntilPromote`
+    - `ActorRevisionDiscardPreservesPreviousSnapshot`
+    - `DataTableRevisionSwitchKeepsPreviousSnapshotVisibleUntilPromote`
+    - `DataTableRevisionDiscardPreservesPreviousSnapshot`
+    - `DependencyRevisionSwitchKeepsPreviousSnapshotVisibleUntilPromote`
+    - `DependencyRevisionDiscardPreservesPreviousSnapshot`
+    - `GameplayTagReferenceRevisionSwitchKeepsPreviousSnapshotVisibleUntilPromote`
+    - `GameplayTagReferenceRevisionDiscardPreservesPreviousSnapshot`
+    - `MeshCatalogRevisionSwitchKeepsPreviousSnapshotVisibleUntilPromote`
+    - `MeshCatalogRevisionDiscardPreservesPreviousSnapshot`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\ProjectQueryPayload_test.cpp`
+    - `SearchAggregatesStaleAndProgress`
+    - `StatsKeepsIndexingSeparateFromStale`
+  - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\MonolithIndexRuntimeStateTests.cpp`
+    - `StaleSemantics`
+    - `StalePagination`
+    - `PrefixMatching`
   - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\IndexerShadowMode_test.cpp`
-    - `test_shadow_mode_allows_only_one_cohort_at_a_time`
-    - `test_shadow_mode_uses_level1_then_level2_diff`
-    - `test_level2_sampling_is_deterministic`
-    - `test_shadow_tables_drop_after_promote_retention`
+    - `AllowsOnlyOneCohortAtATime`
+    - `UsesLevel1ThenLevel2Diff`
+    - `Level2SamplingIsDeterministic`
+    - `ShadowTablesDropAfterPromoteRetention`
   - `E:\fanggang_matrix\Unreal_Matrix\Client\Plugins\Matrix\Monolith\Source\MonolithIndex\Private\Tests\WarmupCommandlet_test.cpp`
-    - `test_commandlet_parses_scope_arg`
-    - `test_commandlet_respects_time_window_early_exit`
-    - `test_commandlet_never_opens_local_sqlite`
+    - `ParseScope`
+    - `TimeWindow`
+    - `BypassSqlite`
+    - `ReleaseThresholdClamp`
 - **验收门槛**
   - Gate 0 两机 diff `= 0` 或报告明确锁定 `ARSnapshotV1`
   - query 在索引中不拒绝服务

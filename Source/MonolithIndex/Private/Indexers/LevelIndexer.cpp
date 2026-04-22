@@ -1,8 +1,7 @@
 #include "Indexers/LevelIndexer.h"
-#include "MonolithMemoryHelper.h"
-#include "MonolithSettings.h"
-#include "AssetRegistry/AssetRegistryModule.h"
+#include "MonolithIndexerShadowMode.h"
 #include "AssetRegistry/IAssetRegistry.h"
+#include "Containers/StringConv.h"
 #include "Engine/World.h"
 #include "Engine/Level.h"
 #include "GameFramework/Actor.h"
@@ -13,169 +12,255 @@
 #include "UObject/Package.h"
 #include "WorldPartition/WorldPartition.h"
 
-bool FLevelIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
+/*
+ * 这份实现文件把 World 的 PersistentLevel 抽成一串 Actor 摘要。
+ *
+ * 这里不追求还原整个关卡对象图，
+ * 而是抓最适合索引和比较的那部分：
+ * - Actor 名
+ * - Actor 类
+ * - 标签
+ * - Transform
+ * - 组件摘要
+ */
+
+namespace LevelIndexerInternal
 {
-	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-
-	// Find all World assets under indexed paths
-	TArray<FAssetData> WorldAssets;
-	FARFilter Filter;
-	if (IndexedPaths.Num() > 0)
+	static void WriteUInt32(TArray<uint8>& Bytes, const uint32 Value)
 	{
-		for (const FName& Path : IndexedPaths)
-		{
-			Filter.PackagePaths.Add(Path);
-		}
-	}
-	else
-	{
-		Filter.PackagePaths.Add(FName(TEXT("/Game")));
-	}
-	Filter.bRecursivePaths = true;
-	Filter.ClassPaths.Add(UWorld::StaticClass()->GetClassPathName());
-	Registry.GetAssets(Filter, WorldAssets);
-
-	// Get settings for batching
-	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
-	const int32 BatchSize = FMath::Max(1, FMonolithMemoryHelper::GetResolvedPostPassBatchSize());
-	const SIZE_T MemoryBudgetMB = static_cast<SIZE_T>(FMonolithMemoryHelper::GetResolvedMemoryBudgetMB());
-	const bool bLogMemory = Settings->bLogMemoryStats;
-
-	UE_LOG(LogMonolithIndex, Log, TEXT("LevelIndexer: Found %d World assets to index (batch size: %d)"),
-		WorldAssets.Num(), BatchSize);
-
-	if (bLogMemory)
-	{
-		FMonolithMemoryHelper::LogMemoryStats(TEXT("LevelIndexer start"));
+		Bytes.Add(static_cast<uint8>(Value & 0xff));
+		Bytes.Add(static_cast<uint8>((Value >> 8) & 0xff));
+		Bytes.Add(static_cast<uint8>((Value >> 16) & 0xff));
+		Bytes.Add(static_cast<uint8>((Value >> 24) & 0xff));
 	}
 
-	int32 ActorsInserted = 0;
-	int32 LevelsProcessed = 0;
-	int32 BatchNumber = 0;
-
-	for (int32 i = 0; i < WorldAssets.Num(); i += BatchSize)
+	static bool ReadUInt32(const TArray<uint8>& Bytes, int32& Offset, uint32& OutValue)
 	{
-		// Compiler-idle gate is enforced by FMonolithCompilerSafeDispatch at the call site (see issue #19).
-
-		// Memory budget check before each batch
-		if (FMonolithMemoryHelper::ShouldThrottle(MemoryBudgetMB))
+		if (Offset + 4 > Bytes.Num())
 		{
-			UE_LOG(LogMonolithIndex, Log, TEXT("LevelIndexer: Memory budget exceeded, forcing GC..."));
-			FMonolithMemoryHelper::ForceGarbageCollection(true);
-			FMonolithMemoryHelper::YieldToEditor();
-
-			if (bLogMemory)
-			{
-				FMonolithMemoryHelper::LogMemoryStats(TEXT("LevelIndexer after throttle GC"));
-			}
+			return false;
 		}
 
-		int32 BatchEnd = FMath::Min(i + BatchSize, WorldAssets.Num());
+		OutValue = static_cast<uint32>(Bytes[Offset])
+			| (static_cast<uint32>(Bytes[Offset + 1]) << 8)
+			| (static_cast<uint32>(Bytes[Offset + 2]) << 16)
+			| (static_cast<uint32>(Bytes[Offset + 3]) << 24);
+		Offset += 4;
+		return true;
+	}
 
-		// Process batch
-		for (int32 j = i; j < BatchEnd; ++j)
+	static void WriteString(TArray<uint8>& Bytes, const FString& Value)
+	{
+		FTCHARToUTF8 Convert(*Value);
+		WriteUInt32(Bytes, static_cast<uint32>(Convert.Length()));
+		if (Convert.Length() > 0)
 		{
-			const FAssetData& WorldData = WorldAssets[j];
-
-			int64 LevelAssetId = DB.GetAssetId(WorldData.PackageName.ToString());
-			if (LevelAssetId < 0) continue;
-
-			// Load the package to access level data without initializing gameplay
-			UPackage* Package = LoadPackage(nullptr, *WorldData.PackageName.ToString(), LOAD_NoWarn | LOAD_Quiet);
-			if (!Package) continue;
-
-			UWorld* World = FindObject<UWorld>(Package, *WorldData.AssetName.ToString());
-			if (!World)
-			{
-				// Try the common naming convention
-				World = FindObject<UWorld>(Package, TEXT("World"));
-			}
-			if (!World || !World->PersistentLevel)
-			{
-				// Mark package for unload even if we couldn't find the world
-				FMonolithMemoryHelper::TryUnloadPackage(Package);
-				continue;
-			}
-
-			// Only index the persistent level - skip streaming sub-levels for performance
-			ULevel* Level = World->PersistentLevel;
-			ActorsInserted += IndexActorsInLevel(Level, DB, LevelAssetId);
-
-			// Uninitialize WorldPartition before unload - LoadPackage skips the editor teardown path, so GC would otherwise assert in UWorldPartitionSubsystem::Deinitialize
-			if (UWorldPartition* WP = World->GetWorldPartition())
-			{
-				if (WP->IsInitialized())
-				{
-					WP->Uninitialize();
-				}
-			}
-
-			// Mark world/package for unloading after indexing
-			FMonolithMemoryHelper::TryUnloadPackage(World);
-
-			LevelsProcessed++;
-		}
-
-		BatchNumber++;
-
-		// GC after each batch to prevent memory accumulation
-		FMonolithMemoryHelper::ForceGarbageCollection(false);
-		FMonolithMemoryHelper::YieldToEditor();
-
-		// Log progress periodically
-		if (BatchNumber % 5 == 0 || BatchEnd == WorldAssets.Num())
-		{
-			UE_LOG(LogMonolithIndex, Log, TEXT("LevelIndexer: processed %d / %d levels"),
-				LevelsProcessed, WorldAssets.Num());
-
-			if (bLogMemory)
-			{
-				FMonolithMemoryHelper::LogMemoryStats(FString::Printf(TEXT("LevelIndexer batch %d"), BatchNumber));
-			}
+			Bytes.Append(reinterpret_cast<const uint8*>(Convert.Get()), Convert.Length());
 		}
 	}
 
-	// Final GC
-	FMonolithMemoryHelper::ForceGarbageCollection(true);
-
-	UE_LOG(LogMonolithIndex, Log, TEXT("LevelIndexer: indexed %d levels, %d actors total"),
-		LevelsProcessed, ActorsInserted);
-
-	if (bLogMemory)
+	static bool ReadString(const TArray<uint8>& Bytes, int32& Offset, FString& OutValue)
 	{
-		FMonolithMemoryHelper::LogMemoryStats(TEXT("LevelIndexer complete"));
+		uint32 Length = 0;
+		if (!ReadUInt32(Bytes, Offset, Length))
+		{
+			return false;
+		}
+
+		if (Length == 0)
+		{
+			OutValue.Reset();
+			return true;
+		}
+
+		if (Offset + static_cast<int32>(Length) > Bytes.Num())
+		{
+			return false;
+		}
+
+		FUTF8ToTCHAR Convert(reinterpret_cast<const UTF8CHAR*>(Bytes.GetData() + Offset), static_cast<int32>(Length));
+		OutValue = FString(Convert.Length(), Convert.Get());
+		Offset += static_cast<int32>(Length);
+		return true;
+	}
+}
+
+bool FLevelIndexer::BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact)
+{
+	TArray<FIndexedActor> Actors;
+	if (!BuildActorPayload(LoadedAsset, Actors))
+	{
+		return false;
 	}
 
+	OutArtifact = FMonolithArtifact();
+	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
+	OutArtifact.IndexerId = GetIndexerId();
+	OutArtifact.IndexerVersion = GetIndexerVersion();
+	OutArtifact.ExecutionMode = GetExecutionMode();
+	OutArtifact.PackageName = AssetData.PackageName.ToString();
+	SerializePayload(Actors, OutArtifact.Payload);
 	return true;
 }
 
-int32 FLevelIndexer::IndexActorsInLevel(ULevel* Level, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FLevelIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
 {
-	if (!Level) return 0;
+	TArray<FIndexedActor> Actors;
+	if (!DeserializePayload(Artifact.Payload, Actors))
+	{
+		return false;
+	}
 
-	int32 Count = 0;
+	return MaterializeActors(Actors, DB, AssetId);
+}
+
+bool FLevelIndexer::MaterializeArtifactToShadow(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName)
+{
+	TArray<FIndexedActor> Actors;
+	if (!DeserializePayload(Artifact.Payload, Actors))
+	{
+		return false;
+	}
+
+	return MaterializeActorsToShadow(Actors, DB, AssetId, CohortName);
+}
+
+bool FLevelIndexer::BuildActorPayload(UObject* LoadedAsset, TArray<FIndexedActor>& OutActors) const
+{
+	OutActors.Reset();
+
+	UWorld* World = Cast<UWorld>(LoadedAsset);
+	if (!World || !World->PersistentLevel)
+	{
+		return false;
+	}
+
+	return BuildActorsInLevel(World->PersistentLevel, OutActors);
+}
+
+bool FLevelIndexer::BuildActorsInLevel(ULevel* Level, TArray<FIndexedActor>& OutActors) const
+{
+	if (!Level)
+	{
+		return false;
+	}
+
+	OutActors.Reset();
 	for (AActor* Actor : Level->Actors)
 	{
+		// WorldSettings 是引擎默认管理对象，几乎总在，
+		// 但对“关卡内容索引”帮助不大，所以这里主动跳过。
 		if (!Actor) continue;
-
-		// Skip the world settings and default brush - they're internal
 		if (Actor->IsA(AWorldSettings::StaticClass())) continue;
 
 		FIndexedActor IndexedActor;
-		IndexedActor.AssetId = AssetId;
 		IndexedActor.ActorName = Actor->GetName();
 		IndexedActor.ActorClass = Actor->GetClass()->GetName();
 		IndexedActor.ActorLabel = Actor->GetActorLabel();
 		IndexedActor.Transform = SerializeTransform(Actor->GetActorTransform());
 		IndexedActor.Components = SerializeComponents(Actor);
-
-		DB.InsertActor(IndexedActor);
-		Count++;
+		OutActors.Add(MoveTemp(IndexedActor));
 	}
-	return Count;
+
+	OutActors.Sort([](const FIndexedActor& A, const FIndexedActor& B)
+	{
+		// 明确排序后，artifact payload 和 shadow 比较结果才稳定。
+		if (A.ActorName != B.ActorName)
+		{
+			return A.ActorName < B.ActorName;
+		}
+		if (A.ActorClass != B.ActorClass)
+		{
+			return A.ActorClass < B.ActorClass;
+		}
+		return A.ActorLabel < B.ActorLabel;
+	});
+
+	return true;
 }
 
-FString FLevelIndexer::SerializeTransform(const FTransform& Transform)
+bool FLevelIndexer::MaterializeActors(const TArray<FIndexedActor>& Actors, FMonolithIndexDatabase& DB, int64 AssetId) const
+{
+	for (const FIndexedActor& Actor : Actors)
+	{
+		FIndexedActor IndexedActor = Actor;
+		IndexedActor.AssetId = AssetId;
+		if (DB.InsertActor(IndexedActor) <= 0)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+bool FLevelIndexer::MaterializeActorsToShadow(const TArray<FIndexedActor>& Actors, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName) const
+{
+	TArray<FMonolithShadowIndexedActor> ShadowActors;
+	ShadowActors.Reserve(Actors.Num());
+	for (const FIndexedActor& Actor : Actors)
+	{
+		// shadow 表里会额外带 row_hash，方便先做一级聚合 diff。
+		FMonolithShadowIndexedActor ShadowActor;
+		ShadowActor.Actor = Actor;
+		ShadowActor.Actor.AssetId = AssetId;
+		ShadowActor.RowHash = ComputeActorRowHash(ShadowActor.Actor);
+		ShadowActors.Add(MoveTemp(ShadowActor));
+	}
+
+	return DB.ReplaceShadowActorsForAsset(CohortName, AssetId, ShadowActors);
+}
+
+void FLevelIndexer::SerializePayload(const TArray<FIndexedActor>& Actors, TArray<uint8>& OutBytes)
+{
+	OutBytes.Reset();
+	OutBytes.Add(1);
+	LevelIndexerInternal::WriteUInt32(OutBytes, static_cast<uint32>(Actors.Num()));
+	for (const FIndexedActor& Actor : Actors)
+	{
+		LevelIndexerInternal::WriteString(OutBytes, Actor.ActorName);
+		LevelIndexerInternal::WriteString(OutBytes, Actor.ActorClass);
+		LevelIndexerInternal::WriteString(OutBytes, Actor.ActorLabel);
+		LevelIndexerInternal::WriteString(OutBytes, Actor.Transform);
+		LevelIndexerInternal::WriteString(OutBytes, Actor.Components);
+	}
+}
+
+bool FLevelIndexer::DeserializePayload(const TArray<uint8>& Bytes, TArray<FIndexedActor>& OutActors)
+{
+	OutActors.Reset();
+	if (Bytes.Num() < 1 || Bytes[0] != 1)
+	{
+		return false;
+	}
+
+	int32 Offset = 1;
+	uint32 ActorCount = 0;
+	if (!LevelIndexerInternal::ReadUInt32(Bytes, Offset, ActorCount))
+	{
+		return false;
+	}
+
+	OutActors.Reserve(static_cast<int32>(ActorCount));
+	for (uint32 ActorIndex = 0; ActorIndex < ActorCount; ++ActorIndex)
+	{
+		FIndexedActor Actor;
+		if (!LevelIndexerInternal::ReadString(Bytes, Offset, Actor.ActorName)
+			|| !LevelIndexerInternal::ReadString(Bytes, Offset, Actor.ActorClass)
+			|| !LevelIndexerInternal::ReadString(Bytes, Offset, Actor.ActorLabel)
+			|| !LevelIndexerInternal::ReadString(Bytes, Offset, Actor.Transform)
+			|| !LevelIndexerInternal::ReadString(Bytes, Offset, Actor.Components))
+		{
+			return false;
+		}
+
+		OutActors.Add(MoveTemp(Actor));
+	}
+
+	return true;
+}
+
+FString FLevelIndexer::SerializeTransform(const FTransform& Transform) const
 {
 	auto Obj = MakeShared<FJsonObject>();
 
@@ -206,7 +291,7 @@ FString FLevelIndexer::SerializeTransform(const FTransform& Transform)
 	return Result;
 }
 
-FString FLevelIndexer::SerializeComponents(const AActor* Actor)
+FString FLevelIndexer::SerializeComponents(const AActor* Actor) const
 {
 	TArray<TSharedPtr<FJsonValue>> CompArray;
 

@@ -1,61 +1,34 @@
 #include "Actions/ProjectListGameplayTagsAction.h"
+#include "Actions/MonolithProjectActionUtils.h"
 #include "MonolithIndexSubsystem.h"
 #include "MonolithParamSchema.h"
-#include "SQLiteDatabase.h"
-#include "Editor.h"
+
+/*
+ * 这个 action 负责列出 GameplayTag 清单。
+ *
+ * 以前它会直接抓 raw SQLite 句柄自己查，
+ * 现在改成走子系统/数据库正式接口，这样查询就能复用统一的数据库锁，
+ * 避免后台索引和前台查询同时碰库时互相踩到。
+ */
 
 FMonolithActionResult FProjectListGameplayTagsAction::Execute(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Prefix;
-	if (Params->HasField(TEXT("prefix")))
-	{
-		Prefix = Params->GetStringField(TEXT("prefix"));
-	}
+	const FString Prefix = MonolithProjectActionUtils::GetOptionalStringParam(Params, TEXT("prefix"));
 
-	UMonolithIndexSubsystem* Subsystem = GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>();
+	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
 	if (!Subsystem)
 	{
-		return FMonolithActionResult::Error(TEXT("Index subsystem not available"));
+		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
 	}
 
-	FMonolithIndexDatabase* DB = Subsystem->GetDatabase();
-	if (!DB || !DB->IsOpen())
-	{
-		return FMonolithActionResult::Error(TEXT("Project index database not available"));
-	}
-
-	FSQLiteDatabase* RawDB = DB->GetRawDatabase();
-	if (!RawDB)
-	{
-		return FMonolithActionResult::Error(TEXT("Raw database handle not available"));
-	}
-
-	FSQLitePreparedStatement Stmt;
-	if (Prefix.IsEmpty())
-	{
-		Stmt.Create(*RawDB, TEXT("SELECT tag_name, parent_tag, reference_count FROM tags ORDER BY tag_name;"));
-	}
-	else
-	{
-		Stmt.Create(*RawDB, TEXT("SELECT tag_name, parent_tag, reference_count FROM tags WHERE tag_name LIKE ? ORDER BY tag_name;"));
-		FString LikePattern = Prefix + TEXT("%");
-		Stmt.SetBindingValueByIndex(1, LikePattern);
-	}
-
+	const TArray<FIndexedGameplayTagSummary> TagSummaries = Subsystem->ListGameplayTags(Prefix);
 	TArray<TSharedPtr<FJsonValue>> TagsArr;
-	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	for (const FIndexedGameplayTagSummary& TagSummary : TagSummaries)
 	{
-		FString TagName, ParentTag;
-		int64 RefCount = 0;
-
-		Stmt.GetColumnValueByIndex(0, TagName);
-		Stmt.GetColumnValueByIndex(1, ParentTag);
-		Stmt.GetColumnValueByIndex(2, RefCount);
-
 		auto Entry = MakeShared<FJsonObject>();
-		Entry->SetStringField(TEXT("tag_name"), TagName);
-		Entry->SetStringField(TEXT("parent_tag"), ParentTag);
-		Entry->SetNumberField(TEXT("reference_count"), static_cast<double>(RefCount));
+		Entry->SetStringField(TEXT("tag_name"), TagSummary.TagName);
+		Entry->SetStringField(TEXT("parent_tag"), TagSummary.ParentTag);
+		Entry->SetNumberField(TEXT("reference_count"), static_cast<double>(TagSummary.ReferenceCount));
 		TagsArr.Add(MakeShared<FJsonValueObject>(Entry));
 	}
 

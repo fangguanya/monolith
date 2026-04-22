@@ -1,177 +1,221 @@
 #include "Indexers/EQSIndexer.h"
-#include "MonolithSettings.h"
-#include "EnvironmentQuery/EnvQuery.h"
-#include "EnvironmentQuery/EnvQueryOption.h"
-#include "EnvironmentQuery/EnvQueryGenerator.h"
-#include "EnvironmentQuery/EnvQueryTest.h"
-#include "AssetRegistry/AssetRegistryModule.h"
+
+#include "Indexers/MonolithSimpleArtifactSerialization.h"
 #include "AssetRegistry/IAssetRegistry.h"
-#include "Serialization/JsonWriter.h"
+#include "EnvironmentQuery/EnvQuery.h"
+#include "EnvironmentQuery/EnvQueryGenerator.h"
+#include "EnvironmentQuery/EnvQueryOption.h"
+#include "EnvironmentQuery/EnvQueryTest.h"
 #include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 
-#if PLATFORM_WINDOWS
-#include "Windows/AllowWindowsPlatformTypes.h"
-#include <excpt.h>
-#include "Windows/HideWindowsPlatformTypes.h"
+/*
+ * EQS 的价值不只是“这个查询用了哪些类”，
+ * 更重要的是“Option、Generator、Test 是怎样组合起来的”。
+ *
+ * 所以这次迁移里，我们把 EQS 改成真正的图 payload：
+ * - 每个 Option 是一个节点；
+ * - Generator 和每个 Test 也各自是节点；
+ * - Option -> Generator / Test 的关系保存在内部 connections 里。
+ */
 
-static bool SafeCallWithSEH_EQS(void(*Func)(void*), void* Context)
+namespace EQSIndexerInternal
 {
-	__try
+	/** 把 JSON 对象压成紧凑字符串，方便直接放进 node.properties。 */
+	static bool SerializeJsonObject(const TSharedPtr<FJsonObject>& Object, FString& OutJson)
 	{
-		Func(Context);
-		return true;
+		auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+		return FJsonSerializer::Serialize(Object.ToSharedRef(), Writer);
 	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
+
+	/** 向 graph payload 追加一个节点。 */
+	static int32 AddNode(
+		MonolithSimpleArtifactSerialization::FGraphPayload& Payload,
+		const FString& NodeType,
+		const FString& NodeName,
+		const FString& NodeClass,
+		const FString& Properties)
+	{
+		FIndexedNode Node;
+		Node.NodeType = NodeType;
+		Node.NodeName = NodeName;
+		Node.NodeClass = NodeClass;
+		Node.Properties = Properties;
+		return Payload.Nodes.Add(MoveTemp(Node));
+	}
+
+	/** 向 graph payload 追加一条内部连接。 */
+	static void AddConnection(
+		MonolithSimpleArtifactSerialization::FGraphPayload& Payload,
+		const int32 SourceNodeIndex,
+		const FString& SourcePin,
+		const int32 TargetNodeIndex,
+		const FString& TargetPin,
+		const FString& PinType)
+	{
+		MonolithSimpleArtifactSerialization::FGraphPayloadConnection Connection;
+		Connection.SourceNodeIndex = SourceNodeIndex;
+		Connection.SourcePin = SourcePin;
+		Connection.TargetNodeIndex = TargetNodeIndex;
+		Connection.TargetPin = TargetPin;
+		Connection.PinType = PinType;
+		Payload.Connections.Add(MoveTemp(Connection));
+	}
+
+	/** 构建 Option 节点属性。 */
+	static bool BuildOptionProperties(const int32 OptionIndex, const int32 TestCount, const bool bHasGenerator, FString& OutProperties)
+	{
+		TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+		Properties->SetNumberField(TEXT("option_index"), OptionIndex);
+		Properties->SetNumberField(TEXT("test_count"), TestCount);
+		Properties->SetBoolField(TEXT("has_generator"), bHasGenerator);
+		return SerializeJsonObject(Properties, OutProperties);
+	}
+
+	/** 构建 Generator 节点属性。 */
+	static bool BuildGeneratorProperties(const int32 OptionIndex, const UEnvQueryGenerator* Generator, FString& OutProperties)
+	{
+		TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+		Properties->SetNumberField(TEXT("option_index"), OptionIndex);
+		Properties->SetStringField(TEXT("class"), Generator ? Generator->GetClass()->GetName() : TEXT("None"));
+		return SerializeJsonObject(Properties, OutProperties);
+	}
+
+	/** 构建 Test 节点属性。 */
+	static bool BuildTestProperties(const int32 OptionIndex, const int32 TestIndex, const UEnvQueryTest* Test, FString& OutProperties)
+	{
+		TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+		Properties->SetNumberField(TEXT("option_index"), OptionIndex);
+		Properties->SetNumberField(TEXT("test_index"), TestIndex);
+		Properties->SetStringField(TEXT("class"), Test ? Test->GetClass()->GetName() : TEXT("None"));
+		return SerializeJsonObject(Properties, OutProperties);
+	}
+}
+
+bool FEQSIndexer::BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact)
+{
+	(void)AssetRegistry;
+
+	MonolithSimpleArtifactSerialization::FGraphPayload Payload;
+	if (!BuildPayload(Cast<UEnvQuery>(LoadedAsset), Payload))
 	{
 		return false;
 	}
-}
-#endif
 
-// SEH 安全调用上下文
-struct FEQSIndexCallContext
-{
-	FEQSIndexer* Self;
-	FMonolithIndexDatabase* DB;
-	int64 AssetId;
-	FSoftObjectPath ObjectPath;
-	bool bSuccess;
-};
-
-static void LoadAndIndexEQSAsset(void* Ctx)
-{
-	auto* C = static_cast<FEQSIndexCallContext*>(Ctx);
-	C->bSuccess = false;
-
-	UObject* Loaded = C->ObjectPath.TryLoad();
-	if (!Loaded) return;
-
-	if (UEnvQuery* Query = Cast<UEnvQuery>(Loaded))
-	{
-		C->Self->IndexEnvQueryPublic(Query, *C->DB, C->AssetId);
-		C->bSuccess = true;
-	}
+	OutArtifact = FMonolithArtifact();
+	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
+	OutArtifact.IndexerId = GetIndexerId();
+	OutArtifact.IndexerVersion = GetIndexerVersion();
+	OutArtifact.ExecutionMode = GetExecutionMode();
+	OutArtifact.PackageName = AssetData.PackageName.ToString();
+	MonolithSimpleArtifactSerialization::SerializeGraphPayload(Payload, OutArtifact.Payload);
+	return OutArtifact.Payload.Num() > 0;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
-
-FString FEQSIndexer::JsonToString(TSharedPtr<FJsonObject> JsonObj)
+bool FEQSIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
 {
-	FString Out;
-	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
-	FJsonSerializer::Serialize(JsonObj, *Writer, true);
-	return Out;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Sentinel 入口
-// ─────────────────────────────────────────────────────────────
-
-bool FEQSIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
-{
-	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-
-	TArray<FAssetData> Assets;
-	FARFilter Filter;
-	for (const FName& ContentPath : UMonolithSettings::GetIndexedContentPaths())
+	MonolithSimpleArtifactSerialization::FGraphPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeGraphPayload(Artifact.Payload, Payload))
 	{
-		Filter.PackagePaths.Add(ContentPath);
-	}
-	Filter.bRecursivePaths = true;
-	Filter.ClassPaths.Add(UEnvQuery::StaticClass()->GetClassPathName());
-	Registry.GetAssets(Filter, Assets);
-
-	int32 TotalIndexed = 0;
-	for (const FAssetData& AD : Assets)
-	{
-		int64 AId = DB.GetAssetId(AD.PackageName.ToString());
-		if (AId < 0) continue;
-
-		FEQSIndexCallContext Ctx;
-		Ctx.Self = this;
-		Ctx.DB = &DB;
-		Ctx.AssetId = AId;
-		Ctx.ObjectPath = AD.GetSoftObjectPath();
-		Ctx.bSuccess = false;
-
-#if PLATFORM_WINDOWS
-		if (SafeCallWithSEH_EQS(&LoadAndIndexEQSAsset, &Ctx))
-		{
-			if (Ctx.bSuccess) TotalIndexed++;
-		}
-		else
-		{
-			UE_LOG(LogMonolithIndex, Warning, TEXT("EQSIndexer: crashed loading/indexing '%s' - skipping"), *AD.GetSoftObjectPath().ToString());
-		}
-#else
-		LoadAndIndexEQSAsset(&Ctx);
-		if (Ctx.bSuccess) TotalIndexed++;
-#endif
+		return false;
 	}
 
-	UE_LOG(LogMonolithIndex, Log, TEXT("EQSIndexer: indexed %d EQS assets"), TotalIndexed);
-	return true;
+	return MonolithSimpleArtifactSerialization::MaterializeGraphPayload(Payload, DB, AssetId);
 }
 
-// ─────────────────────────────────────────────────────────────
-// EnvQuery 索引
-// ─────────────────────────────────────────────────────────────
-
-void FEQSIndexer::IndexEnvQuery(UEnvQuery* Query, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FEQSIndexer::MaterializeArtifactToShadow(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName)
 {
-	if (!Query) return;
+	MonolithSimpleArtifactSerialization::FGraphPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeGraphPayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeGraphPayloadToShadow(Payload, DB, AssetId, CohortName);
+}
+
+bool FEQSIndexer::BuildPayload(UEnvQuery* Query, MonolithSimpleArtifactSerialization::FGraphPayload& OutPayload) const
+{
+	OutPayload = MonolithSimpleArtifactSerialization::FGraphPayload();
+	if (!Query)
+	{
+		return false;
+	}
 
 	const TArray<UEnvQueryOption*>& Options = Query->GetOptions();
-
-	// 收集唯一 Generator/Test 类用于交叉引用
-	TSet<FString> UniqueClasses;
-
-	for (int32 i = 0; i < Options.Num(); ++i)
+	for (int32 OptionIndex = 0; OptionIndex < Options.Num(); ++OptionIndex)
 	{
-		const UEnvQueryOption* Option = Options[i];
-		if (!Option) continue;
+		const UEnvQueryOption* Option = Options[OptionIndex];
+		if (!Option)
+		{
+			continue;
+		}
 
-		auto Props = MakeShared<FJsonObject>();
+		FString OptionProperties;
+		if (!EQSIndexerInternal::BuildOptionProperties(OptionIndex, Option->Tests.Num(), Option->Generator != nullptr, OptionProperties))
+		{
+			return false;
+		}
 
-		// Generator 信息
-		FString GeneratorClassName = TEXT("None");
+		const int32 OptionNodeIndex = EQSIndexerInternal::AddNode(
+			OutPayload,
+			TEXT("EQS_Option"),
+			FString::Printf(TEXT("Option_%d"), OptionIndex),
+			TEXT("EnvQueryOption"),
+			OptionProperties);
+
 		if (Option->Generator)
 		{
-			GeneratorClassName = Option->Generator->GetClass()->GetName();
-			Props->SetStringField(TEXT("generator_class"), GeneratorClassName);
-			UniqueClasses.Add(GeneratorClassName);
+			FString GeneratorProperties;
+			if (!EQSIndexerInternal::BuildGeneratorProperties(OptionIndex, Option->Generator, GeneratorProperties))
+			{
+				return false;
+			}
+
+			const int32 GeneratorNodeIndex = EQSIndexerInternal::AddNode(
+				OutPayload,
+				TEXT("EQS_Generator"),
+				Option->Generator->GetClass()->GetName(),
+				Option->Generator->GetClass()->GetName(),
+				GeneratorProperties);
+			EQSIndexerInternal::AddConnection(
+				OutPayload,
+				OptionNodeIndex,
+				TEXT("Generator"),
+				GeneratorNodeIndex,
+				TEXT("Self"),
+				TEXT("EQS_Generator"));
 		}
 
-		// Tests 列表
-		TArray<TSharedPtr<FJsonValue>> TestsArr;
-		for (const UEnvQueryTest* Test : Option->Tests)
+		for (int32 TestIndex = 0; TestIndex < Option->Tests.Num(); ++TestIndex)
 		{
-			if (!Test) continue;
-			const FString TestClassName = Test->GetClass()->GetName();
-			TestsArr.Add(MakeShared<FJsonValueString>(TestClassName));
-			UniqueClasses.Add(TestClassName);
+			const UEnvQueryTest* Test = Option->Tests[TestIndex];
+			if (!Test)
+			{
+				continue;
+			}
+
+			FString TestProperties;
+			if (!EQSIndexerInternal::BuildTestProperties(OptionIndex, TestIndex, Test, TestProperties))
+			{
+				return false;
+			}
+
+			const int32 TestNodeIndex = EQSIndexerInternal::AddNode(
+				OutPayload,
+				TEXT("EQS_Test"),
+				FString::Printf(TEXT("Option_%d_Test_%d"), OptionIndex, TestIndex),
+				Test->GetClass()->GetName(),
+				TestProperties);
+			EQSIndexerInternal::AddConnection(
+				OutPayload,
+				OptionNodeIndex,
+				TEXT("Tests"),
+				TestNodeIndex,
+				FString::Printf(TEXT("Test_%d"), TestIndex),
+				TEXT("EQS_Test"));
 		}
-		Props->SetArrayField(TEXT("tests"), TestsArr);
-
-		FIndexedNode Node;
-		Node.AssetId = AssetId;
-		Node.NodeType = TEXT("EQS_Option");
-		Node.NodeName = FString::Printf(TEXT("Option_%d"), i);
-		Node.NodeClass = GeneratorClassName;
-		Node.Properties = JsonToString(Props);
-		DB.InsertNode(Node);
 	}
 
-	// EQS→Generator/Test 类交叉引用
-	for (const FString& ClassName : UniqueClasses)
-	{
-		FIndexedConnection Conn;
-		Conn.SourceNodeId = AssetId;
-		Conn.SourcePin = Query->GetName();
-		Conn.TargetPin = ClassName;
-		Conn.PinType = TEXT("EQS_UsesClass");
-		DB.InsertConnection(Conn);
-	}
+	return true;
 }

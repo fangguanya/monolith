@@ -1,13 +1,11 @@
 #include "MonolithMeshBlockoutActions.h"
 #include "MonolithMeshSceneActions.h"
 #include "MonolithMeshUtils.h"
-#include "MonolithMeshCatalog.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithIndexSubsystem.h"
-#include "MonolithIndexDatabase.h"
 #include "MonolithSettings.h"
 
 #include "Engine/StaticMesh.h"
@@ -28,7 +26,6 @@
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonSerializer.h"
 #include "Editor.h"
-#include "SQLiteDatabase.h"
 #include "Math/RandomStream.h"
 
 // ============================================================================
@@ -361,16 +358,10 @@ FVector FMonolithMeshBlockoutActions::GetBlockoutActorSize(const AActor* Actor)
 
 namespace BlockoutHelpers
 {
-	/** Get catalog database, or nullptr */
-	FSQLiteDatabase* GetCatalogDB()
+	/** 统一从 MonolithIndex 子系统拿 mesh catalog 查询入口。 */
+	UMonolithIndexSubsystem* GetIndexSubsystem()
 	{
-		UMonolithIndexSubsystem* IndexSub = GEditor ?
-			GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>() : nullptr;
-		if (!IndexSub || !IndexSub->GetDatabase())
-		{
-			return nullptr;
-		}
-		return IndexSub->GetDatabase()->GetRawDatabase();
+		return GEditor ? GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>() : nullptr;
 	}
 
 	/** Sort 3 floats smallest to largest */
@@ -1263,8 +1254,8 @@ FMonolithActionResult FMonolithMeshBlockoutActions::MatchAssetToBlockout(const T
 		return FMonolithActionResult::Error(Error);
 	}
 
-	FSQLiteDatabase* DB = BlockoutHelpers::GetCatalogDB();
-	if (!DB)
+	UMonolithIndexSubsystem* IndexSubsystem = BlockoutHelpers::GetIndexSubsystem();
+	if (!IndexSubsystem)
 	{
 		return FMonolithActionResult::Error(TEXT("Mesh catalog not available. Run monolith_reindex() first."));
 	}
@@ -1306,8 +1297,12 @@ FMonolithActionResult FMonolithMeshBlockoutActions::MatchAssetToBlockout(const T
 	}
 
 	// Query catalog — get more than TopN to allow scoring
-	TSharedPtr<FJsonObject> CatalogResults = FMonolithMeshCatalog::SearchBySize(
-		*DB, MinBounds, MaxBounds, Category, FString(), TopN * 5);
+	TSharedPtr<FJsonObject> CatalogResults = IndexSubsystem->SearchMeshCatalogBySize(
+		MinBounds, MaxBounds, Category, FString(), TopN * 5);
+	if (!CatalogResults.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Mesh catalog query failed."));
+	}
 
 	const TArray<TSharedPtr<FJsonValue>>* ResultsArr;
 	if (!CatalogResults || !CatalogResults->TryGetArrayField(TEXT("results"), ResultsArr))
@@ -1440,14 +1435,18 @@ FMonolithActionResult FMonolithMeshBlockoutActions::MatchAllInVolume(const TShar
 		return FMonolithActionResult::Error(TEXT("Missing required param: volume_name"));
 	}
 
-	FSQLiteDatabase* DB = BlockoutHelpers::GetCatalogDB();
-	if (!DB)
+	UMonolithIndexSubsystem* IndexSubsystem = BlockoutHelpers::GetIndexSubsystem();
+	if (!IndexSubsystem)
 	{
 		return FMonolithActionResult::Error(TEXT("No meshes indexed. Run monolith_reindex() first."));
 	}
 
 	// Check catalog isn't empty
-	TSharedPtr<FJsonObject> Stats = FMonolithMeshCatalog::GetStats(*DB);
+	TSharedPtr<FJsonObject> Stats = IndexSubsystem->GetMeshCatalogStats();
+	if (!Stats.IsValid())
+	{
+		return FMonolithActionResult::Error(TEXT("Mesh catalog stats query failed."));
+	}
 	double TotalMeshes = 0;
 	if (Stats) Stats->TryGetNumberField(TEXT("total_meshes"), TotalMeshes);
 	if (TotalMeshes == 0)

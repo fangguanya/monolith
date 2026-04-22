@@ -1,122 +1,111 @@
 #include "Indexers/NiagaraIndexer.h"
-#include "MonolithSettings.h"
-#include "MonolithMemoryHelper.h"
+
+#include "Indexers/MonolithSimpleArtifactSerialization.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "NiagaraSystem.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraRendererProperties.h"
-#include "AssetRegistry/AssetRegistryModule.h"
-#include "AssetRegistry/IAssetRegistry.h"
-#include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 
-bool FNiagaraIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
+/*
+ * Niagara 这条链路现在和 Animation / InputAction 很像：
+ * - 先把运行时对象压成轻量 payload；
+ * - 再把 payload 写到正式表或 shadow 表；
+ * - warmup 则只负责提前构建 payload 并塞进缓存。
+ *
+ * 这样做的好处是：
+ * - full / incremental / live / warmup / shadow 都共用同一份“怎么抽取 Niagara 摘要”的逻辑；
+ * - 去掉旧 sentinel 后，不会再出现“同一类数据两套入口”的维护分叉。
+ */
+
+namespace NiagaraIndexerInternal
 {
-	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-
-	TArray<FAssetData> NiagaraAssets;
-	FARFilter Filter;
-	for (const FName& ContentPath : UMonolithSettings::GetIndexedContentPaths())
+	/** 把 JSON 对象压成紧凑字符串，方便直接塞进 node.properties。 */
+	static bool SerializeJsonObject(const TSharedPtr<FJsonObject>& Object, FString& OutJson)
 	{
-		Filter.PackagePaths.Add(ContentPath);
+		auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+		return FJsonSerializer::Serialize(Object.ToSharedRef(), Writer);
 	}
-	Filter.bRecursivePaths = true;
-	Filter.ClassPaths.Add(UNiagaraSystem::StaticClass()->GetClassPathName());
-	Registry.GetAssets(Filter, NiagaraAssets);
-
-	// Get settings for batching
-	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
-	const int32 BatchSize = FMath::Max(1, FMonolithMemoryHelper::GetResolvedPostPassBatchSize());
-	const SIZE_T MemoryBudgetMB = static_cast<SIZE_T>(FMonolithMemoryHelper::GetResolvedMemoryBudgetMB());
-	const bool bLogMemory = Settings->bLogMemoryStats;
-
-	UE_LOG(LogMonolithIndex, Log, TEXT("NiagaraIndexer: Found %d Niagara systems to index (batch size: %d)"),
-		NiagaraAssets.Num(), BatchSize);
-
-	if (bLogMemory)
-	{
-		FMonolithMemoryHelper::LogMemoryStats(TEXT("NiagaraIndexer start"));
-	}
-
-	int32 SystemsIndexed = 0;
-	int32 BatchNumber = 0;
-
-	for (int32 i = 0; i < NiagaraAssets.Num(); i += BatchSize)
-	{
-		// Compiler-idle gate is enforced by FMonolithCompilerSafeDispatch at the call site (see issue #19).
-
-		// Memory budget check before each batch
-		if (FMonolithMemoryHelper::ShouldThrottle(MemoryBudgetMB))
-		{
-			UE_LOG(LogMonolithIndex, Log, TEXT("NiagaraIndexer: Memory budget exceeded, forcing GC..."));
-			FMonolithMemoryHelper::ForceGarbageCollection(true);
-			FMonolithMemoryHelper::YieldToEditor();
-
-			if (bLogMemory)
-			{
-				FMonolithMemoryHelper::LogMemoryStats(TEXT("NiagaraIndexer after throttle GC"));
-			}
-		}
-
-		int32 BatchEnd = FMath::Min(i + BatchSize, NiagaraAssets.Num());
-
-		// Process batch
-		for (int32 j = i; j < BatchEnd; ++j)
-		{
-			const FAssetData& NiagaraAssetData = NiagaraAssets[j];
-
-			int64 NiagaraAssetId = DB.GetAssetId(NiagaraAssetData.PackageName.ToString());
-			if (NiagaraAssetId < 0) continue;
-
-			UNiagaraSystem* System = Cast<UNiagaraSystem>(NiagaraAssetData.GetAsset());
-			if (!System) continue;
-
-			IndexNiagaraSystem(System, DB, NiagaraAssetId);
-			SystemsIndexed++;
-
-			// Mark for unloading
-			FMonolithMemoryHelper::TryUnloadPackage(System);
-		}
-
-		BatchNumber++;
-
-		// GC after each batch
-		FMonolithMemoryHelper::ForceGarbageCollection(false);
-		FMonolithMemoryHelper::YieldToEditor();
-
-		// Log progress periodically
-		if (BatchNumber % 5 == 0 || BatchEnd == NiagaraAssets.Num())
-		{
-			UE_LOG(LogMonolithIndex, Log, TEXT("NiagaraIndexer: processed %d / %d systems"),
-				BatchEnd, NiagaraAssets.Num());
-
-			if (bLogMemory)
-			{
-				FMonolithMemoryHelper::LogMemoryStats(FString::Printf(TEXT("NiagaraIndexer batch %d"), BatchNumber));
-			}
-		}
-	}
-
-	// Final GC
-	FMonolithMemoryHelper::ForceGarbageCollection(true);
-
-	UE_LOG(LogMonolithIndex, Log, TEXT("NiagaraIndexer: indexed %d Niagara systems"), SystemsIndexed);
-
-	if (bLogMemory)
-	{
-		FMonolithMemoryHelper::LogMemoryStats(TEXT("NiagaraIndexer complete"));
-	}
-
-	return true;
 }
 
-void FNiagaraIndexer::IndexNiagaraSystem(UNiagaraSystem* System, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FNiagaraIndexer::BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact)
 {
-	if (!System) return;
+	(void)AssetRegistry;
+	MonolithSimpleArtifactSerialization::FNodesPayload Payload;
+	if (!BuildPayload(Cast<UNiagaraSystem>(LoadedAsset), Payload))
+	{
+		return false;
+	}
 
-	const TArray<FNiagaraEmitterHandle>& EmitterHandles = System->GetEmitterHandles();
+	OutArtifact = FMonolithArtifact();
+	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
+	OutArtifact.IndexerId = GetIndexerId();
+	OutArtifact.IndexerVersion = GetIndexerVersion();
+	OutArtifact.ExecutionMode = GetExecutionMode();
+	OutArtifact.PackageName = AssetData.PackageName.ToString();
+	MonolithSimpleArtifactSerialization::SerializeNodesPayload(Payload, OutArtifact.Payload);
+	return OutArtifact.Payload.Num() > 0;
+}
 
-	// Build system-level metadata
+bool FNiagaraIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
+{
+	MonolithSimpleArtifactSerialization::FNodesPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeNodesPayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeNodesPayload(Payload, DB, AssetId);
+}
+
+bool FNiagaraIndexer::MaterializeArtifactToShadow(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName)
+{
+	MonolithSimpleArtifactSerialization::FNodesPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeNodesPayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeNodesPayloadToShadow(Payload, DB, AssetId, CohortName);
+}
+
+bool FNiagaraIndexer::BuildPayload(UNiagaraSystem* System, MonolithSimpleArtifactSerialization::FNodesPayload& OutPayload) const
+{
+	OutPayload = MonolithSimpleArtifactSerialization::FNodesPayload();
+	if (!System)
+	{
+		return false;
+	}
+
+	FIndexedNode SystemNode;
+	if (!BuildSystemNode(System, SystemNode))
+	{
+		return false;
+	}
+
+	OutPayload.Nodes.Add(MoveTemp(SystemNode));
+	for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+	{
+		FIndexedNode EmitterNode;
+		if (BuildEmitterNode(Handle, EmitterNode))
+		{
+			OutPayload.Nodes.Add(MoveTemp(EmitterNode));
+		}
+	}
+
+	return OutPayload.Nodes.Num() > 0;
+}
+
+bool FNiagaraIndexer::BuildSystemNode(UNiagaraSystem* System, FIndexedNode& OutNode) const
+{
+	if (!System)
+	{
+		return false;
+	}
+
 	auto SystemProps = MakeShared<FJsonObject>();
+	const TArray<FNiagaraEmitterHandle>& EmitterHandles = System->GetEmitterHandles();
 	SystemProps->SetBoolField(TEXT("has_fixed_bounds"), System->bFixedBounds);
 	if (System->bFixedBounds)
 	{
@@ -134,79 +123,55 @@ void FNiagaraIndexer::IndexNiagaraSystem(UNiagaraSystem* System, FMonolithIndexD
 	}
 	SystemProps->SetArrayField(TEXT("emitter_names"), EmitterNames);
 
-	// Serialize system-level node
-	FString SystemPropsStr;
+	OutNode = FIndexedNode();
+	OutNode.NodeName = System->GetName();
+	OutNode.NodeClass = TEXT("NiagaraSystem");
+	OutNode.NodeType = TEXT("System");
+	return NiagaraIndexerInternal::SerializeJsonObject(SystemProps, OutNode.Properties);
+}
+
+bool FNiagaraIndexer::BuildEmitterNode(const FNiagaraEmitterHandle& Handle, FIndexedNode& OutNode) const
+{
+	auto EmitterProps = MakeShared<FJsonObject>();
+	EmitterProps->SetStringField(TEXT("name"), Handle.GetName().ToString());
+	EmitterProps->SetBoolField(TEXT("enabled"), Handle.GetIsEnabled());
+
+	FVersionedNiagaraEmitter VersionedEmitter = Handle.GetInstance();
+	if (VersionedEmitter.Emitter)
 	{
-		auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&SystemPropsStr);
-		FJsonSerializer::Serialize(SystemProps, *Writer, true);
-	}
-
-	FIndexedNode SystemNode;
-	SystemNode.AssetId = AssetId;
-	SystemNode.NodeName = System->GetName();
-	SystemNode.NodeClass = TEXT("NiagaraSystem");
-	SystemNode.NodeType = TEXT("System");
-	SystemNode.Properties = SystemPropsStr;
-	DB.InsertNode(SystemNode);
-
-	// Index each emitter
-	for (const FNiagaraEmitterHandle& Handle : EmitterHandles)
-	{
-		auto EmitterProps = MakeShared<FJsonObject>();
-		EmitterProps->SetStringField(TEXT("name"), Handle.GetName().ToString());
-		EmitterProps->SetBoolField(TEXT("enabled"), Handle.GetIsEnabled());
-
-		FVersionedNiagaraEmitter VersionedEmitter = Handle.GetInstance();
-		if (VersionedEmitter.Emitter)
+		if (FVersionedNiagaraEmitterData* EmitterData = VersionedEmitter.GetEmitterData())
 		{
-			FVersionedNiagaraEmitterData* EmitterData = VersionedEmitter.GetEmitterData();
-			if (EmitterData)
+			switch (EmitterData->SimTarget)
 			{
-				// Sim target
-				switch (EmitterData->SimTarget)
-				{
-				case ENiagaraSimTarget::CPUSim:
-					EmitterProps->SetStringField(TEXT("sim_target"), TEXT("CPU"));
-					break;
-				case ENiagaraSimTarget::GPUComputeSim:
-					EmitterProps->SetStringField(TEXT("sim_target"), TEXT("GPU"));
-					break;
-				default:
-					EmitterProps->SetStringField(TEXT("sim_target"), TEXT("Unknown"));
-					break;
-				}
-
-				// Renderer info
-				const TArray<UNiagaraRendererProperties*>& Renderers = EmitterData->GetRenderers();
-				TArray<TSharedPtr<FJsonValue>> RendererArray;
-				for (const UNiagaraRendererProperties* Renderer : Renderers)
-				{
-					if (Renderer)
-					{
-						RendererArray.Add(MakeShared<FJsonValueString>(Renderer->GetClass()->GetName()));
-					}
-				}
-				EmitterProps->SetArrayField(TEXT("renderers"), RendererArray);
-
-				// Script presence per stage
-				EmitterProps->SetBoolField(TEXT("has_spawn_script"), EmitterData->SpawnScriptProps.Script != nullptr);
-				EmitterProps->SetBoolField(TEXT("has_update_script"), EmitterData->UpdateScriptProps.Script != nullptr);
+			case ENiagaraSimTarget::CPUSim:
+				EmitterProps->SetStringField(TEXT("sim_target"), TEXT("CPU"));
+				break;
+			case ENiagaraSimTarget::GPUComputeSim:
+				EmitterProps->SetStringField(TEXT("sim_target"), TEXT("GPU"));
+				break;
+			default:
+				EmitterProps->SetStringField(TEXT("sim_target"), TEXT("Unknown"));
+				break;
 			}
-		}
 
-		// Serialize emitter node
-		FString EmitterPropsStr;
-		{
-			auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&EmitterPropsStr);
-			FJsonSerializer::Serialize(EmitterProps, *Writer, true);
-		}
+			TArray<TSharedPtr<FJsonValue>> RendererArray;
+			for (const UNiagaraRendererProperties* Renderer : EmitterData->GetRenderers())
+			{
+				if (Renderer)
+				{
+					RendererArray.Add(MakeShared<FJsonValueString>(Renderer->GetClass()->GetName()));
+				}
+			}
+			EmitterProps->SetArrayField(TEXT("renderers"), RendererArray);
 
-		FIndexedNode EmitterNode;
-		EmitterNode.AssetId = AssetId;
-		EmitterNode.NodeName = Handle.GetName().ToString();
-		EmitterNode.NodeClass = TEXT("NiagaraEmitter");
-		EmitterNode.NodeType = TEXT("Emitter");
-		EmitterNode.Properties = EmitterPropsStr;
-		DB.InsertNode(EmitterNode);
+			EmitterProps->SetBoolField(TEXT("has_spawn_script"), EmitterData->SpawnScriptProps.Script != nullptr);
+			EmitterProps->SetBoolField(TEXT("has_update_script"), EmitterData->UpdateScriptProps.Script != nullptr);
+		}
 	}
+
+	OutNode = FIndexedNode();
+	OutNode.NodeName = Handle.GetName().ToString();
+	OutNode.NodeClass = TEXT("NiagaraEmitter");
+	OutNode.NodeType = TEXT("Emitter");
+	return NiagaraIndexerInternal::SerializeJsonObject(EmitterProps, OutNode.Properties);
 }

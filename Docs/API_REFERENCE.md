@@ -2826,7 +2826,7 @@ Find all assets that reference or are referenced by the given asset.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `asset_path` | string | **required** | Package path of the asset (e.g. `/Game/Characters/BP_Hero`) |
+| `package_path` | string | **required** | Package path of the asset (e.g. `/Game/Characters/BP_Hero`) |
 
 ---
 
@@ -2856,7 +2856,7 @@ Get deep details for a specific asset -- nodes, variables, parameters, dependenc
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `asset_path` | string | **required** | Package path of the asset (e.g. `/Game/Characters/BP_Hero`) |
+| `package_path` | string | **required** | Package path of the asset (e.g. `/Game/Characters/BP_Hero`) |
 
 ---
 

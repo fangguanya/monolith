@@ -1,83 +1,42 @@
 #include "Actions/ProjectSearchGameplayTagsAction.h"
+#include "Actions/MonolithProjectActionUtils.h"
 #include "MonolithIndexSubsystem.h"
 #include "MonolithParamSchema.h"
-#include "SQLiteDatabase.h"
-#include "Editor.h"
+
+/*
+ * 这个 action 负责做 GameplayTag 模糊搜索。
+ *
+ * 返回里除了 tag 名本身，还会带上“哪些资产正在引用它”，
+ * 这样外部工具在展示 tag 搜索结果时，可以直接给出上下文。
+ */
 
 FMonolithActionResult FProjectSearchGameplayTagsAction::Execute(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Query = Params->GetStringField(TEXT("query"));
-	if (Query.IsEmpty())
+	FString Query;
+	if (!MonolithProjectActionUtils::TryGetRequiredStringParam(Params, TEXT("query"), Query))
 	{
-		return FMonolithActionResult::Error(TEXT("'query' parameter is required"), -32602);
+		return MonolithProjectActionUtils::MakeMissingStringParamError(TEXT("query"));
 	}
 
-	UMonolithIndexSubsystem* Subsystem = GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>();
+	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
 	if (!Subsystem)
 	{
-		return FMonolithActionResult::Error(TEXT("Index subsystem not available"));
+		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
 	}
 
-	FMonolithIndexDatabase* DB = Subsystem->GetDatabase();
-	if (!DB || !DB->IsOpen())
-	{
-		return FMonolithActionResult::Error(TEXT("Project index database not available"));
-	}
-
-	FSQLiteDatabase* RawDB = DB->GetRawDatabase();
-	if (!RawDB)
-	{
-		return FMonolithActionResult::Error(TEXT("Raw database handle not available"));
-	}
-
-	// Query tags with aggregated referencing asset paths
-	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*RawDB, TEXT(
-		"SELECT t.id, t.tag_name, t.parent_tag, t.reference_count, "
-		"GROUP_CONCAT(a.package_path) as referencing_assets "
-		"FROM tags t "
-		"LEFT JOIN tag_references tr ON t.id = tr.tag_id "
-		"LEFT JOIN assets a ON tr.asset_id = a.id "
-		"WHERE t.tag_name LIKE ? "
-		"GROUP BY t.id "
-		"ORDER BY t.reference_count DESC, t.tag_name;"
-	));
-
-	FString LikePattern = TEXT("%") + Query + TEXT("%");
-	Stmt.SetBindingValueByIndex(1, LikePattern);
-
+	const TArray<FIndexedGameplayTagSummary> TagSummaries = Subsystem->SearchGameplayTags(Query);
 	TArray<TSharedPtr<FJsonValue>> TagsArr;
-	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	for (const FIndexedGameplayTagSummary& TagSummary : TagSummaries)
 	{
-		int64 TagId = 0;
-		FString TagName, ParentTag, ReferencingAssetsRaw;
-		int64 RefCount = 0;
-
-		Stmt.GetColumnValueByIndex(0, TagId);
-		Stmt.GetColumnValueByIndex(1, TagName);
-		Stmt.GetColumnValueByIndex(2, ParentTag);
-		Stmt.GetColumnValueByIndex(3, RefCount);
-		Stmt.GetColumnValueByIndex(4, ReferencingAssetsRaw);
-
 		auto Entry = MakeShared<FJsonObject>();
-		Entry->SetStringField(TEXT("tag_name"), TagName);
-		Entry->SetStringField(TEXT("parent_tag"), ParentTag);
-		Entry->SetNumberField(TEXT("reference_count"), static_cast<double>(RefCount));
+		Entry->SetStringField(TEXT("tag_name"), TagSummary.TagName);
+		Entry->SetStringField(TEXT("parent_tag"), TagSummary.ParentTag);
+		Entry->SetNumberField(TEXT("reference_count"), static_cast<double>(TagSummary.ReferenceCount));
 
-		// Parse comma-separated asset paths into array
 		TArray<TSharedPtr<FJsonValue>> AssetsArr;
-		if (!ReferencingAssetsRaw.IsEmpty())
+		for (const FString& AssetPath : TagSummary.ReferencingAssets)
 		{
-			TArray<FString> AssetPaths;
-			ReferencingAssetsRaw.ParseIntoArray(AssetPaths, TEXT(","));
-			for (const FString& Path : AssetPaths)
-			{
-				FString Trimmed = Path.TrimStartAndEnd();
-				if (!Trimmed.IsEmpty())
-				{
-					AssetsArr.Add(MakeShared<FJsonValueString>(Trimmed));
-				}
-			}
+			AssetsArr.Add(MakeShared<FJsonValueString>(AssetPath));
 		}
 		Entry->SetArrayField(TEXT("referencing_assets"), AssetsArr);
 

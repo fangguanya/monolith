@@ -1,226 +1,252 @@
 #if WITH_STATETREE
 
 #include "Indexers/StateTreeIndexer.h"
-#include "MonolithSettings.h"
-#include "StateTree.h"
-#include "StateTreeTaskBase.h"
-#include "StateTreeNodeBase.h"
-#include "AssetRegistry/AssetRegistryModule.h"
+
+#include "Indexers/MonolithSimpleArtifactSerialization.h"
 #include "AssetRegistry/IAssetRegistry.h"
-#include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#include "StateTree.h"
+#include "StateTreeNodeBase.h"
+#include "StateTreeTaskBase.h"
 
-#if PLATFORM_WINDOWS
-#include "Windows/AllowWindowsPlatformTypes.h"
-#include <excpt.h>
-#include "Windows/HideWindowsPlatformTypes.h"
+/*
+ * StateTree 这条链路的重点是“状态机本体”：
+ * - 有哪些状态；
+ * - 每个状态挂了哪些任务；
+ * - 状态之间怎么跳。
+ *
+ * 旧实现把任务类名塞回状态属性里，外加一批 class-ref 连接。
+ * 这次改成 graph payload 后，任务本身也会变成节点，
+ * 这样 diff 才能真正比较状态图结构。
+ */
 
-static bool SafeCallWithSEH_ST(void(*Func)(void*), void* Context)
+namespace StateTreeIndexerInternal
 {
-	__try
+	/** 把 JSON 对象压成紧凑字符串，方便直接放进 node.properties。 */
+	static bool SerializeJsonObject(const TSharedPtr<FJsonObject>& Object, FString& OutJson)
 	{
-		Func(Context);
-		return true;
+		auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+		return FJsonSerializer::Serialize(Object.ToSharedRef(), Writer);
 	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
+
+	/** 向 graph payload 追加一个节点。 */
+	static int32 AddNode(
+		MonolithSimpleArtifactSerialization::FGraphPayload& Payload,
+		const FString& NodeType,
+		const FString& NodeName,
+		const FString& NodeClass,
+		const FString& Properties)
+	{
+		FIndexedNode Node;
+		Node.NodeType = NodeType;
+		Node.NodeName = NodeName;
+		Node.NodeClass = NodeClass;
+		Node.Properties = Properties;
+		return Payload.Nodes.Add(MoveTemp(Node));
+	}
+
+	/** 向 graph payload 追加一条内部连接。 */
+	static void AddConnection(
+		MonolithSimpleArtifactSerialization::FGraphPayload& Payload,
+		const int32 SourceNodeIndex,
+		const FString& SourcePin,
+		const int32 TargetNodeIndex,
+		const FString& TargetPin,
+		const FString& PinType)
+	{
+		MonolithSimpleArtifactSerialization::FGraphPayloadConnection Connection;
+		Connection.SourceNodeIndex = SourceNodeIndex;
+		Connection.SourcePin = SourcePin;
+		Connection.TargetNodeIndex = TargetNodeIndex;
+		Connection.TargetPin = TargetPin;
+		Connection.PinType = PinType;
+		Payload.Connections.Add(MoveTemp(Connection));
+	}
+
+	/** 构建状态节点属性。 */
+	static bool BuildStateProperties(
+		const FCompactStateTreeState& State,
+		const TConstArrayView<FCompactStateTreeState>& States,
+		FString& OutProperties)
+	{
+		TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+		Properties->SetStringField(
+			TEXT("state_type"),
+			StaticEnum<EStateTreeStateType>()->GetNameStringByValue(static_cast<int64>(State.Type)));
+		Properties->SetNumberField(TEXT("num_children"), State.HasChildren() ? (State.ChildrenEnd - State.ChildrenBegin) : 0);
+		Properties->SetNumberField(TEXT("num_transitions"), State.TransitionsNum);
+		Properties->SetNumberField(TEXT("num_tasks"), State.TasksNum);
+		if (State.Parent.IsValid() && State.Parent.Index < States.Num())
+		{
+			Properties->SetStringField(TEXT("parent_state"), States[State.Parent.Index].Name.ToString());
+		}
+		return SerializeJsonObject(Properties, OutProperties);
+	}
+
+	/** 构建任务节点属性。 */
+	static bool BuildTaskProperties(const FString& StateName, const int32 TaskIndex, const UScriptStruct* ScriptStruct, FString& OutProperties)
+	{
+		TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+		Properties->SetStringField(TEXT("state_name"), StateName);
+		Properties->SetNumberField(TEXT("task_index"), TaskIndex);
+		Properties->SetStringField(TEXT("class"), ScriptStruct ? ScriptStruct->GetName() : TEXT("Unknown"));
+		return SerializeJsonObject(Properties, OutProperties);
+	}
+}
+
+bool FStateTreeIndexer::BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact)
+{
+	(void)AssetRegistry;
+
+	MonolithSimpleArtifactSerialization::FGraphPayload Payload;
+	if (!BuildPayload(Cast<UStateTree>(LoadedAsset), Payload))
 	{
 		return false;
 	}
-}
-#endif
 
-// SEH 安全调用上下文
-struct FSTIndexCallContext
-{
-	FStateTreeIndexer* Self;
-	FMonolithIndexDatabase* DB;
-	int64 AssetId;
-	FSoftObjectPath ObjectPath;
-	bool bSuccess;
-};
-
-static void LoadAndIndexSTAsset(void* Ctx)
-{
-	auto* C = static_cast<FSTIndexCallContext*>(Ctx);
-	C->bSuccess = false;
-
-	UObject* Loaded = C->ObjectPath.TryLoad();
-	if (!Loaded) return;
-
-	if (UStateTree* ST = Cast<UStateTree>(Loaded))
-	{
-		C->Self->IndexStateTreePublic(ST, *C->DB, C->AssetId);
-		C->bSuccess = true;
-	}
+	OutArtifact = FMonolithArtifact();
+	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
+	OutArtifact.IndexerId = GetIndexerId();
+	OutArtifact.IndexerVersion = GetIndexerVersion();
+	OutArtifact.ExecutionMode = GetExecutionMode();
+	OutArtifact.PackageName = AssetData.PackageName.ToString();
+	MonolithSimpleArtifactSerialization::SerializeGraphPayload(Payload, OutArtifact.Payload);
+	return OutArtifact.Payload.Num() > 0;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
-
-FString FStateTreeIndexer::JsonToString(TSharedPtr<FJsonObject> JsonObj)
+bool FStateTreeIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
 {
-	FString Out;
-	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
-	FJsonSerializer::Serialize(JsonObj, *Writer, true);
-	return Out;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Sentinel 入口
-// ─────────────────────────────────────────────────────────────
-
-bool FStateTreeIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
-{
-	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-
-	TArray<FAssetData> Assets;
-	FARFilter Filter;
-	for (const FName& ContentPath : UMonolithSettings::GetIndexedContentPaths())
+	MonolithSimpleArtifactSerialization::FGraphPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeGraphPayload(Artifact.Payload, Payload))
 	{
-		Filter.PackagePaths.Add(ContentPath);
-	}
-	Filter.bRecursivePaths = true;
-	Filter.ClassPaths.Add(UStateTree::StaticClass()->GetClassPathName());
-	Registry.GetAssets(Filter, Assets);
-
-	int32 TotalIndexed = 0;
-	for (const FAssetData& AD : Assets)
-	{
-		int64 AId = DB.GetAssetId(AD.PackageName.ToString());
-		if (AId < 0) continue;
-
-		FSTIndexCallContext Ctx;
-		Ctx.Self = this;
-		Ctx.DB = &DB;
-		Ctx.AssetId = AId;
-		Ctx.ObjectPath = AD.GetSoftObjectPath();
-		Ctx.bSuccess = false;
-
-#if PLATFORM_WINDOWS
-		if (SafeCallWithSEH_ST(&LoadAndIndexSTAsset, &Ctx))
-		{
-			if (Ctx.bSuccess) TotalIndexed++;
-		}
-		else
-		{
-			UE_LOG(LogMonolithIndex, Warning, TEXT("StateTreeIndexer: crashed loading/indexing '%s' - skipping"), *AD.GetSoftObjectPath().ToString());
-		}
-#else
-		LoadAndIndexSTAsset(&Ctx);
-		if (Ctx.bSuccess) TotalIndexed++;
-#endif
+		return false;
 	}
 
-	UE_LOG(LogMonolithIndex, Log, TEXT("StateTreeIndexer: indexed %d StateTree assets"), TotalIndexed);
-	return true;
+	return MonolithSimpleArtifactSerialization::MaterializeGraphPayload(Payload, DB, AssetId);
 }
 
-// ─────────────────────────────────────────────────────────────
-// StateTree 索引
-// ─────────────────────────────────────────────────────────────
-
-void FStateTreeIndexer::IndexStateTree(UStateTree* ST, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FStateTreeIndexer::MaterializeArtifactToShadow(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName)
 {
-	if (!ST || !ST->IsReadyToRun()) return;
-
-	TConstArrayView<FCompactStateTreeState> States = ST->GetStates();
-	const FInstancedStructContainer& Nodes = ST->GetNodes();
-
-	// 收集唯一任务类名用于交叉引用
-	TSet<FString> UniqueTaskClasses;
-
-	// 记录 state index → InsertNode 返回的 NodeId，用于转换连接
-	TMap<int32, int64> StateIndexToNodeId;
-
-	// 索引每个 State
-	for (int32 StateIdx = 0; StateIdx < States.Num(); ++StateIdx)
+	MonolithSimpleArtifactSerialization::FGraphPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeGraphPayload(Artifact.Payload, Payload))
 	{
-		const FCompactStateTreeState& State = States[StateIdx];
+		return false;
+	}
 
-		auto Props = MakeShared<FJsonObject>();
-		Props->SetStringField(TEXT("state_type"), StaticEnum<EStateTreeStateType>()->GetNameStringByValue(static_cast<int64>(State.Type)));
-		Props->SetNumberField(TEXT("num_children"), State.HasChildren() ? (State.ChildrenEnd - State.ChildrenBegin) : 0);
-		Props->SetNumberField(TEXT("num_transitions"), State.TransitionsNum);
-		Props->SetNumberField(TEXT("num_tasks"), State.TasksNum);
+	return MonolithSimpleArtifactSerialization::MaterializeGraphPayloadToShadow(Payload, DB, AssetId, CohortName);
+}
 
-		// 父状态名
-		if (State.Parent.IsValid() && State.Parent.Index < States.Num())
+bool FStateTreeIndexer::BuildPayload(UStateTree* StateTree, MonolithSimpleArtifactSerialization::FGraphPayload& OutPayload) const
+{
+	OutPayload = MonolithSimpleArtifactSerialization::FGraphPayload();
+	if (!StateTree || !StateTree->IsReadyToRun())
+	{
+		return false;
+	}
+
+	const TConstArrayView<FCompactStateTreeState> States = StateTree->GetStates();
+	TMap<int32, int32> StateIndexToNodeIndex;
+
+	// 第一步：先把所有 State 都变成节点。
+	// 这样后面建立 transition 时，就能稳定地拿到源/目标节点下标。
+	for (int32 StateIndex = 0; StateIndex < States.Num(); ++StateIndex)
+	{
+		const FCompactStateTreeState& State = States[StateIndex];
+
+		FString StateProperties;
+		if (!StateTreeIndexerInternal::BuildStateProperties(State, States, StateProperties))
 		{
-			Props->SetStringField(TEXT("parent_state"), States[State.Parent.Index].Name.ToString());
+			return false;
 		}
 
-		// 收集该 State 的任务类名
-		TArray<TSharedPtr<FJsonValue>> TasksArr;
+		const int32 StateNodeIndex = StateTreeIndexerInternal::AddNode(
+			OutPayload,
+			TEXT("ST_State"),
+			State.Name.ToString(),
+			TEXT("FCompactStateTreeState"),
+			StateProperties);
+		StateIndexToNodeIndex.Add(StateIndex, StateNodeIndex);
+	}
+
+	// 第二步：把每个 State 挂着的 Task 也变成节点，并连回自己的 State。
+	for (int32 StateIndex = 0; StateIndex < States.Num(); ++StateIndex)
+	{
+		const FCompactStateTreeState& State = States[StateIndex];
+		const int32* StateNodeIndex = StateIndexToNodeIndex.Find(StateIndex);
+		if (!StateNodeIndex)
+		{
+			return false;
+		}
+
 		for (uint16 TaskOffset = 0; TaskOffset < State.TasksNum; ++TaskOffset)
 		{
-			int32 NodeIdx = State.TasksBegin + TaskOffset;
-			FConstStructView NodeView = ST->GetNode(NodeIdx);
-			if (NodeView.IsValid())
+			const int32 NodeIndex = State.TasksBegin + TaskOffset;
+			const FConstStructView NodeView = StateTree->GetNode(NodeIndex);
+			if (!NodeView.IsValid())
 			{
-				const UScriptStruct* ScriptStruct = NodeView.GetScriptStruct();
-				if (ScriptStruct)
-				{
-					const FString TaskClassName = ScriptStruct->GetName();
-					TasksArr.Add(MakeShared<FJsonValueString>(TaskClassName));
-					UniqueTaskClasses.Add(TaskClassName);
-				}
+				continue;
 			}
-		}
-		Props->SetArrayField(TEXT("tasks"), TasksArr);
 
-		FIndexedNode IndexedNode;
-		IndexedNode.AssetId = AssetId;
-		IndexedNode.NodeType = TEXT("ST_State");
-		IndexedNode.NodeName = State.Name.ToString();
-		IndexedNode.NodeClass = TEXT("FCompactStateTreeState");
-		IndexedNode.Properties = JsonToString(Props);
-		int64 NodeId = DB.InsertNode(IndexedNode);
-		StateIndexToNodeId.Add(StateIdx, NodeId);
+			const UScriptStruct* ScriptStruct = NodeView.GetScriptStruct();
+			FString TaskProperties;
+			if (!StateTreeIndexerInternal::BuildTaskProperties(State.Name.ToString(), TaskOffset, ScriptStruct, TaskProperties))
+			{
+				return false;
+			}
+
+			const int32 TaskNodeIndex = StateTreeIndexerInternal::AddNode(
+				OutPayload,
+				TEXT("ST_Task"),
+				FString::Printf(TEXT("%s.Task.%d"), *State.Name.ToString(), TaskOffset),
+				ScriptStruct ? ScriptStruct->GetName() : TEXT("Unknown"),
+				TaskProperties);
+			StateTreeIndexerInternal::AddConnection(
+				OutPayload,
+				*StateNodeIndex,
+				TEXT("Tasks"),
+				TaskNodeIndex,
+				ScriptStruct ? ScriptStruct->GetName() : TEXT("Task"),
+				TEXT("ST_Task"));
+		}
 	}
 
-	// 索引 Transitions（State → State 连接）
-	for (int32 StateIdx = 0; StateIdx < States.Num(); ++StateIdx)
+	// 第三步：建立 State -> State 的 transition 连接。
+	for (int32 StateIndex = 0; StateIndex < States.Num(); ++StateIndex)
 	{
-		const FCompactStateTreeState& State = States[StateIdx];
-		int64* SourceNodeId = StateIndexToNodeId.Find(StateIdx);
-		if (!SourceNodeId) continue;
-
-		for (uint8 TransOffset = 0; TransOffset < State.TransitionsNum; ++TransOffset)
+		const FCompactStateTreeState& State = States[StateIndex];
+		const int32* SourceNodeIndex = StateIndexToNodeIndex.Find(StateIndex);
+		if (!SourceNodeIndex)
 		{
-			FStateTreeIndex16 TransIdx(State.TransitionsBegin + TransOffset);
-			const FCompactStateTransition* Trans = ST->GetTransitionFromIndex(TransIdx);
-			if (!Trans) continue;
+			return false;
+		}
 
-			// 只处理有效目标状态的转换
-			if (Trans->State.IsValid())
+		for (uint8 TransitionOffset = 0; TransitionOffset < State.TransitionsNum; ++TransitionOffset)
+		{
+			const FStateTreeIndex16 TransitionIndex(State.TransitionsBegin + TransitionOffset);
+			const FCompactStateTransition* Transition = StateTree->GetTransitionFromIndex(TransitionIndex);
+			if (!Transition || !Transition->State.IsValid())
 			{
-				int32 TargetStateIdx = Trans->State.Index;
-				int64* TargetNodeId = StateIndexToNodeId.Find(TargetStateIdx);
-				if (TargetNodeId)
-				{
-					FIndexedConnection Conn;
-					Conn.SourceNodeId = *SourceNodeId;
-					Conn.TargetNodeId = *TargetNodeId;
-					Conn.SourcePin = States[StateIdx].Name.ToString();
-					Conn.TargetPin = States[TargetStateIdx].Name.ToString();
-					Conn.PinType = TEXT("ST_Transition");
-					DB.InsertConnection(Conn);
-				}
+				continue;
 			}
+
+			const int32* TargetNodeIndex = StateIndexToNodeIndex.Find(Transition->State.Index);
+			if (!TargetNodeIndex)
+			{
+				continue;
+			}
+
+			StateTreeIndexerInternal::AddConnection(
+				OutPayload,
+				*SourceNodeIndex,
+				States[StateIndex].Name.ToString(),
+				*TargetNodeIndex,
+				States[Transition->State.Index].Name.ToString(),
+				TEXT("ST_Transition"));
 		}
 	}
 
-	// StateTree→TaskClass 交叉引用
-	for (const FString& ClassName : UniqueTaskClasses)
-	{
-		FIndexedConnection Conn;
-		Conn.SourceNodeId = AssetId;
-		Conn.SourcePin = ST->GetName();
-		Conn.TargetPin = ClassName;
-		Conn.PinType = TEXT("ST_UsesTaskClass");
-		DB.InsertConnection(Conn);
-	}
+	return true;
 }
 
 #endif // WITH_STATETREE

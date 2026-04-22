@@ -1,4 +1,5 @@
 #include "MonolithMemoryHelper.h"
+#include "Async/Async.h"
 #include "HAL/PlatformMemory.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
@@ -64,6 +65,36 @@ void FMonolithMemoryHelper::ForceGarbageCollection(bool bFullPurge)
 		UE_LOG(LogMonolithMemory, Verbose, TEXT("TryCollectGarbage returned false - GC deferred by engine"));
 		return;
 	}
+}
+
+void FMonolithMemoryHelper::RequestGarbageCollection(const bool bFullPurge, const bool bPumpEditor)
+{
+	/*
+	 * 这条 helper 的重点是“请求”而不是“等待”：
+	 * - 如果当前已经在 GT，就立刻执行；
+	 * - 否则只把工作投递回 GT，然后后台线程继续自己的节奏。
+	 *
+	 * 这样索引主链就不会再为了 GC/yield 去同步卡住后台线程。
+	 */
+	auto RunRequestedGc = [bFullPurge, bPumpEditor]()
+	{
+		FMonolithMemoryHelper::ForceGarbageCollection(bFullPurge);
+		if (bPumpEditor)
+		{
+			FMonolithMemoryHelper::YieldToEditor();
+		}
+	};
+
+	if (IsInGameThread())
+	{
+		RunRequestedGc();
+		return;
+	}
+
+	AsyncTask(ENamedThreads::GameThread, [RunRequestedGc = MoveTemp(RunRequestedGc)]() mutable
+	{
+		RunRequestedGc();
+	});
 }
 
 bool FMonolithMemoryHelper::TryUnloadPackage(UObject* Asset)

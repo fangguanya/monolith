@@ -1,307 +1,399 @@
 #include "Indexers/BehaviorTreeIndexer.h"
-#include "MonolithSettings.h"
+
+#include "Indexers/MonolithSimpleArtifactSerialization.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "BehaviorTree/BehaviorTree.h"
 #include "BehaviorTree/BlackboardData.h"
 #include "BehaviorTree/BTCompositeNode.h"
-#include "BehaviorTree/BTTaskNode.h"
 #include "BehaviorTree/BTDecorator.h"
 #include "BehaviorTree/BTService.h"
+#include "BehaviorTree/BTTaskNode.h"
 #include "BehaviorTree/Blackboard/BlackboardKeyType.h"
-#include "AssetRegistry/AssetRegistryModule.h"
-#include "AssetRegistry/IAssetRegistry.h"
-#include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 
-#if PLATFORM_WINDOWS
-#include "Windows/AllowWindowsPlatformTypes.h"
-#include <excpt.h>
-#include "Windows/HideWindowsPlatformTypes.h"
+/*
+ * 这份实现的核心目标是把旧的 sentinel 行为树索引，
+ * 收口成一套真正可缓存、可 shadow、可 warmup 的 package-scoped 图 payload。
+ *
+ * 这里有两个很重要的取舍：
+ * 1. 只保留“资产内部图结构”这类真正能参与 shadow diff 的数据；
+ * 2. 不再往 connection 表里塞跨资产 class ref / asset ref 这种当前 diff 用不上的半残语义。
+ *
+ * 换句话说：
+ * - BehaviorTree 现在关注的是“树里有哪些节点，它们怎么连”；
+ * - Blackboard 现在关注的是“这个黑板有哪些键”；
+ * - 两者都走同一份 graph payload 协议。
+ */
 
-static bool SafeCallWithSEH_BT(void(*Func)(void*), void* Context)
+namespace BehaviorTreeIndexerInternal
 {
-	__try
+	/** 把 JSON 对象压成紧凑字符串，方便直接存进 node.properties。 */
+	static bool SerializeJsonObject(const TSharedPtr<FJsonObject>& Object, FString& OutJson)
 	{
-		Func(Context);
-		return true;
+		auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+		return FJsonSerializer::Serialize(Object.ToSharedRef(), Writer);
 	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
+
+	/** 往 graph payload 里追加一条 node，并返回它在数组里的下标。 */
+	static int32 AddNode(
+		MonolithSimpleArtifactSerialization::FGraphPayload& Payload,
+		const FString& NodeType,
+		const FString& NodeName,
+		const FString& NodeClass,
+		const FString& Properties,
+		const int32 PosX = 0,
+		const int32 PosY = 0)
+	{
+		FIndexedNode Node;
+		Node.NodeType = NodeType;
+		Node.NodeName = NodeName;
+		Node.NodeClass = NodeClass;
+		Node.Properties = Properties;
+		Node.PosX = PosX;
+		Node.PosY = PosY;
+		return Payload.Nodes.Add(MoveTemp(Node));
+	}
+
+	/** 往 graph payload 里追加一条内部连线。 */
+	static void AddConnection(
+		MonolithSimpleArtifactSerialization::FGraphPayload& Payload,
+		const int32 SourceNodeIndex,
+		const FString& SourcePin,
+		const int32 TargetNodeIndex,
+		const FString& TargetPin,
+		const FString& PinType)
+	{
+		MonolithSimpleArtifactSerialization::FGraphPayloadConnection Connection;
+		Connection.SourceNodeIndex = SourceNodeIndex;
+		Connection.SourcePin = SourcePin;
+		Connection.TargetNodeIndex = TargetNodeIndex;
+		Connection.TargetPin = TargetPin;
+		Connection.PinType = PinType;
+		Payload.Connections.Add(MoveTemp(Connection));
+	}
+
+	/** 统一构建行为树节点的 JSON 属性。 */
+	static bool BuildBehaviorTreeNodeProperties(
+		const UBTNode* Node,
+		const int32 ExecutionIndex,
+		const int32 Depth,
+		const int32 ChildCount,
+		const int32 ServiceCount,
+		const int32 DecoratorCount,
+		const FString& BlackboardAssetPath,
+		FString& OutProperties)
+	{
+		TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+		Properties->SetNumberField(TEXT("execution_index"), ExecutionIndex);
+		Properties->SetNumberField(TEXT("depth"), Depth);
+		Properties->SetNumberField(TEXT("child_count"), ChildCount);
+		Properties->SetNumberField(TEXT("service_count"), ServiceCount);
+		Properties->SetNumberField(TEXT("decorator_count"), DecoratorCount);
+		if (!BlackboardAssetPath.IsEmpty())
+		{
+			Properties->SetStringField(TEXT("blackboard_asset"), BlackboardAssetPath);
+		}
+		if (Node)
+		{
+			Properties->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+		}
+		return SerializeJsonObject(Properties, OutProperties);
+	}
+
+	/** 统一构建黑板主节点的 JSON 属性。 */
+	static bool BuildBlackboardProperties(const UBlackboardData* Blackboard, const int32 DeclaredKeyCount, const int32 ResolvedKeyCount, FString& OutProperties)
+	{
+		TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+		Properties->SetNumberField(TEXT("declared_key_count"), DeclaredKeyCount);
+		Properties->SetNumberField(TEXT("resolved_key_count"), ResolvedKeyCount);
+		Properties->SetBoolField(TEXT("has_parent"), Blackboard && Blackboard->Parent != nullptr);
+		if (Blackboard && Blackboard->Parent)
+		{
+			Properties->SetStringField(TEXT("parent_blackboard"), Blackboard->Parent->GetPathName());
+		}
+		return SerializeJsonObject(Properties, OutProperties);
+	}
+}
+
+bool FBehaviorTreeIndexer::BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact)
+{
+	(void)AssetRegistry;
+
+	MonolithSimpleArtifactSerialization::FGraphPayload Payload;
+	if (!BuildPayload(LoadedAsset, Payload))
 	{
 		return false;
 	}
+
+	OutArtifact = FMonolithArtifact();
+	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
+	OutArtifact.IndexerId = GetIndexerId();
+	OutArtifact.IndexerVersion = GetIndexerVersion();
+	OutArtifact.ExecutionMode = GetExecutionMode();
+	OutArtifact.PackageName = AssetData.PackageName.ToString();
+	MonolithSimpleArtifactSerialization::SerializeGraphPayload(Payload, OutArtifact.Payload);
+	return OutArtifact.Payload.Num() > 0;
 }
-#endif
 
-// SEH 安全调用上下文
-struct FBTIndexCallContext
+bool FBehaviorTreeIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
 {
-	FBehaviorTreeIndexer* Self;
-	FMonolithIndexDatabase* DB;
-	int64 AssetId;
-	FSoftObjectPath ObjectPath;
-	bool bSuccess;
-	enum EType { BehaviorTree, Blackboard } Type;
-};
-
-static void LoadAndIndexBTAsset(void* Ctx)
-{
-	auto* C = static_cast<FBTIndexCallContext*>(Ctx);
-	C->bSuccess = false;
-
-	UObject* Loaded = C->ObjectPath.TryLoad();
-	if (!Loaded) return;
-
-	switch (C->Type)
+	MonolithSimpleArtifactSerialization::FGraphPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeGraphPayload(Artifact.Payload, Payload))
 	{
-	case FBTIndexCallContext::BehaviorTree:
-		if (UBehaviorTree* BT = Cast<UBehaviorTree>(Loaded))
-		{ C->Self->IndexBehaviorTreePublic(BT, *C->DB, C->AssetId); C->bSuccess = true; }
-		break;
-	case FBTIndexCallContext::Blackboard:
-		if (UBlackboardData* BB = Cast<UBlackboardData>(Loaded))
-		{ C->Self->IndexBlackboardPublic(BB, *C->DB, C->AssetId); C->bSuccess = true; }
-		break;
-	}
-}
-
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
-
-FString FBehaviorTreeIndexer::JsonToString(TSharedPtr<FJsonObject> JsonObj)
-{
-	FString Out;
-	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
-	FJsonSerializer::Serialize(JsonObj, *Writer, true);
-	return Out;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Sentinel 入口
-// ─────────────────────────────────────────────────────────────
-
-bool FBehaviorTreeIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
-{
-	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-
-	int32 TotalIndexed = 0;
-
-	// 按资产类型枚举并索引
-	auto IndexAllOfType = [&](UClass* Class, FBTIndexCallContext::EType Type) -> int32
-	{
-		TArray<FAssetData> Assets;
-		FARFilter Filter;
-		for (const FName& ContentPath : UMonolithSettings::GetIndexedContentPaths())
-		{
-			Filter.PackagePaths.Add(ContentPath);
-		}
-		Filter.bRecursivePaths = true;
-		Filter.ClassPaths.Add(Class->GetClassPathName());
-		Registry.GetAssets(Filter, Assets);
-
-		int32 Count = 0;
-		for (const FAssetData& AD : Assets)
-		{
-			int64 AId = DB.GetAssetId(AD.PackageName.ToString());
-			if (AId < 0) continue;
-
-			FBTIndexCallContext Ctx;
-			Ctx.Self = this;
-			Ctx.DB = &DB;
-			Ctx.AssetId = AId;
-			Ctx.ObjectPath = AD.GetSoftObjectPath();
-			Ctx.bSuccess = false;
-			Ctx.Type = Type;
-
-#if PLATFORM_WINDOWS
-			if (SafeCallWithSEH_BT(&LoadAndIndexBTAsset, &Ctx))
-			{
-				if (Ctx.bSuccess) Count++;
-			}
-			else
-			{
-				UE_LOG(LogMonolithIndex, Warning, TEXT("BehaviorTreeIndexer: crashed loading/indexing '%s' - skipping"), *AD.GetSoftObjectPath().ToString());
-			}
-#else
-			LoadAndIndexBTAsset(&Ctx);
-			if (Ctx.bSuccess) Count++;
-#endif
-		}
-		return Count;
-	};
-
-	TotalIndexed += IndexAllOfType(UBehaviorTree::StaticClass(), FBTIndexCallContext::BehaviorTree);
-	TotalIndexed += IndexAllOfType(UBlackboardData::StaticClass(), FBTIndexCallContext::Blackboard);
-
-	UE_LOG(LogMonolithIndex, Log, TEXT("BehaviorTreeIndexer: indexed %d BT/Blackboard assets"), TotalIndexed);
-	return true;
-}
-
-// ─────────────────────────────────────────────────────────────
-// BehaviorTree 节点遍历
-// ─────────────────────────────────────────────────────────────
-
-void FBehaviorTreeIndexer::IndexBehaviorTree(UBehaviorTree* BT, FMonolithIndexDatabase& DB, int64 AssetId)
-{
-	if (!BT) return;
-
-	// BT→Blackboard 交叉引用
-	if (BT->BlackboardAsset)
-	{
-		int64 BBAssetId = DB.GetAssetId(BT->BlackboardAsset->GetPackage()->GetName());
-		if (BBAssetId >= 0)
-		{
-			FIndexedConnection Conn;
-			Conn.SourceNodeId = AssetId;
-			Conn.TargetNodeId = BBAssetId;
-			Conn.PinType = TEXT("BT_UsesBlackboard");
-			DB.InsertConnection(Conn);
-		}
+		return false;
 	}
 
-	UBTCompositeNode* RootNode = BT->RootNode;
-	if (!RootNode) return;
+	return MonolithSimpleArtifactSerialization::MaterializeGraphPayload(Payload, DB, AssetId);
+}
 
-	// 收集唯一节点类用于交叉引用
-	TSet<FString> UniqueNodeClasses;
+bool FBehaviorTreeIndexer::MaterializeArtifactToShadow(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName)
+{
+	MonolithSimpleArtifactSerialization::FGraphPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeGraphPayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
 
-	// 节点执行索引计数器
+	return MonolithSimpleArtifactSerialization::MaterializeGraphPayloadToShadow(Payload, DB, AssetId, CohortName);
+}
+
+bool FBehaviorTreeIndexer::BuildPayload(UObject* LoadedAsset, MonolithSimpleArtifactSerialization::FGraphPayload& OutPayload) const
+{
+	if (UBehaviorTree* BehaviorTree = Cast<UBehaviorTree>(LoadedAsset))
+	{
+		return BuildBehaviorTreePayload(BehaviorTree, OutPayload);
+	}
+
+	if (UBlackboardData* Blackboard = Cast<UBlackboardData>(LoadedAsset))
+	{
+		return BuildBlackboardPayload(Blackboard, OutPayload);
+	}
+
+	OutPayload = MonolithSimpleArtifactSerialization::FGraphPayload();
+	return false;
+}
+
+bool FBehaviorTreeIndexer::BuildBehaviorTreePayload(UBehaviorTree* BehaviorTree, MonolithSimpleArtifactSerialization::FGraphPayload& OutPayload) const
+{
+	OutPayload = MonolithSimpleArtifactSerialization::FGraphPayload();
+	if (!BehaviorTree)
+	{
+		return false;
+	}
+
+	UBTCompositeNode* RootNode = BehaviorTree->RootNode;
+	if (!RootNode)
+	{
+		// 没有根节点的行为树仍然算一个“合法但为空”的快照。
+		// 这样 artifact 链路不会因为空树而失败，只是最终不会写出任何 node。
+		return true;
+	}
+
+	const FString BlackboardAssetPath = BehaviorTree->BlackboardAsset
+		? BehaviorTree->BlackboardAsset->GetPathName()
+		: FString();
 	int32 ExecutionIndex = 0;
 
-	// 辅助 lambda：索引单个 BTNode
-	auto IndexSingleNode = [&](UBTNode* Node, const FString& NodeType, int32 ParentExecIndex, int32 Depth)
+	TFunction<int32(UBTNode*, const FString&, int32, int32, int32, int32)> AddBehaviorTreeNode;
+	AddBehaviorTreeNode =
+		[&](UBTNode* Node, const FString& NodeType, const int32 Depth, const int32 ChildCount, const int32 ServiceCount, const int32 DecoratorCount) -> int32
 	{
-		if (!Node) return;
-
-		auto Props = MakeShared<FJsonObject>();
-		Props->SetNumberField(TEXT("execution_index"), ExecutionIndex);
-		Props->SetNumberField(TEXT("parent_execution_index"), ParentExecIndex);
-		Props->SetNumberField(TEXT("depth"), Depth);
-
-		const FString ClassName = Node->GetClass()->GetName();
-		UniqueNodeClasses.Add(ClassName);
-
-		FIndexedNode IndexedNode;
-		IndexedNode.AssetId = AssetId;
-		IndexedNode.NodeType = NodeType;
-		IndexedNode.NodeName = Node->GetNodeName();
-		IndexedNode.NodeClass = ClassName;
-		IndexedNode.Properties = JsonToString(Props);
-		DB.InsertNode(IndexedNode);
-
-		ExecutionIndex++;
-	};
-
-	// DFS 遍历 BT 节点树
-	struct FStackEntry
-	{
-		UBTCompositeNode* Composite;
-		int32 ParentExecIndex;
-		int32 Depth;
-	};
-
-	TArray<FStackEntry> Stack;
-	Stack.Add({ RootNode, -1, 0 });
-
-	while (Stack.Num() > 0)
-	{
-		FStackEntry Current = Stack.Pop();
-		UBTCompositeNode* Composite = Current.Composite;
-		if (!Composite) continue;
-
-		int32 CompositeExecIdx = ExecutionIndex;
-		IndexSingleNode(Composite, TEXT("BT_Composite"), Current.ParentExecIndex, Current.Depth);
-
-		// Composite 上的 Services
-		for (UBTService* Service : Composite->Services)
+		if (!Node)
 		{
-			IndexSingleNode(Service, TEXT("BT_Service"), CompositeExecIdx, Current.Depth + 1);
+			return INDEX_NONE;
 		}
 
-		// 遍历 Children（FBTCompositeChild）
-		for (int32 i = 0; i < Composite->Children.Num(); ++i)
+		FString Properties;
+		if (!BehaviorTreeIndexerInternal::BuildBehaviorTreeNodeProperties(
+			Node,
+			ExecutionIndex,
+			Depth,
+			ChildCount,
+			ServiceCount,
+			DecoratorCount,
+			BlackboardAssetPath,
+			Properties))
 		{
-			const FBTCompositeChild& Child = Composite->Children[i];
+			return INDEX_NONE;
+		}
 
-			// Child 上的 Decorators
-			for (UBTDecorator* Dec : Child.Decorators)
+		const int32 NodeIndex = BehaviorTreeIndexerInternal::AddNode(
+			OutPayload,
+			NodeType,
+			Node->GetNodeName(),
+			Node->GetClass()->GetName(),
+			Properties);
+		++ExecutionIndex;
+		return NodeIndex;
+	};
+
+	TFunction<void(UBTCompositeNode*, int32, int32)> VisitComposite;
+	VisitComposite = [&](UBTCompositeNode* Composite, const int32 ParentNodeIndex, const int32 Depth)
+	{
+		if (!Composite)
+		{
+			return;
+		}
+
+		const int32 CompositeNodeIndex = AddBehaviorTreeNode(
+			Composite,
+			TEXT("BT_Composite"),
+			Depth,
+			Composite->Children.Num(),
+			Composite->Services.Num(),
+			0);
+		if (CompositeNodeIndex == INDEX_NONE)
+		{
+			return;
+		}
+
+		if (ParentNodeIndex != INDEX_NONE)
+		{
+			BehaviorTreeIndexerInternal::AddConnection(
+				OutPayload,
+				ParentNodeIndex,
+				TEXT("Child"),
+				CompositeNodeIndex,
+				Composite->GetNodeName(),
+				TEXT("BT_Child"));
+		}
+
+		for (UBTService* Service : Composite->Services)
+		{
+			const int32 ServiceNodeIndex = AddBehaviorTreeNode(Service, TEXT("BT_Service"), Depth + 1, 0, 0, 0);
+			if (ServiceNodeIndex != INDEX_NONE)
 			{
-				IndexSingleNode(Dec, TEXT("BT_Decorator"), CompositeExecIdx, Current.Depth + 1);
+				BehaviorTreeIndexerInternal::AddConnection(
+					OutPayload,
+					CompositeNodeIndex,
+					TEXT("Services"),
+					ServiceNodeIndex,
+					Service ? Service->GetNodeName() : TEXT("Service"),
+					TEXT("BT_Service"));
+			}
+		}
+
+		for (const FBTCompositeChild& Child : Composite->Children)
+		{
+			for (UBTDecorator* Decorator : Child.Decorators)
+			{
+				const int32 DecoratorNodeIndex = AddBehaviorTreeNode(Decorator, TEXT("BT_Decorator"), Depth + 1, 0, 0, 0);
+				if (DecoratorNodeIndex != INDEX_NONE)
+				{
+					BehaviorTreeIndexerInternal::AddConnection(
+						OutPayload,
+						CompositeNodeIndex,
+						TEXT("Decorators"),
+						DecoratorNodeIndex,
+						Decorator ? Decorator->GetNodeName() : TEXT("Decorator"),
+						TEXT("BT_Decorator"));
+				}
 			}
 
 			if (Child.ChildComposite)
 			{
-				// 子 Composite 节点入栈
-				Stack.Add({ Child.ChildComposite, CompositeExecIdx, Current.Depth + 1 });
+				VisitComposite(Child.ChildComposite, CompositeNodeIndex, Depth + 1);
+				continue;
 			}
-			else if (Child.ChildTask)
-			{
-				// Task 节点
-				int32 TaskExecIdx = ExecutionIndex;
-				IndexSingleNode(Child.ChildTask, TEXT("BT_Task"), CompositeExecIdx, Current.Depth + 1);
 
-				// Task 上的 Services
-				for (UBTService* TaskSvc : Child.ChildTask->Services)
+			if (Child.ChildTask)
+			{
+				const int32 TaskNodeIndex = AddBehaviorTreeNode(
+					Child.ChildTask,
+					TEXT("BT_Task"),
+					Depth + 1,
+					0,
+					Child.ChildTask->Services.Num(),
+					0);
+				if (TaskNodeIndex == INDEX_NONE)
 				{
-					IndexSingleNode(TaskSvc, TEXT("BT_Service"), TaskExecIdx, Current.Depth + 2);
+					continue;
+				}
+
+				BehaviorTreeIndexerInternal::AddConnection(
+					OutPayload,
+					CompositeNodeIndex,
+					TEXT("Child"),
+					TaskNodeIndex,
+					Child.ChildTask->GetNodeName(),
+					TEXT("BT_Child"));
+
+				for (UBTService* TaskService : Child.ChildTask->Services)
+				{
+					const int32 ServiceNodeIndex = AddBehaviorTreeNode(TaskService, TEXT("BT_Service"), Depth + 2, 0, 0, 0);
+					if (ServiceNodeIndex != INDEX_NONE)
+					{
+						BehaviorTreeIndexerInternal::AddConnection(
+							OutPayload,
+							TaskNodeIndex,
+							TEXT("Services"),
+							ServiceNodeIndex,
+							TaskService ? TaskService->GetNodeName() : TEXT("Service"),
+							TEXT("BT_Service"));
+					}
 				}
 			}
 		}
-	}
+	};
 
-	// BT→NodeClass 交叉引用（每个唯一类一条）
-	for (const FString& ClassName : UniqueNodeClasses)
-	{
-		FIndexedConnection Conn;
-		Conn.SourceNodeId = AssetId;
-		Conn.SourcePin = BT->GetName();
-		Conn.TargetPin = ClassName;
-		Conn.PinType = TEXT("BT_UsesNodeClass");
-		DB.InsertConnection(Conn);
-	}
+	VisitComposite(RootNode, INDEX_NONE, 0);
+	return true;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Blackboard 键索引
-// ─────────────────────────────────────────────────────────────
-
-void FBehaviorTreeIndexer::IndexBlackboard(UBlackboardData* BB, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FBehaviorTreeIndexer::BuildBlackboardPayload(UBlackboardData* Blackboard, MonolithSimpleArtifactSerialization::FGraphPayload& OutPayload) const
 {
-	if (!BB) return;
-
-	// 包括父 Blackboard 的键
-	TArray<const UBlackboardData*> BBChain;
-	const UBlackboardData* Current = BB;
-	while (Current)
+	OutPayload = MonolithSimpleArtifactSerialization::FGraphPayload();
+	if (!Blackboard)
 	{
-		BBChain.Insert(Current, 0);
-		Current = Current->Parent;
+		return false;
 	}
 
-	for (const UBlackboardData* BBData : BBChain)
+	TArray<const UBlackboardData*> BlackboardChain;
+	for (const UBlackboardData* Current = Blackboard; Current; Current = Current->Parent)
 	{
-		for (const FBlackboardEntry& Key : BBData->Keys)
+		// 从根到叶排好顺序，确保变量顺序稳定。
+		BlackboardChain.Insert(Current, 0);
+	}
+
+	int32 ResolvedKeyCount = 0;
+	for (const UBlackboardData* BlackboardLayer : BlackboardChain)
+	{
+		ResolvedKeyCount += BlackboardLayer ? BlackboardLayer->Keys.Num() : 0;
+	}
+
+	FString Properties;
+	if (!BehaviorTreeIndexerInternal::BuildBlackboardProperties(Blackboard, Blackboard->Keys.Num(), ResolvedKeyCount, Properties))
+	{
+		return false;
+	}
+
+	BehaviorTreeIndexerInternal::AddNode(
+		OutPayload,
+		TEXT("Blackboard"),
+		Blackboard->GetName(),
+		Blackboard->GetClass()->GetName(),
+		Properties);
+
+	for (const UBlackboardData* BlackboardLayer : BlackboardChain)
+	{
+		if (!BlackboardLayer)
 		{
-			FIndexedVariable Var;
-			Var.AssetId = AssetId;
-			Var.VarName = Key.EntryName.ToString();
-			Var.VarType = Key.KeyType ? Key.KeyType->GetClass()->GetName() : TEXT("Unknown");
-			Var.Category = TEXT("Blackboard");
-			Var.bIsReplicated = Key.bInstanceSynced;
-			DB.InsertVariable(Var);
+			continue;
+		}
+
+		for (const FBlackboardEntry& Key : BlackboardLayer->Keys)
+		{
+			FIndexedVariable Variable;
+			Variable.VarName = Key.EntryName.ToString();
+			Variable.VarType = Key.KeyType ? Key.KeyType->GetClass()->GetName() : TEXT("Unknown");
+			Variable.Category = TEXT("Blackboard");
+			Variable.DefaultValue = BlackboardLayer->GetName();
+			Variable.bIsExposed = false;
+			Variable.bIsReplicated = Key.bInstanceSynced;
+			OutPayload.Variables.Add(MoveTemp(Variable));
 		}
 	}
 
-	// 如果有父 Blackboard，建立引用关系
-	if (BB->Parent)
-	{
-		int64 ParentAssetId = DB.GetAssetId(BB->Parent->GetPackage()->GetName());
-		if (ParentAssetId >= 0)
-		{
-			FIndexedConnection Conn;
-			Conn.SourceNodeId = AssetId;
-			Conn.TargetNodeId = ParentAssetId;
-			Conn.PinType = TEXT("BB_InheritsFrom");
-			DB.InsertConnection(Conn);
-		}
-	}
+	return true;
 }

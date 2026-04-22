@@ -1,202 +1,193 @@
 #include "Indexers/GameplayTagIndexer.h"
-#include "MonolithSettings.h"
-#include "GameplayTagsManager.h"
-#include "GameplayTagContainer.h"
-#include "AssetRegistry/AssetRegistryModule.h"
+
 #include "AssetRegistry/IAssetRegistry.h"
+#include "GameplayTagContainer.h"
+#include "Indexers/MonolithSimpleArtifactSerialization.h"
 
-bool FGameplayTagIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
+/*
+ * GameplayTagIndexer 也统一收口到“单一 payload 真相”：
+ * - 先从 Asset Registry 元数据里抽出 tag 引用列表；
+ * - 生产表 / artifact / shadow 都围着这份列表转。
+ *
+ * 这样以后如果团队想改 tag 提取规则，只需要改 BuildPayload 一处。
+ */
+
+namespace GameplayTagIndexerInternal
 {
-	UGameplayTagsManager& TagManager = UGameplayTagsManager::Get();
-
-	// Get the root gameplay tag nodes
-	FGameplayTagContainer AllTags;
-	TagManager.RequestAllGameplayTags(AllTags, true);
-
-	int32 TagsInserted = 0;
-
-	// Walk the full tag tree via the tag manager's node structure
-	TArray<TSharedPtr<FGameplayTagNode>> RootNodes;
-	TagManager.GetFilteredGameplayRootTags(FString(), RootNodes);
-
-	for (const TSharedPtr<FGameplayTagNode>& RootNode : RootNodes)
-	{
-		if (RootNode.IsValid())
-		{
-			IndexTagNode(*RootNode, DB);
-			TagsInserted++;
-		}
-	}
-
-	// Now scan assets for tag references
-	ScanAssetTagReferences(DB);
-
-	UE_LOG(LogMonolithIndex, Log, TEXT("GameplayTagIndexer: indexed %d root tag trees, scanned assets for references"), TagsInserted);
-	return true;
-}
-
-int64 FGameplayTagIndexer::IndexTagNode(const FGameplayTagNode& Node, FMonolithIndexDatabase& DB)
-{
-	FString TagName = Node.GetCompleteTagString();
-	if (TagName.IsEmpty())
-	{
-		return -1;
-	}
-
-	// Determine parent tag name
-	FString ParentTag;
-	TSharedPtr<FGameplayTagNode> ParentNode = Node.GetParentTagNode();
-	if (ParentNode.IsValid())
-	{
-		ParentTag = ParentNode->GetCompleteTagString();
-	}
-
-	// Insert or get existing tag
-	int64 TagId = DB.GetOrCreateTag(TagName, ParentTag);
-	if (TagId < 0)
-	{
-		return -1;
-	}
-
-	// Recurse into children
-	TArray<TSharedPtr<FGameplayTagNode>> ChildNodes = Node.GetChildTagNodes();
-	for (const TSharedPtr<FGameplayTagNode>& Child : ChildNodes)
-	{
-		if (Child.IsValid())
-		{
-			IndexTagNode(*Child, DB);
-		}
-	}
-
-	return TagId;
-}
-
-void FGameplayTagIndexer::ScanAssetTagReferences(FMonolithIndexDatabase& DB)
-{
-	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-
-	TArray<FAssetData> AllAssets;
-	FARFilter Filter;
-	for (const FName& ContentPath : UMonolithSettings::GetIndexedContentPaths())
-	{
-		Filter.PackagePaths.Add(ContentPath);
-	}
-	Filter.bRecursivePaths = true;
-	Registry.GetAssets(Filter, AllAssets);
-
-	int32 RefsInserted = 0;
-
-	// The asset registry stores gameplay tags in asset metadata under known tag value keys.
-	// Common key names used by UE for GameplayTagContainers in asset registry:
 	static const FName OwnedGameplayTagsKey(TEXT("OwnedGameplayTags"));
 	static const FName GameplayTagsKey(TEXT("GameplayTags"));
 
-	for (const FAssetData& Asset : AllAssets)
+	/** 把提取出的 tag + context 追加进 payload。 */
+	static void AppendTagReference(
+		const FString& TagName,
+		const FString& Context,
+		MonolithSimpleArtifactSerialization::FTagReferencePayload& OutPayload)
 	{
-		int64 AssetId = DB.GetAssetId(Asset.PackageName.ToString());
-		if (AssetId < 0) continue;
+		if (TagName.IsEmpty())
+		{
+			return;
+		}
 
-		// Check known tag value keys in asset registry metadata
-		TArray<const FName*> TagKeys = { &OwnedGameplayTagsKey, &GameplayTagsKey };
+		MonolithSimpleArtifactSerialization::FTagReferencePayloadEntry Entry;
+		Entry.TagName = TagName;
+		Entry.Context = Context;
+		OutPayload.References.Add(MoveTemp(Entry));
+	}
 
-		for (const FName* KeyPtr : TagKeys)
+	/** 从 `TagName="Foo.Bar"` 这种结构体导出文本里把 tag 名抠出来。 */
+	static void AppendTagReferencesFromExportText(
+		const FString& Value,
+		const FString& Context,
+		MonolithSimpleArtifactSerialization::FTagReferencePayload& OutPayload)
+	{
+		FString Remaining = Value;
+		const FString TagToken = TEXT("TagName=\"");
+		int32 TokenPosition = INDEX_NONE;
+		while ((TokenPosition = Remaining.Find(TagToken, ESearchCase::CaseSensitive)) != INDEX_NONE)
+		{
+			Remaining.RightChopInline(TokenPosition + TagToken.Len());
+			const int32 EndQuote = Remaining.Find(TEXT("\""), ESearchCase::CaseSensitive);
+			if (EndQuote == INDEX_NONE)
+			{
+				break;
+			}
+
+			AppendTagReference(Remaining.Left(EndQuote), Context, OutPayload);
+			Remaining.RightChopInline(EndQuote + 1);
+		}
+	}
+
+	/** 从逗号分隔的简单列表里提取 tag 名。 */
+	static void AppendTagReferencesFromSimpleList(
+		const FString& Value,
+		const FString& Context,
+		MonolithSimpleArtifactSerialization::FTagReferencePayload& OutPayload)
+	{
+		TArray<FString> ParsedTags;
+		Value.ParseIntoArray(ParsedTags, TEXT(","));
+		for (FString& TagName : ParsedTags)
+		{
+			TagName.TrimStartAndEndInline();
+			AppendTagReference(TagName, Context, OutPayload);
+		}
+	}
+
+	/** 对单个元数据值选择合适的解析方式。 */
+	static void AppendTagReferencesFromValue(
+		const FString& Value,
+		const FString& Context,
+		MonolithSimpleArtifactSerialization::FTagReferencePayload& OutPayload)
+	{
+		if (Value.IsEmpty())
+		{
+			return;
+		}
+
+		if (Value.Contains(TEXT("TagName=\"")))
+		{
+			AppendTagReferencesFromExportText(Value, Context, OutPayload);
+			return;
+		}
+
+		AppendTagReferencesFromSimpleList(Value, Context, OutPayload);
+	}
+
+	/** 只从 AssetData 里提取“这份资产当前引用了哪些 tag”。 */
+	static bool BuildPayload(
+		const FAssetData& AssetData,
+		MonolithSimpleArtifactSerialization::FTagReferencePayload& OutPayload)
+	{
+		OutPayload = MonolithSimpleArtifactSerialization::FTagReferencePayload();
+		if (AssetData.PackageName.IsNone())
+		{
+			return false;
+		}
+
+		// 先走最常见的两个键，既容易读，也能避免后面的 EnumerateTags 重复处理。
+		for (const FName Key : { OwnedGameplayTagsKey, GameplayTagsKey })
 		{
 			FString TagValueString;
-			if (Asset.GetTagValue(*KeyPtr, TagValueString) && !TagValueString.IsEmpty())
+			if (AssetData.GetTagValue(Key, TagValueString))
 			{
-				// Parse the tag container string - format is comma-separated tag names
-				// or parenthesized format: (GameplayTags=((TagName="Tag.Name"),(TagName="Tag.Other")))
-				TArray<FString> ParsedTags;
-
-				if (TagValueString.Contains(TEXT("TagName=")))
-				{
-					// Structured format: extract TagName values
-					FString Remaining = TagValueString;
-					FString TagToken = TEXT("TagName=\"");
-					int32 Pos = 0;
-					while ((Pos = Remaining.Find(TagToken, ESearchCase::CaseSensitive)) != INDEX_NONE)
-					{
-						Remaining.RightChopInline(Pos + TagToken.Len());
-						int32 EndQuote = Remaining.Find(TEXT("\""), ESearchCase::CaseSensitive);
-						if (EndQuote != INDEX_NONE)
-						{
-							ParsedTags.Add(Remaining.Left(EndQuote));
-							Remaining.RightChopInline(EndQuote + 1);
-						}
-					}
-				}
-				else
-				{
-					// Simple comma-separated format
-					TagValueString.ParseIntoArray(ParsedTags, TEXT(","));
-					for (FString& Tag : ParsedTags)
-					{
-						Tag.TrimStartAndEndInline();
-					}
-				}
-
-				// Insert references for each found tag
-				FString Context = KeyPtr->ToString();
-				for (const FString& TagName : ParsedTags)
-				{
-					if (TagName.IsEmpty()) continue;
-
-					int64 TagId = DB.GetOrCreateTag(TagName, FString());
-					if (TagId < 0) continue;
-
-					FIndexedTagReference Ref;
-					Ref.TagId = TagId;
-					Ref.AssetId = AssetId;
-					Ref.Context = Context;
-					DB.InsertTagReference(Ref);
-					RefsInserted++;
-				}
+				AppendTagReferencesFromValue(TagValueString, Key.ToString(), OutPayload);
 			}
 		}
 
-		// Also scan all asset registry tag values for any that look like gameplay tags
-		// (custom properties that store FGameplayTag or FGameplayTagContainer)
-		Asset.EnumerateTags([&](TPair<FName, FAssetTagValueRef> TagPair)
+		AssetData.EnumerateTags([&OutPayload](const TPair<FName, FAssetTagValueRef>& TagPair)
 		{
-			// Skip the keys we already processed
 			if (TagPair.Key == OwnedGameplayTagsKey || TagPair.Key == GameplayTagsKey)
 			{
 				return;
 			}
 
-			FString Value = TagPair.Value.GetValue();
-			// Heuristic: if value contains "TagName=" it likely has gameplay tags
-			if (Value.Contains(TEXT("TagName=\"")))
+			const FString Value = TagPair.Value.GetValue();
+			if (!Value.Contains(TEXT("TagName=\"")))
 			{
-				FString Remaining = Value;
-				FString TagToken = TEXT("TagName=\"");
-				int32 Pos = 0;
-				while ((Pos = Remaining.Find(TagToken, ESearchCase::CaseSensitive)) != INDEX_NONE)
-				{
-					Remaining.RightChopInline(Pos + TagToken.Len());
-					int32 EndQuote = Remaining.Find(TEXT("\""), ESearchCase::CaseSensitive);
-					if (EndQuote != INDEX_NONE)
-					{
-						FString TagName = Remaining.Left(EndQuote);
-						Remaining.RightChopInline(EndQuote + 1);
-
-						if (!TagName.IsEmpty())
-						{
-							int64 TagId = DB.GetOrCreateTag(TagName, FString());
-							if (TagId < 0) return;
-
-							FIndexedTagReference Ref;
-							Ref.TagId = TagId;
-							Ref.AssetId = AssetId;
-							Ref.Context = TagPair.Key.ToString();
-							DB.InsertTagReference(Ref);
-							RefsInserted++;
-						}
-					}
-				}
+				return;
 			}
+
+			AppendTagReferencesFromExportText(Value, TagPair.Key.ToString(), OutPayload);
 		});
+
+		OutPayload.References.Sort([](
+			const MonolithSimpleArtifactSerialization::FTagReferencePayloadEntry& A,
+			const MonolithSimpleArtifactSerialization::FTagReferencePayloadEntry& B)
+		{
+			if (A.TagName != B.TagName)
+			{
+				return A.TagName < B.TagName;
+			}
+
+			return A.Context < B.Context;
+		});
+
+		return true;
+	}
+}
+
+bool FGameplayTagIndexer::BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact)
+{
+	(void)LoadedAsset;
+	(void)AssetRegistry;
+
+	MonolithSimpleArtifactSerialization::FTagReferencePayload Payload;
+	if (!GameplayTagIndexerInternal::BuildPayload(AssetData, Payload))
+	{
+		return false;
 	}
 
-	UE_LOG(LogMonolithIndex, Log, TEXT("GameplayTagIndexer: inserted %d tag references across assets"), RefsInserted);
+	OutArtifact = FMonolithArtifact();
+	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
+	OutArtifact.IndexerId = GetIndexerId();
+	OutArtifact.IndexerVersion = GetIndexerVersion();
+	OutArtifact.ExecutionMode = GetExecutionMode();
+	OutArtifact.PackageName = AssetData.PackageName.ToString();
+	MonolithSimpleArtifactSerialization::SerializeTagReferencePayload(Payload, OutArtifact.Payload);
+	return OutArtifact.Payload.Num() > 0;
+}
+
+bool FGameplayTagIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
+{
+	MonolithSimpleArtifactSerialization::FTagReferencePayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeTagReferencePayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeTagReferencePayload(Payload, DB, AssetId);
+}
+
+bool FGameplayTagIndexer::MaterializeArtifactToShadow(
+	const FMonolithArtifact& Artifact,
+	FMonolithIndexDatabase& DB,
+	int64 AssetId,
+	const FString& CohortName)
+{
+	MonolithSimpleArtifactSerialization::FTagReferencePayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeTagReferencePayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeTagReferencePayloadToShadow(Payload, DB, AssetId, CohortName);
 }

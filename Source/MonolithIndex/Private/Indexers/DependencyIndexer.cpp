@@ -1,73 +1,119 @@
 #include "Indexers/DependencyIndexer.h"
-#include "AssetRegistry/AssetRegistryModule.h"
+
 #include "AssetRegistry/IAssetRegistry.h"
+#include "Indexers/MonolithSimpleArtifactSerialization.h"
 
-bool FDependencyIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
+/*
+ * DependencyIndexer 的核心目标是“只维护一份 dependency 真相”：
+ * - 生产路径直接把 payload 回放到正式表；
+ * - artifact 路径把同一份 payload 写进缓存；
+ * - shadow 路径把同一份 payload 回放到影子表。
+ *
+ * 这样就不会出现“正式索引逻辑一套，artifact 逻辑又偷偷是另一套”的重复实现。
+ */
+
+namespace DependencyIndexerInternal
 {
-	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
-
-	TArray<FAssetData> AllAssets;
-	FARFilter Filter;
-	if (IndexedPaths.Num() > 0)
+	/** 直接从 Asset Registry 读取某个包的依赖关系，并转成稳定 payload。 */
+	static bool BuildPayload(
+		const FAssetData& AssetData,
+		IAssetRegistry& Registry,
+		MonolithSimpleArtifactSerialization::FDependencyPayload& OutPayload)
 	{
-		for (const FName& Path : IndexedPaths)
+		OutPayload = MonolithSimpleArtifactSerialization::FDependencyPayload();
+		if (AssetData.PackageName.IsNone())
 		{
-			Filter.PackagePaths.Add(Path);
-		}
-	}
-	else
-	{
-		Filter.PackagePaths.Add(FName(TEXT("/Game")));
-	}
-	Filter.bRecursivePaths = true;
-	Registry.GetAssets(Filter, AllAssets);
-
-	int32 DepsInserted = 0;
-
-	for (const FAssetData& Source : AllAssets)
-	{
-		int64 SourceId = DB.GetAssetId(Source.PackageName.ToString());
-		if (SourceId < 0) continue;
-
-		TArray<FAssetIdentifier> HardDeps;
-		Registry.GetDependencies(Source.PackageName, HardDeps,
-			UE::AssetRegistry::EDependencyCategory::Package,
-			UE::AssetRegistry::EDependencyQuery::Hard);
-
-		for (const FAssetIdentifier& Dep : HardDeps)
-		{
-			FString DepPath = Dep.PackageName.ToString();
-			int64 TargetId = DB.GetAssetId(DepPath);
-			if (TargetId < 0) continue;
-
-			FIndexedDependency IndexedDep;
-			IndexedDep.SourceAssetId = SourceId;
-			IndexedDep.TargetAssetId = TargetId;
-			IndexedDep.DependencyType = TEXT("Hard");
-			DB.InsertDependency(IndexedDep);
-			DepsInserted++;
+			return false;
 		}
 
-		TArray<FAssetIdentifier> SoftDeps;
-		Registry.GetDependencies(Source.PackageName, SoftDeps,
-			UE::AssetRegistry::EDependencyCategory::Package,
-			UE::AssetRegistry::EDependencyQuery::Soft);
-
-		for (const FAssetIdentifier& Dep : SoftDeps)
+		auto AppendDependencies = [&Registry, &AssetData, &OutPayload](
+			const UE::AssetRegistry::EDependencyQuery Query,
+			const TCHAR* DependencyType)
 		{
-			FString DepPath = Dep.PackageName.ToString();
-			int64 TargetId = DB.GetAssetId(DepPath);
-			if (TargetId < 0) continue;
+			TArray<FAssetIdentifier> Dependencies;
+			Registry.GetDependencies(
+				AssetData.PackageName,
+				Dependencies,
+				UE::AssetRegistry::EDependencyCategory::Package,
+				Query);
 
-			FIndexedDependency IndexedDep;
-			IndexedDep.SourceAssetId = SourceId;
-			IndexedDep.TargetAssetId = TargetId;
-			IndexedDep.DependencyType = TEXT("Soft");
-			DB.InsertDependency(IndexedDep);
-			DepsInserted++;
-		}
+			for (const FAssetIdentifier& DependencyIdentifier : Dependencies)
+			{
+				if (DependencyIdentifier.PackageName.IsNone())
+				{
+					continue;
+				}
+
+				// artifact 里只保留真正稳定的语义字段：
+				// 目标包路径 + 依赖类型。
+				MonolithSimpleArtifactSerialization::FDependencyPayloadEntry Entry;
+				Entry.TargetPackagePath = DependencyIdentifier.PackageName.ToString();
+				Entry.DependencyType = DependencyType;
+				OutPayload.Dependencies.Add(MoveTemp(Entry));
+			}
+		};
+
+		AppendDependencies(UE::AssetRegistry::EDependencyQuery::Hard, TEXT("Hard"));
+		AppendDependencies(UE::AssetRegistry::EDependencyQuery::Soft, TEXT("Soft"));
+
+		OutPayload.Dependencies.Sort([](
+			const MonolithSimpleArtifactSerialization::FDependencyPayloadEntry& A,
+			const MonolithSimpleArtifactSerialization::FDependencyPayloadEntry& B)
+		{
+			if (A.TargetPackagePath != B.TargetPackagePath)
+			{
+				return A.TargetPackagePath < B.TargetPackagePath;
+			}
+
+			return A.DependencyType < B.DependencyType;
+		});
+
+		return true;
+	}
+}
+
+bool FDependencyIndexer::BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact)
+{
+	(void)LoadedAsset;
+
+	MonolithSimpleArtifactSerialization::FDependencyPayload Payload;
+	if (!DependencyIndexerInternal::BuildPayload(AssetData, AssetRegistry, Payload))
+	{
+		return false;
 	}
 
-	UE_LOG(LogMonolithIndex, Log, TEXT("DependencyIndexer: inserted %d dependency edges"), DepsInserted);
-	return true;
+	OutArtifact = FMonolithArtifact();
+	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
+	OutArtifact.IndexerId = GetIndexerId();
+	OutArtifact.IndexerVersion = GetIndexerVersion();
+	OutArtifact.ExecutionMode = GetExecutionMode();
+	OutArtifact.PackageName = AssetData.PackageName.ToString();
+	MonolithSimpleArtifactSerialization::SerializeDependencyPayload(Payload, OutArtifact.Payload);
+	return OutArtifact.Payload.Num() > 0;
+}
+
+bool FDependencyIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
+{
+	MonolithSimpleArtifactSerialization::FDependencyPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeDependencyPayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeDependencyPayload(Payload, DB, AssetId);
+}
+
+bool FDependencyIndexer::MaterializeArtifactToShadow(
+	const FMonolithArtifact& Artifact,
+	FMonolithIndexDatabase& DB,
+	int64 AssetId,
+	const FString& CohortName)
+{
+	MonolithSimpleArtifactSerialization::FDependencyPayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeDependencyPayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeDependencyPayloadToShadow(Payload, DB, AssetId, CohortName);
 }

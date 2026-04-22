@@ -1,12 +1,10 @@
 #include "MonolithMeshTemplateActions.h"
 #include "MonolithMeshUtils.h"
-#include "MonolithMeshCatalog.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithIndexSubsystem.h"
-#include "MonolithIndexDatabase.h"
 
 #include "Engine/StaticMesh.h"
 #include "MeshDescription.h"
@@ -14,7 +12,6 @@
 #include "StaticMeshResources.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
-#include "SQLiteDatabase.h"
 #include "Editor.h"
 
 // ============================================================================
@@ -31,16 +28,10 @@
 
 namespace MeshValidationHelpers
 {
-	/** Get catalog database, or nullptr */
-	FSQLiteDatabase* GetCatalogDB()
+	/** 统一从 MonolithIndex 子系统拿 mesh catalog 查询入口。 */
+	UMonolithIndexSubsystem* GetIndexSubsystem()
 	{
-		UMonolithIndexSubsystem* IndexSub = GEditor ?
-			GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>() : nullptr;
-		if (!IndexSub || !IndexSub->GetDatabase())
-		{
-			return nullptr;
-		}
-		return IndexSub->GetDatabase()->GetRawDatabase();
+		return GEditor ? GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>() : nullptr;
 	}
 
 	/** Severity string to numeric priority (lower = more severe) */
@@ -437,68 +428,48 @@ FMonolithActionResult FMonolithMeshTemplateActions::BatchValidate(const TSharedP
 	TArray<TSharedPtr<FJsonValue>> IssuesArr;
 	int32 TotalScanned = 0;
 	int32 TotalFlagged = 0;
-	int32 SQLFiltered = 0;
+	int32 CatalogFiltered = 0;
 
-	// === Pass 1: Fast SQL pre-filter from mesh_catalog ===
+	// === Pass 1: Fast catalog pre-filter from mesh_catalog ===
 	TArray<FString> FlaggedPaths;
-	TMap<FString, TArray<FString>> SQLIssues; // asset_path -> list of issue descriptions
+	TMap<FString, TArray<FString>> CatalogIssues; // asset_path -> list of issue descriptions
 
-	FSQLiteDatabase* DB = MeshValidationHelpers::GetCatalogDB();
-	if (DB)
+	UMonolithIndexSubsystem* IndexSubsystem = MeshValidationHelpers::GetIndexSubsystem();
+	const TArray<FIndexedMeshCatalogEntry> CatalogEntries = IndexSubsystem
+		? IndexSubsystem->GetMeshCatalogEntries(PathFilter)
+		: TArray<FIndexedMeshCatalogEntry>();
+	if (IndexSubsystem)
 	{
-		// Build SQL to find meshes with obvious issues
-		FString SQL = TEXT(
-			"SELECT asset_path, tri_count, has_collision, lod_count, degenerate, pivot_offset_z "
-			"FROM mesh_catalog WHERE 1=1"
-		);
-
-		if (!PathFilter.IsEmpty())
+		for (const FIndexedMeshCatalogEntry& CatalogEntry : CatalogEntries)
 		{
-			SQL += FString::Printf(TEXT(" AND asset_path LIKE '%%%s%%'"), *PathFilter);
-		}
-
-		FSQLitePreparedStatement Stmt;
-		Stmt.Create(*DB, *SQL);
-
-		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
-		{
-			FString AssetPath;
-			int64 TriCount = 0, HasCollision = 0, LodCount = 0, Degenerate = 0;
-			double PivotOffsetZ = 0.0;
-
-			Stmt.GetColumnValueByIndex(0, AssetPath);
-			Stmt.GetColumnValueByIndex(1, TriCount);
-			Stmt.GetColumnValueByIndex(2, HasCollision);
-			Stmt.GetColumnValueByIndex(3, LodCount);
-			Stmt.GetColumnValueByIndex(4, Degenerate);
-			Stmt.GetColumnValueByIndex(5, PivotOffsetZ);
-
 			TotalScanned++;
 			TArray<FString> Issues;
 
 			// CRITICAL: no collision
-			if (HasCollision == 0 && MinSeverityPriority >= MeshValidationHelpers::SeverityPriority(TEXT("CRITICAL")))
+			if (!CatalogEntry.bHasCollision && MinSeverityPriority >= MeshValidationHelpers::SeverityPriority(TEXT("CRITICAL")))
 			{
 				Issues.Add(TEXT("CRITICAL: No collision setup"));
 			}
 
 			// HIGH: >1K tris with no LODs
-			if (TriCount > 1000 && LodCount <= 1 && MinSeverityPriority >= MeshValidationHelpers::SeverityPriority(TEXT("HIGH")))
+			if (CatalogEntry.TriCount > 1000
+				&& CatalogEntry.LodCount <= 1
+				&& MinSeverityPriority >= MeshValidationHelpers::SeverityPriority(TEXT("HIGH")))
 			{
-				Issues.Add(FString::Printf(TEXT("HIGH: %lld tris with only %lld LOD"), TriCount, LodCount));
+				Issues.Add(FString::Printf(TEXT("HIGH: %d tris with only %d LOD"), CatalogEntry.TriCount, CatalogEntry.LodCount));
 			}
 
 			// MEDIUM: degenerate
-			if (Degenerate != 0 && MinSeverityPriority >= MeshValidationHelpers::SeverityPriority(TEXT("MEDIUM")))
+			if (CatalogEntry.bDegenerate && MinSeverityPriority >= MeshValidationHelpers::SeverityPriority(TEXT("MEDIUM")))
 			{
 				Issues.Add(TEXT("MEDIUM: Has degenerate geometry"));
 			}
 
 			if (Issues.Num() > 0)
 			{
-				FlaggedPaths.Add(AssetPath);
-				SQLIssues.Add(AssetPath, Issues);
-				SQLFiltered++;
+				FlaggedPaths.Add(CatalogEntry.AssetPath);
+				CatalogIssues.Add(CatalogEntry.AssetPath, Issues);
+				CatalogFiltered++;
 			}
 		}
 	}
@@ -509,11 +480,11 @@ FMonolithActionResult FMonolithMeshTemplateActions::BatchValidate(const TSharedP
 		auto IssueObj = MakeShared<FJsonObject>();
 		IssueObj->SetStringField(TEXT("asset_path"), AssetPath);
 
-		// SQL issues
+		// 目录预筛问题
 		TArray<TSharedPtr<FJsonValue>> IssueList;
-		if (TArray<FString>* SQLIssueList = SQLIssues.Find(AssetPath))
+		if (TArray<FString>* CatalogIssueList = CatalogIssues.Find(AssetPath))
 		{
-			for (const FString& Issue : *SQLIssueList)
+			for (const FString& Issue : *CatalogIssueList)
 			{
 				auto IssueEntry = MakeShared<FJsonObject>();
 				// Parse severity from prefix
@@ -596,12 +567,12 @@ FMonolithActionResult FMonolithMeshTemplateActions::BatchValidate(const TSharedP
 	Result->SetArrayField(TEXT("flagged_assets"), IssuesArr);
 	Result->SetNumberField(TEXT("total_scanned"), TotalScanned);
 	Result->SetNumberField(TEXT("total_flagged"), TotalFlagged);
-	Result->SetNumberField(TEXT("sql_pre_filtered"), SQLFiltered);
-	Result->SetBoolField(TEXT("catalog_available"), DB != nullptr);
+	Result->SetNumberField(TEXT("catalog_pre_filtered"), CatalogFiltered);
+	Result->SetBoolField(TEXT("catalog_available"), IndexSubsystem != nullptr);
 
-	if (!DB)
+	if (!IndexSubsystem)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("Mesh catalog not available — run monolith_reindex() first for SQL pre-filtering. Falling back to slower asset-load validation."));
+		Result->SetStringField(TEXT("warning"), TEXT("Mesh catalog not available — run monolith_reindex() first for catalog pre-filtering. Falling back to slower asset-load validation."));
 	}
 
 	return FMonolithActionResult::Success(Result);

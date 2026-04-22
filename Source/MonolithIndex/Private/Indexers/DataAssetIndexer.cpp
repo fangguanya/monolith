@@ -1,62 +1,134 @@
 #include "Indexers/DataAssetIndexer.h"
+#include "Engine/DataAsset.h"
 #include "UObject/UnrealType.h"
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 
-bool FDataAssetIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
+/*
+ * DataAssetIndexer 的目标很直接：
+ * 把“主要靠 UPROPERTY 配出来的资产”翻译成 Monolith 能搜索、能 diff 的统一结构。
+ *
+ * 这里我们会生成两层结果：
+ * 1. 一个 node：保存整份属性树的大 JSON 快照；
+ * 2. 一组 variables：把每个重要属性拆成独立行，方便全文搜索和 shadow diff。
+ */
+
+bool FDataAssetIndexer::ShouldSkipNodeProperty(const FProperty* Prop)
 {
-	if (!LoadedAsset) return false;
+	return !Prop
+		|| Prop->GetOwnerClass() == UObject::StaticClass()
+		|| Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient);
+}
 
-	TSharedPtr<FJsonObject> Props = SerializeObjectProperties(LoadedAsset);
-	if (!Props) return false;
+bool FDataAssetIndexer::ShouldSkipVariableProperty(const FProperty* Prop)
+{
+	return ShouldSkipNodeProperty(Prop)
+		|| Prop->GetOwnerClass() == UDataAsset::StaticClass();
+}
 
-	FString PropsStr;
-	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&PropsStr);
-	FJsonSerializer::Serialize(Props, *Writer, true);
+bool FDataAssetIndexer::BuildPayload(UObject* Object, MonolithSimpleArtifactSerialization::FNodeVariablePayload& OutPayload)
+{
+	if (!Object)
+	{
+		return false;
+	}
 
-	FIndexedNode Node;
-	Node.AssetId = AssetId;
-	Node.NodeType = TEXT("DataAsset");
-	Node.NodeName = LoadedAsset->GetName();
-	Node.NodeClass = LoadedAsset->GetClass()->GetName();
-	Node.Properties = PropsStr;
-	DB.InsertNode(Node);
+	TSharedPtr<FJsonObject> Props = SerializeObjectProperties(Object);
+	if (!Props)
+	{
+		return false;
+	}
 
-	// Also index individual properties as variables for FTS search
-	UClass* ObjClass = LoadedAsset->GetClass();
+	OutPayload = MonolithSimpleArtifactSerialization::FNodeVariablePayload();
+	OutPayload.Node.NodeType = TEXT("DataAsset");
+	OutPayload.Node.NodeName = Object->GetName();
+	OutPayload.Node.NodeClass = Object->GetClass()->GetName();
+
+	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutPayload.Node.Properties);
+	if (!FJsonSerializer::Serialize(Props, *Writer, true))
+	{
+		return false;
+	}
+
+	UClass* ObjClass = Object->GetClass();
 	for (TFieldIterator<FProperty> It(ObjClass, EFieldIteratorFlags::IncludeSuper, EFieldIteratorFlags::ExcludeDeprecated); It; ++It)
 	{
 		FProperty* Prop = *It;
-		if (!Prop) continue;
-		if (Prop->GetOwnerClass() == UObject::StaticClass()) continue;
-		if (Prop->GetOwnerClass() == UDataAsset::StaticClass()) continue;
-		if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+		if (ShouldSkipVariableProperty(Prop))
+		{
+			continue;
+		}
 
-		const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(LoadedAsset);
+		const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Object);
 
 		FString DefaultStr;
-		Prop->ExportTextItem_Direct(DefaultStr, ValuePtr, nullptr, LoadedAsset, PPF_None);
+		Prop->ExportTextItem_Direct(DefaultStr, ValuePtr, nullptr, Object, PPF_None);
 
-		if (DefaultStr.IsEmpty() || DefaultStr == TEXT("None") || DefaultStr == TEXT("()")) continue;
+		// 空值、None 和空括号通常没什么搜索意义，跳过能让结果更干净。
+		if (DefaultStr.IsEmpty() || DefaultStr == TEXT("None") || DefaultStr == TEXT("()"))
+		{
+			continue;
+		}
 
 		FIndexedVariable Var;
-		Var.AssetId = AssetId;
 		Var.VarName = Prop->GetName();
 		Var.VarType = Prop->GetCPPType();
 		Var.Category = Prop->GetMetaData(TEXT("Category"));
 		Var.DefaultValue = DefaultStr;
 		Var.bIsExposed = false;
 		Var.bIsReplicated = !!(Prop->PropertyFlags & CPF_Net);
-
-		DB.InsertVariable(Var);
+		OutPayload.Variables.Add(MoveTemp(Var));
 	}
 
 	return true;
 }
 
+bool FDataAssetIndexer::BuildArtifact(const FAssetData& AssetData, UObject* LoadedAsset, IAssetRegistry& AssetRegistry, FMonolithArtifact& OutArtifact)
+{
+	MonolithSimpleArtifactSerialization::FNodeVariablePayload Payload;
+	if (!BuildPayload(LoadedAsset, Payload))
+	{
+		return false;
+	}
+
+	OutArtifact = FMonolithArtifact();
+	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
+	OutArtifact.IndexerId = GetIndexerId();
+	OutArtifact.IndexerVersion = GetIndexerVersion();
+	OutArtifact.ExecutionMode = GetExecutionMode();
+	OutArtifact.PackageName = AssetData.PackageName.ToString();
+	MonolithSimpleArtifactSerialization::SerializeNodeVariablePayload(Payload, OutArtifact.Payload);
+	return OutArtifact.Payload.Num() > 0;
+}
+
+bool FDataAssetIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
+{
+	MonolithSimpleArtifactSerialization::FNodeVariablePayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeNodeVariablePayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeNodeVariablePayload(Payload, DB, AssetId);
+}
+
+bool FDataAssetIndexer::MaterializeArtifactToShadow(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId, const FString& CohortName)
+{
+	MonolithSimpleArtifactSerialization::FNodeVariablePayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeNodeVariablePayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeNodeVariablePayloadToShadow(Payload, DB, AssetId, CohortName);
+}
+
 TSharedPtr<FJsonObject> FDataAssetIndexer::SerializeObjectProperties(UObject* Object)
 {
-	if (!Object) return nullptr;
+	if (!Object)
+	{
+		return nullptr;
+	}
 
 	auto Root = MakeShared<FJsonObject>();
 	UClass* ObjClass = Object->GetClass();
@@ -67,9 +139,10 @@ TSharedPtr<FJsonObject> FDataAssetIndexer::SerializeObjectProperties(UObject* Ob
 	for (TFieldIterator<FProperty> It(ObjClass, EFieldIteratorFlags::IncludeSuper, EFieldIteratorFlags::ExcludeDeprecated); It; ++It)
 	{
 		FProperty* Prop = *It;
-		if (!Prop) continue;
-		if (Prop->GetOwnerClass() == UObject::StaticClass()) continue;
-		if (Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient)) continue;
+		if (ShouldSkipNodeProperty(Prop))
+		{
+			continue;
+		}
 
 		const void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Object);
 		PropsObj->SetField(Prop->GetName(), PropertyToJsonValue(Prop, ValuePtr, Object));
@@ -81,7 +154,10 @@ TSharedPtr<FJsonObject> FDataAssetIndexer::SerializeObjectProperties(UObject* Ob
 
 TSharedPtr<FJsonValue> FDataAssetIndexer::PropertyToJsonValue(FProperty* Prop, const void* ValuePtr, const UObject* Owner)
 {
-	if (!Prop || !ValuePtr) return MakeShared<FJsonValueNull>();
+	if (!Prop || !ValuePtr)
+	{
+		return MakeShared<FJsonValueNull>();
+	}
 
 	if (const FNumericProperty* NumProp = CastField<FNumericProperty>(Prop))
 	{
@@ -94,13 +170,19 @@ TSharedPtr<FJsonValue> FDataAssetIndexer::PropertyToJsonValue(FProperty* Prop, c
 			}
 		}
 		if (NumProp->IsInteger())
+		{
 			return MakeShared<FJsonValueNumber>(static_cast<double>(NumProp->GetSignedIntPropertyValue(ValuePtr)));
+		}
 		if (NumProp->IsFloatingPoint())
+		{
 			return MakeShared<FJsonValueNumber>(NumProp->GetFloatingPointPropertyValue(ValuePtr));
+		}
 	}
 
 	if (const FBoolProperty* BoolProp = CastField<FBoolProperty>(Prop))
+	{
 		return MakeShared<FJsonValueBoolean>(BoolProp->GetPropertyValue(ValuePtr));
+	}
 
 	if (const FEnumProperty* EnumProp = CastField<FEnumProperty>(Prop))
 	{
@@ -110,11 +192,17 @@ TSharedPtr<FJsonValue> FDataAssetIndexer::PropertyToJsonValue(FProperty* Prop, c
 	}
 
 	if (const FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+	{
 		return MakeShared<FJsonValueString>(StrProp->GetPropertyValue(ValuePtr));
+	}
 	if (const FNameProperty* NameProp = CastField<FNameProperty>(Prop))
+	{
 		return MakeShared<FJsonValueString>(NameProp->GetPropertyValue(ValuePtr).ToString());
+	}
 	if (const FTextProperty* TextProp = CastField<FTextProperty>(Prop))
+	{
 		return MakeShared<FJsonValueString>(TextProp->GetPropertyValue(ValuePtr).ToString());
+	}
 
 	if (const FSoftObjectProperty* SoftProp = CastField<FSoftObjectProperty>(Prop))
 	{
@@ -154,7 +242,9 @@ TSharedPtr<FJsonValue> FDataAssetIndexer::PropertyToJsonValue(FProperty* Prop, c
 		TArray<TSharedPtr<FJsonValue>> Arr;
 		FScriptArrayHelper Helper(ArrayProp, ValuePtr);
 		for (int32 i = 0; i < Helper.Num(); ++i)
+		{
 			Arr.Add(PropertyToJsonValue(ArrayProp->Inner, Helper.GetRawPtr(i), Owner));
+		}
 		return MakeShared<FJsonValueArray>(Arr);
 	}
 
@@ -165,7 +255,9 @@ TSharedPtr<FJsonValue> FDataAssetIndexer::PropertyToJsonValue(FProperty* Prop, c
 		for (int32 i = 0; i < Helper.Num(); ++i)
 		{
 			if (Helper.IsValidIndex(i))
+			{
 				Arr.Add(PropertyToJsonValue(SetProp->ElementProp, Helper.GetElementPtr(i), Owner));
+			}
 		}
 		return MakeShared<FJsonValueArray>(Arr);
 	}

@@ -1,32 +1,28 @@
 #include "Actions/ProjectFindByTypeAction.h"
+#include "Actions/MonolithProjectActionUtils.h"
 #include "MonolithIndexSubsystem.h"
 #include "MonolithParamSchema.h"
-#include "Editor.h"
 
 FMonolithActionResult FProjectFindByTypeAction::Execute(const TSharedPtr<FJsonObject>& Params)
 {
-	FString AssetClass = Params->GetStringField(TEXT("asset_type"));
+	FString AssetClass = MonolithProjectActionUtils::GetOptionalStringParam(Params, TEXT("asset_type"));
 	if (AssetClass.IsEmpty())
 	{
-		AssetClass = Params->GetStringField(TEXT("asset_class"));
+		AssetClass = MonolithProjectActionUtils::GetOptionalStringParam(Params, TEXT("asset_class"));
 	}
-	int32 Limit = Params->HasField(TEXT("limit")) ? Params->GetIntegerField(TEXT("limit")) : 100;
-	int32 Offset = Params->HasField(TEXT("offset")) ? Params->GetIntegerField(TEXT("offset")) : 0;
-	FString ModuleFilter;
-	if (Params->HasField(TEXT("module")))
-	{
-		ModuleFilter = Params->GetStringField(TEXT("module"));
-	}
+	const int32 Limit = MonolithProjectActionUtils::GetOptionalIntParam(Params, TEXT("limit"), 100);
+	const int32 Offset = MonolithProjectActionUtils::GetOptionalIntParam(Params, TEXT("offset"), 0);
+	const FString ModuleFilter = MonolithProjectActionUtils::GetOptionalStringParam(Params, TEXT("module"));
 
 	if (AssetClass.IsEmpty())
 	{
 		return FMonolithActionResult::Error(TEXT("'asset_type' (or 'asset_class') parameter is required"), -32602);
 	}
 
-	UMonolithIndexSubsystem* Subsystem = GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>();
+	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
 	if (!Subsystem)
 	{
-		return FMonolithActionResult::Error(TEXT("Index subsystem not available"));
+		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
 	}
 
 	TArray<FIndexedAsset> Assets = Subsystem->FindByType(AssetClass, Limit, Offset);

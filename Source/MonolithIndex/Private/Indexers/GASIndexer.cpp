@@ -1,872 +1,763 @@
 #include "Indexers/GASIndexer.h"
-#include "MonolithSettings.h"
-#include "AssetRegistry/AssetRegistryModule.h"
-#include "AssetRegistry/IAssetRegistry.h"
-#include "Engine/Blueprint.h"
-#include "UObject/UObjectIterator.h"
-#include "Serialization/JsonWriter.h"
-#include "Serialization/JsonSerializer.h"
-#include "GameplayTagContainer.h"
-#include "GameplayAbilitySpec.h"
+
 #include "Abilities/GameplayAbility.h"
-#include "GameplayEffect.h"
+#include "AssetRegistry/IAssetRegistry.h"
 #include "AttributeSet.h"
-#include "GameplayCueNotify_Static.h"
+#include "Engine/Blueprint.h"
 #include "GameplayCueNotify_Actor.h"
+#include "GameplayCueNotify_Static.h"
+#include "GameplayEffect.h"
+#include "GameplayTagContainer.h"
+#include "Indexers/MonolithSimpleArtifactSerialization.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
+#include "UObject/UnrealType.h"
 
-// ─────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────
+/*
+ * 这份实现只做一件事：
+ * “把单个 GAS Blueprint 的关键玩法配置，整理成 1 条结构化 node。”
+ *
+ * 这轮继续往前收口后，GAS 不再分别维护：
+ * - 直接写生产表的一套逻辑；
+ * - 构建 artifact 的一套逻辑；
+ * - 写 shadow 表的另一套逻辑。
+ *
+ * 现在统一改成：
+ * 1. 先构建 1 条稳定 node；
+ * 2. 再根据需要把这条 node 序列化成 artifact；
+ * 3. 最后由统一 helper 回放到生产表或 shadow 表。
+ *
+ * 这样 full / incremental / live / shadow / warmup / DDC
+ * 就都在复用同一份“GAS 资产到底长什么样”的真相来源。
+ */
 
-FString FGASIndexer::JsonToString(TSharedPtr<FJsonObject> JsonObj)
+namespace GASIndexerInternal
 {
-	FString Out;
-	auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Out);
-	FJsonSerializer::Serialize(JsonObj, *Writer, true);
-	return Out;
-}
-
-TArray<TSharedPtr<FJsonValue>> FGASIndexer::ExtractTagContainer(UObject* CDO, const FString& PropertyName)
-{
-	TArray<TSharedPtr<FJsonValue>> Result;
-	if (!CDO) return Result;
-
-	FProperty* Prop = CDO->GetClass()->FindPropertyByName(*PropertyName);
-	if (!Prop) return Result;
-
-	// FGameplayTagContainer is a struct property
-	FStructProperty* StructProp = CastField<FStructProperty>(Prop);
-	if (!StructProp) return Result;
-
-	const void* ValuePtr = StructProp->ContainerPtrToValuePtr<void>(CDO);
-	const FGameplayTagContainer* TagContainer = static_cast<const FGameplayTagContainer*>(ValuePtr);
-	if (!TagContainer) return Result;
-
-	for (const FGameplayTag& Tag : *TagContainer)
+	/** 这份 Blueprint 到底属于哪一类 GAS 资产。 */
+	enum class EGASBlueprintKind : uint8
 	{
-		Result.Add(MakeShared<FJsonValueString>(Tag.ToString()));
-	}
-	return Result;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Helper: find Blueprint CDOs by native parent class
-// ─────────────────────────────────────────────────────────────
-
-namespace
-{
-	struct FBPWithCDO
-	{
-		UObject* CDO;
-		FString AssetPath;
-		int64 AssetId;
+		/** 不是 GAS Blueprint。 */
+		None,
+		/** GameplayAbility Blueprint。 */
+		GameplayAbility,
+		/** GameplayEffect Blueprint。 */
+		GameplayEffect,
+		/** AttributeSet Blueprint。 */
+		AttributeSet,
+		/** GameplayCue 静态通知 Blueprint。 */
+		GameplayCueStatic,
+		/** GameplayCue Actor 通知 Blueprint。 */
+		GameplayCueActor,
 	};
 
-	TArray<FBPWithCDO> FindBlueprintCDOsOfClass(UClass* NativeBaseClass, FMonolithIndexDatabase& DB)
+	/** 两个常见 Blueprint 父类标签名。 */
+	static const FName ParentClassTagName(TEXT("ParentClass"));
+	static const FName NativeParentClassTagName(TEXT("NativeParentClass"));
+
+	/** 把 JSON 对象压成紧凑字符串，方便直接存进 node.properties。 */
+	static bool SerializeJsonObject(const TSharedPtr<FJsonObject>& Object, FString& OutJson)
 	{
-		TArray<FBPWithCDO> Results;
-		IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+		auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutJson);
+		return FJsonSerializer::Serialize(Object.ToSharedRef(), Writer);
+	}
 
-		TArray<FAssetData> BPAssets;
-		FARFilter Filter;
-		for (const FName& ContentPath : UMonolithSettings::GetIndexedContentPaths())
+	/** 默认 node 名更偏向“人类正在操作的那份资产名”，而不是生成类名。 */
+	static FString ResolveNodeName(const FAssetData& AssetData, const UBlueprint* Blueprint)
+	{
+		if (!AssetData.AssetName.IsNone())
 		{
-			Filter.PackagePaths.Add(ContentPath);
+			return AssetData.AssetName.ToString();
 		}
-		Filter.bRecursivePaths = true;
-		Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
-		Registry.GetAssets(Filter, BPAssets);
 
-		// Compiler-idle gate is enforced by FMonolithCompilerSafeDispatch at the call site (see issue #19).
-
-		for (const FAssetData& AssetData : BPAssets)
+		if (Blueprint)
 		{
-			UBlueprint* BP = Cast<UBlueprint>(AssetData.GetAsset());
-			if (!BP || !BP->GeneratedClass) continue;
-			if (!BP->GeneratedClass->IsChildOf(NativeBaseClass)) continue;
-
-			UObject* CDO = BP->GeneratedClass->GetDefaultObject(false);
-			if (!CDO) continue;
-
-			int64 Id = DB.GetAssetId(AssetData.PackageName.ToString());
-			if (Id < 0) continue;
-
-			Results.Add({ CDO, AssetData.GetObjectPathString(), Id });
+			return Blueprint->GetName();
 		}
-		return Results;
+
+		return TEXT("UnnamedGASAsset");
+	}
+
+	/** 从 AssetData 里拿父类标签。
+	 * Blueprint 资产有时写 `NativeParentClass`，有时写 `ParentClass`，这里统一兜底。 */
+	static FString GetBlueprintParentClassTag(const FAssetData& AssetData)
+	{
+		FString ParentClassPath;
+		if (AssetData.GetTagValue(NativeParentClassTagName, ParentClassPath) && !ParentClassPath.IsEmpty())
+		{
+			return ParentClassPath;
+		}
+
+		AssetData.GetTagValue(ParentClassTagName, ParentClassPath);
+		return ParentClassPath;
+	}
+
+	/** 仅凭父类路径字符串判断 GAS 类型。
+	 * 这里故意使用 `Contains(...)`，因为不同工程/蓝图层级下路径形式会有细微差异，
+	 * 但类型名关键字保持稳定。 */
+	static EGASBlueprintKind ResolveKindFromParentClassPath(const FString& ParentClassPath)
+	{
+		if (ParentClassPath.Contains(TEXT("GameplayAbility")))
+		{
+			return EGASBlueprintKind::GameplayAbility;
+		}
+		if (ParentClassPath.Contains(TEXT("GameplayEffect")))
+		{
+			return EGASBlueprintKind::GameplayEffect;
+		}
+		if (ParentClassPath.Contains(TEXT("AttributeSet")))
+		{
+			return EGASBlueprintKind::AttributeSet;
+		}
+		if (ParentClassPath.Contains(TEXT("GameplayCueNotify_Actor")))
+		{
+			return EGASBlueprintKind::GameplayCueActor;
+		}
+		if (ParentClassPath.Contains(TEXT("GameplayCueNotify_Static")) || ParentClassPath.Contains(TEXT("GameplayCueNotify")))
+		{
+			return EGASBlueprintKind::GameplayCueStatic;
+		}
+
+		return EGASBlueprintKind::None;
+	}
+
+	/** 如果 Blueprint 已经加载，就优先用 GeneratedClass 做更准确的类型判断。 */
+	static EGASBlueprintKind ResolveKindFromLoadedBlueprint(const UBlueprint* Blueprint)
+	{
+		if (!Blueprint || !Blueprint->GeneratedClass)
+		{
+			return EGASBlueprintKind::None;
+		}
+
+		const UClass* GeneratedClass = Blueprint->GeneratedClass;
+		if (GeneratedClass->IsChildOf(UGameplayAbility::StaticClass()))
+		{
+			return EGASBlueprintKind::GameplayAbility;
+		}
+		if (GeneratedClass->IsChildOf(UGameplayEffect::StaticClass()))
+		{
+			return EGASBlueprintKind::GameplayEffect;
+		}
+		if (GeneratedClass->IsChildOf(UAttributeSet::StaticClass()))
+		{
+			return EGASBlueprintKind::AttributeSet;
+		}
+		if (GeneratedClass->IsChildOf(AGameplayCueNotify_Actor::StaticClass()))
+		{
+			return EGASBlueprintKind::GameplayCueActor;
+		}
+		if (GeneratedClass->IsChildOf(UGameplayCueNotify_Static::StaticClass()))
+		{
+			return EGASBlueprintKind::GameplayCueStatic;
+		}
+
+		return EGASBlueprintKind::None;
+	}
+
+	/** 统一解析“这份资产是不是 GAS Blueprint、具体是哪种”。 */
+	static EGASBlueprintKind ResolveBlueprintKind(const FAssetData& AssetData, const UBlueprint* Blueprint)
+	{
+		const EGASBlueprintKind LoadedKind = ResolveKindFromLoadedBlueprint(Blueprint);
+		if (LoadedKind != EGASBlueprintKind::None)
+		{
+			return LoadedKind;
+		}
+
+		return ResolveKindFromParentClassPath(GetBlueprintParentClassTag(AssetData));
+	}
+
+	/** 把 GameplayTagContainer 展平成 JSON 字符串数组。 */
+	static TArray<TSharedPtr<FJsonValue>> ExtractTagContainer(const UObject* Object, const TCHAR* PropertyName)
+	{
+		TArray<TSharedPtr<FJsonValue>> Result;
+		if (!Object)
+		{
+			return Result;
+		}
+
+		const FProperty* Property = Object->GetClass()->FindPropertyByName(PropertyName);
+		const FStructProperty* StructProperty = CastField<FStructProperty>(Property);
+		if (!StructProperty)
+		{
+			return Result;
+		}
+
+		const void* ValuePtr = StructProperty->ContainerPtrToValuePtr<void>(Object);
+		const FGameplayTagContainer* TagContainer = static_cast<const FGameplayTagContainer*>(ValuePtr);
+		if (!TagContainer)
+		{
+			return Result;
+		}
+
+		for (const FGameplayTag& Tag : *TagContainer)
+		{
+			Result.Add(MakeShared<FJsonValueString>(Tag.ToString()));
+		}
+		return Result;
+	}
+
+	/** 读取枚举属性并转成人类可读字符串。 */
+	static bool TryReadEnumPropertyAsString(const UObject* Object, const TCHAR* PropertyName, FString& OutValue)
+	{
+		OutValue.Reset();
+		if (!Object)
+		{
+			return false;
+		}
+
+		const FProperty* Property = Object->GetClass()->FindPropertyByName(PropertyName);
+		if (!Property)
+		{
+			return false;
+		}
+
+		if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
+		{
+			const FNumericProperty* UnderlyingProperty = EnumProperty->GetUnderlyingProperty();
+			const void* ValuePtr = EnumProperty->ContainerPtrToValuePtr<void>(Object);
+			const UEnum* EnumDefinition = EnumProperty->GetEnum();
+			if (!UnderlyingProperty || !EnumDefinition || !ValuePtr)
+			{
+				return false;
+			}
+
+			OutValue = EnumDefinition->GetNameStringByValue(UnderlyingProperty->GetSignedIntPropertyValue(ValuePtr));
+			return !OutValue.IsEmpty();
+		}
+
+		if (const FByteProperty* ByteProperty = CastField<FByteProperty>(Property))
+		{
+			if (!ByteProperty->Enum)
+			{
+				return false;
+			}
+
+			OutValue = ByteProperty->Enum->GetNameStringByValue(ByteProperty->GetPropertyValue_InContainer(Object));
+			return !OutValue.IsEmpty();
+		}
+
+		return false;
+	}
+
+	/** 读取 float/double 数值属性。 */
+	static bool TryReadNumericPropertyAsDouble(const UObject* Object, const TCHAR* PropertyName, double& OutValue)
+	{
+		OutValue = 0.0;
+		if (!Object)
+		{
+			return false;
+		}
+
+		const FProperty* Property = Object->GetClass()->FindPropertyByName(PropertyName);
+		if (const FFloatProperty* FloatProperty = CastField<FFloatProperty>(Property))
+		{
+			OutValue = FloatProperty->GetPropertyValue_InContainer(Object);
+			return true;
+		}
+		if (const FDoubleProperty* DoubleProperty = CastField<FDoubleProperty>(Property))
+		{
+			OutValue = DoubleProperty->GetPropertyValue_InContainer(Object);
+			return true;
+		}
+
+		return false;
+	}
+
+	/** 读取类引用属性，并导出成完整路径。 */
+	static bool TryReadClassPropertyPath(const UObject* Object, const TCHAR* PropertyName, FString& OutPath)
+	{
+		OutPath.Reset();
+		if (!Object)
+		{
+			return false;
+		}
+
+		const FClassProperty* ClassProperty = CastField<FClassProperty>(Object->GetClass()->FindPropertyByName(PropertyName));
+		if (!ClassProperty)
+		{
+			return false;
+		}
+
+		const UClass* ReferencedClass = Cast<UClass>(ClassProperty->GetPropertyValue_InContainer(Object));
+		if (!ReferencedClass)
+		{
+			return false;
+		}
+
+		OutPath = ReferencedClass->GetPathName();
+		return !OutPath.IsEmpty();
+	}
+
+	/** 为 node 准备统一的“公共头部字段”。 */
+	static void PopulateCommonNodeFields(
+		const FAssetData& AssetData,
+		const UBlueprint* Blueprint,
+		TSharedPtr<FJsonObject>& Properties)
+	{
+		Properties->SetStringField(TEXT("asset_path"), AssetData.GetObjectPathString());
+		Properties->SetStringField(TEXT("package_path"), AssetData.PackageName.ToString());
+		if (Blueprint && Blueprint->GeneratedClass)
+		{
+			Properties->SetStringField(TEXT("generated_class"), Blueprint->GeneratedClass->GetPathName());
+			Properties->SetStringField(TEXT("parent_class"), Blueprint->GeneratedClass->GetSuperClass()
+				? Blueprint->GeneratedClass->GetSuperClass()->GetPathName()
+				: FString(TEXT("None")));
+		}
+	}
+
+	/** 把 JSON 属性对象包装成一条稳定 node 快照。
+	 *
+	 * 这里故意只负责“在内存里拼出节点”，不直接写数据库。
+	 * 这样生产表、artifact 和 shadow 表三条路径就能共用同一份节点内容。
+	 */
+	static bool BuildNode(
+		const FAssetData& AssetData,
+		const UBlueprint* Blueprint,
+		const FString& NodeType,
+		const TSharedPtr<FJsonObject>& Properties,
+		FIndexedNode& OutNode)
+	{
+		if (!Properties.IsValid())
+		{
+			return false;
+		}
+
+		OutNode = FIndexedNode();
+		OutNode.NodeName = ResolveNodeName(AssetData, Blueprint);
+		OutNode.NodeType = NodeType;
+		OutNode.NodeClass = (Blueprint && Blueprint->GeneratedClass)
+			? Blueprint->GeneratedClass->GetName()
+			: NodeType;
+		return SerializeJsonObject(Properties, OutNode.Properties);
+	}
+
+	/** 把单节点快照包装成 artifact。 */
+	static void BuildNodeArtifact(
+		const FIndexedNode& Node,
+		FMonolithArtifact& OutArtifact,
+		const FName IndexerId,
+		const uint32 IndexerVersion,
+		const uint8 ArtifactSchemaVersion,
+		const EMonolithExecutionMode ExecutionMode,
+		const FString& PackageName)
+	{
+		MonolithSimpleArtifactSerialization::FNodePayload Payload;
+		Payload.Node = Node;
+
+		OutArtifact = FMonolithArtifact();
+		OutArtifact.ArtifactSchemaVersion = ArtifactSchemaVersion;
+		OutArtifact.IndexerId = IndexerId;
+		OutArtifact.IndexerVersion = IndexerVersion;
+		OutArtifact.ExecutionMode = ExecutionMode;
+		OutArtifact.PackageName = PackageName;
+		MonolithSimpleArtifactSerialization::SerializeNodePayload(Payload, OutArtifact.Payload);
 	}
 }
 
-// ─────────────────────────────────────────────────────────────
-// Main sentinel entry point
-// ─────────────────────────────────────────────────────────────
-
-bool FGASIndexer::IndexAsset(const FAssetData& AssetData, UObject* LoadedAsset, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FGASIndexer::MatchesAsset(const FAssetData& AssetData, const UObject* LoadedAsset) const
 {
-	// Collected cross-reference data
-	TArray<FAbilityRef> AbilityRefs;
-	TArray<FEffectRef> EffectRefs;
-	TArray<FAttributeSetRef> AttributeSetRefs;
-	TArray<FCueRef> CueRefs;
-
-	// Map from asset path to effect node ID for cross-referencing
-	TMap<FString, int64> EffectPathToNodeId;
-
-	int32 TotalIndexed = 0;
-
-	// ── 1. GameplayAbilities ──
+	if (!IMonolithIndexer::MatchesAsset(AssetData, LoadedAsset))
 	{
-		TArray<FBPWithCDO> Abilities = FindBlueprintCDOsOfClass(UGameplayAbility::StaticClass(), DB);
-		for (auto& Entry : Abilities)
-		{
-			int64 NodeId = IndexAbility(Entry.CDO, Entry.AssetPath, DB, Entry.AssetId);
-			if (NodeId >= 0)
-			{
-				FAbilityRef Ref;
-				Ref.NodeId = NodeId;
-
-				// Extract cost/cooldown class paths via CDO reflection
-				FProperty* CostProp = Entry.CDO->GetClass()->FindPropertyByName(TEXT("CostGameplayEffectClass"));
-				if (CostProp)
-				{
-					FClassProperty* ClassProp = CastField<FClassProperty>(CostProp);
-					if (ClassProp)
-					{
-						UClass* CostClass = Cast<UClass>(ClassProp->GetPropertyValue_InContainer(Entry.CDO));
-						if (CostClass)
-						{
-							Ref.CostEffectPath = CostClass->GetPathName();
-						}
-					}
-				}
-
-				FProperty* CooldownProp = Entry.CDO->GetClass()->FindPropertyByName(TEXT("CooldownGameplayEffectClass"));
-				if (CooldownProp)
-				{
-					FClassProperty* ClassProp = CastField<FClassProperty>(CooldownProp);
-					if (ClassProp)
-					{
-						UClass* CooldownClass = Cast<UClass>(ClassProp->GetPropertyValue_InContainer(Entry.CDO));
-						if (CooldownClass)
-						{
-							Ref.CooldownEffectPath = CooldownClass->GetPathName();
-						}
-					}
-				}
-
-				AbilityRefs.Add(MoveTemp(Ref));
-				TotalIndexed++;
-			}
-		}
+		return false;
 	}
 
-	// ── 2. GameplayEffects ──
-	{
-		TArray<FBPWithCDO> Effects = FindBlueprintCDOsOfClass(UGameplayEffect::StaticClass(), DB);
-		for (auto& Entry : Effects)
-		{
-			int64 NodeId = IndexEffect(Entry.CDO, Entry.AssetPath, DB, Entry.AssetId);
-			if (NodeId >= 0)
-			{
-				EffectPathToNodeId.Add(Entry.CDO->GetClass()->GetPathName(), NodeId);
-
-				FEffectRef Ref;
-				Ref.NodeId = NodeId;
-
-				// Collect modifier attribute references
-				FProperty* ModsProp = Entry.CDO->GetClass()->FindPropertyByName(TEXT("Modifiers"));
-				if (ModsProp)
-				{
-					FArrayProperty* ArrayProp = CastField<FArrayProperty>(ModsProp);
-					if (ArrayProp)
-					{
-						FScriptArrayHelper ArrayHelper(ArrayProp, ArrayProp->ContainerPtrToValuePtr<void>(Entry.CDO));
-						for (int32 i = 0; i < ArrayHelper.Num(); i++)
-						{
-							void* ElemPtr = ArrayHelper.GetRawPtr(i);
-							FStructProperty* InnerStructProp = CastField<FStructProperty>(ArrayProp->Inner);
-							if (!InnerStructProp) continue;
-
-							// Get the Attribute field from FGameplayModifierInfo
-							FProperty* AttrProp = InnerStructProp->Struct->FindPropertyByName(TEXT("Attribute"));
-							if (!AttrProp) continue;
-
-							FStructProperty* AttrStructProp = CastField<FStructProperty>(AttrProp);
-							if (!AttrStructProp) continue;
-
-							const void* AttrPtr = AttrStructProp->ContainerPtrToValuePtr<void>(ElemPtr);
-
-							// FGameplayAttribute has AttributeName and an owning struct/class
-							// Export text to get the full attribute reference
-							FString AttrExport;
-							AttrStructProp->ExportTextItem_Direct(AttrExport, AttrPtr, nullptr, nullptr, PPF_None);
-							if (!AttrExport.IsEmpty())
-							{
-								Ref.ModifiedAttributes.Add(AttrExport);
-							}
-						}
-					}
-				}
-
-				// Collect gameplay cue tags
-				FProperty* CuesProp = Entry.CDO->GetClass()->FindPropertyByName(TEXT("GameplayCues"));
-				if (CuesProp)
-				{
-					FArrayProperty* CuesArrayProp = CastField<FArrayProperty>(CuesProp);
-					if (CuesArrayProp)
-					{
-						FScriptArrayHelper CueHelper(CuesArrayProp, CuesArrayProp->ContainerPtrToValuePtr<void>(Entry.CDO));
-						for (int32 i = 0; i < CueHelper.Num(); i++)
-						{
-							void* CueElemPtr = CueHelper.GetRawPtr(i);
-							FStructProperty* CueInnerProp = CastField<FStructProperty>(CuesArrayProp->Inner);
-							if (!CueInnerProp) continue;
-
-							// FGameplayEffectCue has GameplayCueTags (FGameplayTagContainer)
-							FProperty* CueTagsProp = CueInnerProp->Struct->FindPropertyByName(TEXT("GameplayCueTags"));
-							if (!CueTagsProp) continue;
-
-							FStructProperty* CueTagsStructProp = CastField<FStructProperty>(CueTagsProp);
-							if (!CueTagsStructProp) continue;
-
-							const void* CueTagsPtr = CueTagsStructProp->ContainerPtrToValuePtr<void>(CueElemPtr);
-							const FGameplayTagContainer* CueTagContainer = static_cast<const FGameplayTagContainer*>(CueTagsPtr);
-							if (CueTagContainer)
-							{
-								for (const FGameplayTag& Tag : *CueTagContainer)
-								{
-									Ref.CueTags.Add(Tag.ToString());
-								}
-							}
-						}
-					}
-				}
-
-				EffectRefs.Add(MoveTemp(Ref));
-				TotalIndexed++;
-			}
-		}
-	}
-
-	// ── 3. AttributeSets ──
-	{
-		// Blueprint-based attribute sets
-		TArray<FBPWithCDO> AttrSets = FindBlueprintCDOsOfClass(UAttributeSet::StaticClass(), DB);
-		for (auto& Entry : AttrSets)
-		{
-			int64 NodeId = IndexAttributeSet(Entry.CDO->GetClass(), DB, Entry.AssetId);
-			if (NodeId >= 0)
-			{
-				FAttributeSetRef Ref;
-				Ref.NodeId = NodeId;
-				Ref.ClassName = Entry.CDO->GetClass()->GetName();
-				for (TFieldIterator<FProperty> It(Entry.CDO->GetClass()); It; ++It)
-				{
-					FStructProperty* SP = CastField<FStructProperty>(*It);
-					if (SP && SP->Struct && SP->Struct->GetName() == TEXT("GameplayAttributeData"))
-					{
-						Ref.AttributeNames.Add(FString::Printf(TEXT("%s.%s"), *Ref.ClassName, *It->GetName()));
-					}
-				}
-				AttributeSetRefs.Add(MoveTemp(Ref));
-				TotalIndexed++;
-			}
-		}
-
-		// Native attribute sets (C++ classes not from Blueprints)
-		for (TObjectIterator<UClass> It; It; ++It)
-		{
-			UClass* Class = *It;
-			if (!Class->IsChildOf(UAttributeSet::StaticClass())) continue;
-			if (Class == UAttributeSet::StaticClass()) continue;
-			if (Class->HasAnyClassFlags(CLASS_Abstract | CLASS_NewerVersionExists)) continue;
-			// Skip Blueprint-generated classes (already handled above)
-			if (Class->ClassGeneratedBy) continue;
-
-			// For native classes, use -1 as AssetId (no package in project content)
-			int64 NodeId = IndexAttributeSet(Class, DB, -1);
-			if (NodeId >= 0)
-			{
-				FAttributeSetRef Ref;
-				Ref.NodeId = NodeId;
-				Ref.ClassName = Class->GetName();
-				for (TFieldIterator<FProperty> PropIt(Class); PropIt; ++PropIt)
-				{
-					FStructProperty* SP = CastField<FStructProperty>(*PropIt);
-					if (SP && SP->Struct && SP->Struct->GetName() == TEXT("GameplayAttributeData"))
-					{
-						Ref.AttributeNames.Add(FString::Printf(TEXT("%s.%s"), *Ref.ClassName, *PropIt->GetName()));
-					}
-				}
-				AttributeSetRefs.Add(MoveTemp(Ref));
-				TotalIndexed++;
-			}
-		}
-	}
-
-	// ── 4. GameplayCues ──
-	{
-		// Static cues
-		TArray<FBPWithCDO> StaticCues = FindBlueprintCDOsOfClass(UGameplayCueNotify_Static::StaticClass(), DB);
-		for (auto& Entry : StaticCues)
-		{
-			int64 NodeId = IndexGameplayCue(Entry.CDO, Entry.AssetPath, DB, Entry.AssetId, false);
-			if (NodeId >= 0)
-			{
-				FCueRef Ref;
-				Ref.NodeId = NodeId;
-
-				FProperty* TagProp = Entry.CDO->GetClass()->FindPropertyByName(TEXT("GameplayCueTag"));
-				if (TagProp)
-				{
-					FStructProperty* TagStructProp = CastField<FStructProperty>(TagProp);
-					if (TagStructProp)
-					{
-						const void* TagPtr = TagStructProp->ContainerPtrToValuePtr<void>(Entry.CDO);
-						const FGameplayTag* Tag = static_cast<const FGameplayTag*>(TagPtr);
-						if (Tag && Tag->IsValid())
-						{
-							Ref.CueTag = Tag->ToString();
-						}
-					}
-				}
-
-				CueRefs.Add(MoveTemp(Ref));
-				TotalIndexed++;
-			}
-		}
-
-		// Actor cues
-		TArray<FBPWithCDO> ActorCues = FindBlueprintCDOsOfClass(AGameplayCueNotify_Actor::StaticClass(), DB);
-		for (auto& Entry : ActorCues)
-		{
-			int64 NodeId = IndexGameplayCue(Entry.CDO, Entry.AssetPath, DB, Entry.AssetId, true);
-			if (NodeId >= 0)
-			{
-				FCueRef Ref;
-				Ref.NodeId = NodeId;
-
-				FProperty* TagProp = Entry.CDO->GetClass()->FindPropertyByName(TEXT("GameplayCueTag"));
-				if (TagProp)
-				{
-					FStructProperty* TagStructProp = CastField<FStructProperty>(TagProp);
-					if (TagStructProp)
-					{
-						const void* TagPtr = TagStructProp->ContainerPtrToValuePtr<void>(Entry.CDO);
-						const FGameplayTag* Tag = static_cast<const FGameplayTag*>(TagPtr);
-						if (Tag && Tag->IsValid())
-						{
-							Ref.CueTag = Tag->ToString();
-						}
-					}
-				}
-
-				CueRefs.Add(MoveTemp(Ref));
-				TotalIndexed++;
-			}
-		}
-	}
-
-	// ── 5. Cross-references ──
-
-	// Ability -> Effect (cost/cooldown)
-	for (const FAbilityRef& AbRef : AbilityRefs)
-	{
-		auto TryConnect = [&](const FString& EffectPath, const FString& PinName)
-		{
-			if (EffectPath.IsEmpty()) return;
-			int64* EffectNodeId = EffectPathToNodeId.Find(EffectPath);
-			if (EffectNodeId)
-			{
-				FIndexedConnection Conn;
-				Conn.SourceNodeId = AbRef.NodeId;
-				Conn.SourcePin = PinName;
-				Conn.TargetNodeId = *EffectNodeId;
-				Conn.TargetPin = TEXT("Self");
-				Conn.PinType = TEXT("GAS_Reference");
-				DB.InsertConnection(Conn);
-			}
-		};
-		TryConnect(AbRef.CostEffectPath, TEXT("CostEffect"));
-		TryConnect(AbRef.CooldownEffectPath, TEXT("CooldownEffect"));
-	}
-
-	// Effect -> AttributeSet (modifier targets)
-	for (const FEffectRef& ERef : EffectRefs)
-	{
-		for (const FString& AttrExport : ERef.ModifiedAttributes)
-		{
-			for (const FAttributeSetRef& ASRef : AttributeSetRefs)
-			{
-				for (const FString& AttrName : ASRef.AttributeNames)
-				{
-					// Match if the exported attribute reference contains the attribute set class + attribute name
-					if (AttrExport.Contains(ASRef.ClassName) && AttrExport.Contains(AttrName.RightChop(AttrName.Find(TEXT(".")) + 1)))
-					{
-						FIndexedConnection Conn;
-						Conn.SourceNodeId = ERef.NodeId;
-						Conn.SourcePin = TEXT("Modifier");
-						Conn.TargetNodeId = ASRef.NodeId;
-						Conn.TargetPin = AttrName;
-						Conn.PinType = TEXT("GAS_ModifiesAttribute");
-						DB.InsertConnection(Conn);
-						break; // One connection per attribute match
-					}
-				}
-			}
-		}
-
-		// Effect -> GameplayCue (cue tags)
-		for (const FString& CueTagStr : ERef.CueTags)
-		{
-			for (const FCueRef& CR : CueRefs)
-			{
-				if (!CR.CueTag.IsEmpty() && CueTagStr.Contains(CR.CueTag))
-				{
-					FIndexedConnection Conn;
-					Conn.SourceNodeId = ERef.NodeId;
-					Conn.SourcePin = TEXT("GameplayCue");
-					Conn.TargetNodeId = CR.NodeId;
-					Conn.TargetPin = TEXT("Self");
-					Conn.PinType = TEXT("GAS_TriggersCue");
-					DB.InsertConnection(Conn);
-				}
-			}
-		}
-	}
-
-	UE_LOG(LogMonolithIndex, Log, TEXT("GASIndexer: indexed %d GAS assets (%d abilities, %d effects, %d attribute sets, %d cues)"),
-		TotalIndexed, AbilityRefs.Num(), EffectRefs.Num(), AttributeSetRefs.Num(), CueRefs.Num());
-	return true;
+	return GASIndexerInternal::ResolveBlueprintKind(AssetData, Cast<UBlueprint>(LoadedAsset))
+		!= GASIndexerInternal::EGASBlueprintKind::None;
 }
 
-// ─────────────────────────────────────────────────────────────
-// IndexAbility
-// ─────────────────────────────────────────────────────────────
-
-int64 FGASIndexer::IndexAbility(UObject* CDO, const FString& AssetPath, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FGASIndexer::BuildArtifact(
+	const FAssetData& AssetData,
+	UObject* LoadedAsset,
+	IAssetRegistry& AssetRegistry,
+	FMonolithArtifact& OutArtifact)
 {
-	if (!CDO) return -1;
-
-	auto Props = MakeShared<FJsonObject>();
-	Props->SetStringField(TEXT("asset_path"), AssetPath);
-	Props->SetStringField(TEXT("class"), CDO->GetClass()->GetName());
-
-	// Tag containers
-	Props->SetArrayField(TEXT("ability_tags"), ExtractTagContainer(CDO, TEXT("AbilityTags")));
-	Props->SetArrayField(TEXT("cancel_abilities_with_tag"), ExtractTagContainer(CDO, TEXT("CancelAbilitiesWithTag")));
-	Props->SetArrayField(TEXT("block_abilities_with_tag"), ExtractTagContainer(CDO, TEXT("BlockAbilitiesWithTag")));
-	Props->SetArrayField(TEXT("activation_required_tags"), ExtractTagContainer(CDO, TEXT("ActivationRequiredTags")));
-	Props->SetArrayField(TEXT("activation_blocked_tags"), ExtractTagContainer(CDO, TEXT("ActivationBlockedTags")));
-
-	// Instancing policy (via reflection — may be protected)
-	FProperty* InstancingProp = CDO->GetClass()->FindPropertyByName(TEXT("InstancingPolicy"));
-	if (InstancingProp)
-	{
-		FByteProperty* ByteProp = CastField<FByteProperty>(InstancingProp);
-		FEnumProperty* EnumProp = CastField<FEnumProperty>(InstancingProp);
-		if (EnumProp)
-		{
-			FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
-			const void* ValuePtr = EnumProp->ContainerPtrToValuePtr<void>(CDO);
-			int64 Value = UnderlyingProp->GetSignedIntPropertyValue(ValuePtr);
-			const UEnum* EnumDef = EnumProp->GetEnum();
-			if (EnumDef)
-			{
-				Props->SetStringField(TEXT("instancing_policy"), EnumDef->GetNameStringByValue(Value));
-			}
-		}
-		else if (ByteProp && ByteProp->Enum)
-		{
-			uint8 Value = ByteProp->GetPropertyValue_InContainer(CDO);
-			Props->SetStringField(TEXT("instancing_policy"), ByteProp->Enum->GetNameStringByValue(Value));
-		}
-	}
-
-	// Net execution policy (via reflection)
-	FProperty* NetExecProp = CDO->GetClass()->FindPropertyByName(TEXT("NetExecutionPolicy"));
-	if (NetExecProp)
-	{
-		FByteProperty* ByteProp = CastField<FByteProperty>(NetExecProp);
-		FEnumProperty* EnumProp = CastField<FEnumProperty>(NetExecProp);
-		if (EnumProp)
-		{
-			FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
-			const void* ValuePtr = EnumProp->ContainerPtrToValuePtr<void>(CDO);
-			int64 Value = UnderlyingProp->GetSignedIntPropertyValue(ValuePtr);
-			const UEnum* EnumDef = EnumProp->GetEnum();
-			if (EnumDef)
-			{
-				Props->SetStringField(TEXT("net_execution_policy"), EnumDef->GetNameStringByValue(Value));
-			}
-		}
-		else if (ByteProp && ByteProp->Enum)
-		{
-			uint8 Value = ByteProp->GetPropertyValue_InContainer(CDO);
-			Props->SetStringField(TEXT("net_execution_policy"), ByteProp->Enum->GetNameStringByValue(Value));
-		}
-	}
-
-	// Cost effect class
-	FProperty* CostProp = CDO->GetClass()->FindPropertyByName(TEXT("CostGameplayEffectClass"));
-	if (CostProp)
-	{
-		FClassProperty* ClassProp = CastField<FClassProperty>(CostProp);
-		if (ClassProp)
-		{
-			UClass* CostClass = Cast<UClass>(ClassProp->GetPropertyValue_InContainer(CDO));
-			Props->SetStringField(TEXT("cost_effect"), CostClass ? CostClass->GetName() : TEXT("None"));
-		}
-	}
-
-	// Cooldown effect class
-	FProperty* CooldownProp = CDO->GetClass()->FindPropertyByName(TEXT("CooldownGameplayEffectClass"));
-	if (CooldownProp)
-	{
-		FClassProperty* ClassProp = CastField<FClassProperty>(CooldownProp);
-		if (ClassProp)
-		{
-			UClass* CooldownClass = Cast<UClass>(ClassProp->GetPropertyValue_InContainer(CDO));
-			Props->SetStringField(TEXT("cooldown_effect"), CooldownClass ? CooldownClass->GetName() : TEXT("None"));
-		}
-	}
+	(void)AssetRegistry;
 
 	FIndexedNode Node;
-	Node.AssetId = AssetId;
-	Node.NodeName = CDO->GetClass()->GetName();
-	Node.NodeClass = TEXT("GameplayAbility");
-	Node.NodeType = TEXT("GameplayAbility");
-	Node.Properties = JsonToString(Props);
-	return DB.InsertNode(Node);
+	if (!BuildNodeForAsset(AssetData, Cast<UBlueprint>(LoadedAsset), Node))
+	{
+		return false;
+	}
+
+	GASIndexerInternal::BuildNodeArtifact(
+		Node,
+		OutArtifact,
+		GetIndexerId(),
+		GetIndexerVersion(),
+		GetArtifactSchemaVersion(),
+		GetExecutionMode(),
+		AssetData.PackageName.ToString());
+	return OutArtifact.Payload.Num() > 0;
 }
 
-// ─────────────────────────────────────────────────────────────
-// IndexEffect
-// ─────────────────────────────────────────────────────────────
-
-int64 FGASIndexer::IndexEffect(UObject* CDO, const FString& AssetPath, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FGASIndexer::MaterializeArtifact(const FMonolithArtifact& Artifact, FMonolithIndexDatabase& DB, int64 AssetId)
 {
-	if (!CDO) return -1;
-
-	auto Props = MakeShared<FJsonObject>();
-	Props->SetStringField(TEXT("asset_path"), AssetPath);
-	Props->SetStringField(TEXT("class"), CDO->GetClass()->GetName());
-
-	// Duration policy
-	FProperty* DurationProp = CDO->GetClass()->FindPropertyByName(TEXT("DurationPolicy"));
-	if (DurationProp)
+	MonolithSimpleArtifactSerialization::FNodePayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeNodePayload(Artifact.Payload, Payload))
 	{
-		FByteProperty* ByteProp = CastField<FByteProperty>(DurationProp);
-		FEnumProperty* EnumProp = CastField<FEnumProperty>(DurationProp);
-		if (EnumProp)
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeNodePayload(Payload, DB, AssetId);
+}
+
+bool FGASIndexer::MaterializeArtifactToShadow(
+	const FMonolithArtifact& Artifact,
+	FMonolithIndexDatabase& DB,
+	int64 AssetId,
+	const FString& CohortName)
+{
+	MonolithSimpleArtifactSerialization::FNodePayload Payload;
+	if (!MonolithSimpleArtifactSerialization::DeserializeNodePayload(Artifact.Payload, Payload))
+	{
+		return false;
+	}
+
+	return MonolithSimpleArtifactSerialization::MaterializeNodePayloadToShadow(Payload, DB, AssetId, CohortName);
+}
+
+bool FGASIndexer::BuildNodeForAsset(const FAssetData& AssetData, UBlueprint* Blueprint, FIndexedNode& OutNode) const
+{
+	if (!Blueprint || !Blueprint->GeneratedClass)
+	{
+		return false;
+	}
+
+	switch (GASIndexerInternal::ResolveBlueprintKind(AssetData, Blueprint))
+	{
+	case GASIndexerInternal::EGASBlueprintKind::GameplayAbility:
+		return BuildGameplayAbilityNode(AssetData, Blueprint, OutNode);
+	case GASIndexerInternal::EGASBlueprintKind::GameplayEffect:
+		return BuildGameplayEffectNode(AssetData, Blueprint, OutNode);
+	case GASIndexerInternal::EGASBlueprintKind::AttributeSet:
+		return BuildAttributeSetNode(AssetData, Blueprint, OutNode);
+	case GASIndexerInternal::EGASBlueprintKind::GameplayCueStatic:
+	case GASIndexerInternal::EGASBlueprintKind::GameplayCueActor:
+		return BuildGameplayCueNode(AssetData, Blueprint, OutNode);
+	case GASIndexerInternal::EGASBlueprintKind::None:
+	default:
+		return false;
+	}
+}
+
+bool FGASIndexer::BuildGameplayAbilityNode(
+	const FAssetData& AssetData,
+	UBlueprint* Blueprint,
+	FIndexedNode& OutNode) const
+{
+	UGameplayAbility* Ability = Blueprint && Blueprint->GeneratedClass
+		? Cast<UGameplayAbility>(Blueprint->GeneratedClass->GetDefaultObject(false))
+		: nullptr;
+	if (!Ability)
+	{
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+	GASIndexerInternal::PopulateCommonNodeFields(AssetData, Blueprint, Properties);
+	Properties->SetArrayField(TEXT("ability_tags"), GASIndexerInternal::ExtractTagContainer(Ability, TEXT("AbilityTags")));
+	Properties->SetArrayField(TEXT("cancel_abilities_with_tag"), GASIndexerInternal::ExtractTagContainer(Ability, TEXT("CancelAbilitiesWithTag")));
+	Properties->SetArrayField(TEXT("block_abilities_with_tag"), GASIndexerInternal::ExtractTagContainer(Ability, TEXT("BlockAbilitiesWithTag")));
+	Properties->SetArrayField(TEXT("activation_required_tags"), GASIndexerInternal::ExtractTagContainer(Ability, TEXT("ActivationRequiredTags")));
+	Properties->SetArrayField(TEXT("activation_blocked_tags"), GASIndexerInternal::ExtractTagContainer(Ability, TEXT("ActivationBlockedTags")));
+
+	FString EnumValue;
+	if (GASIndexerInternal::TryReadEnumPropertyAsString(Ability, TEXT("InstancingPolicy"), EnumValue))
+	{
+		Properties->SetStringField(TEXT("instancing_policy"), EnumValue);
+	}
+	if (GASIndexerInternal::TryReadEnumPropertyAsString(Ability, TEXT("NetExecutionPolicy"), EnumValue))
+	{
+		Properties->SetStringField(TEXT("net_execution_policy"), EnumValue);
+	}
+	if (GASIndexerInternal::TryReadEnumPropertyAsString(Ability, TEXT("NetSecurityPolicy"), EnumValue))
+	{
+		Properties->SetStringField(TEXT("net_security_policy"), EnumValue);
+	}
+
+	FString ClassPath;
+	if (GASIndexerInternal::TryReadClassPropertyPath(Ability, TEXT("CostGameplayEffectClass"), ClassPath))
+	{
+		Properties->SetStringField(TEXT("cost_effect_class"), ClassPath);
+	}
+	if (GASIndexerInternal::TryReadClassPropertyPath(Ability, TEXT("CooldownGameplayEffectClass"), ClassPath))
+	{
+		Properties->SetStringField(TEXT("cooldown_effect_class"), ClassPath);
+	}
+
+	return GASIndexerInternal::BuildNode(AssetData, Blueprint, TEXT("GameplayAbility"), Properties, OutNode);
+}
+
+bool FGASIndexer::BuildGameplayEffectNode(
+	const FAssetData& AssetData,
+	UBlueprint* Blueprint,
+	FIndexedNode& OutNode) const
+{
+	UGameplayEffect* Effect = Blueprint && Blueprint->GeneratedClass
+		? Cast<UGameplayEffect>(Blueprint->GeneratedClass->GetDefaultObject(false))
+		: nullptr;
+	if (!Effect)
+	{
+		return false;
+	}
+
+	TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+	GASIndexerInternal::PopulateCommonNodeFields(AssetData, Blueprint, Properties);
+
+	FString EnumValue;
+	if (GASIndexerInternal::TryReadEnumPropertyAsString(Effect, TEXT("DurationPolicy"), EnumValue))
+	{
+		Properties->SetStringField(TEXT("duration_policy"), EnumValue);
+	}
+	if (GASIndexerInternal::TryReadEnumPropertyAsString(Effect, TEXT("StackingType"), EnumValue))
+	{
+		Properties->SetStringField(TEXT("stacking_type"), EnumValue);
+	}
+
+	double NumericValue = 0.0;
+	if (GASIndexerInternal::TryReadNumericPropertyAsDouble(Effect, TEXT("Period"), NumericValue))
+	{
+		Properties->SetNumberField(TEXT("period"), NumericValue);
+	}
+
+	// Modifiers 是 GameplayEffect 最关键的结构化配置之一。
+	// 这里把每个 modifier 折叠成一段小 JSON，查询侧可以直接读到“改哪个属性、怎么改”。
+	if (const FArrayProperty* ModifiersProperty = CastField<FArrayProperty>(Effect->GetClass()->FindPropertyByName(TEXT("Modifiers"))))
+	{
+		FScriptArrayHelper ModifierArray(ModifiersProperty, ModifiersProperty->ContainerPtrToValuePtr<void>(Effect));
+		TArray<TSharedPtr<FJsonValue>> Modifiers;
+		for (int32 Index = 0; Index < ModifierArray.Num(); ++Index)
 		{
-			FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
-			const void* ValuePtr = EnumProp->ContainerPtrToValuePtr<void>(CDO);
-			int64 Value = UnderlyingProp->GetSignedIntPropertyValue(ValuePtr);
-			const UEnum* EnumDef = EnumProp->GetEnum();
-			if (EnumDef)
+			const FStructProperty* InnerStructProperty = CastField<FStructProperty>(ModifiersProperty->Inner);
+			if (!InnerStructProperty)
 			{
-				Props->SetStringField(TEXT("duration_policy"), EnumDef->GetNameStringByValue(Value));
+				continue;
 			}
-		}
-		else if (ByteProp && ByteProp->Enum)
-		{
-			uint8 Value = ByteProp->GetPropertyValue_InContainer(CDO);
-			Props->SetStringField(TEXT("duration_policy"), ByteProp->Enum->GetNameStringByValue(Value));
-		}
-	}
 
-	// Period
-	FProperty* PeriodProp = CDO->GetClass()->FindPropertyByName(TEXT("Period"));
-	if (PeriodProp)
-	{
-		FFloatProperty* FloatProp = CastField<FFloatProperty>(PeriodProp);
-		if (FloatProp)
-		{
-			Props->SetNumberField(TEXT("period"), FloatProp->GetPropertyValue_InContainer(CDO));
-		}
-	}
+			void* ElementPtr = ModifierArray.GetRawPtr(Index);
+			TSharedPtr<FJsonObject> ModifierObject = MakeShared<FJsonObject>();
 
-	// Stacking type
-	FProperty* StackProp = CDO->GetClass()->FindPropertyByName(TEXT("StackingType"));
-	if (StackProp)
-	{
-		FByteProperty* ByteProp = CastField<FByteProperty>(StackProp);
-		FEnumProperty* EnumProp = CastField<FEnumProperty>(StackProp);
-		if (EnumProp)
-		{
-			FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
-			const void* ValuePtr = EnumProp->ContainerPtrToValuePtr<void>(CDO);
-			int64 Value = UnderlyingProp->GetSignedIntPropertyValue(ValuePtr);
-			const UEnum* EnumDef = EnumProp->GetEnum();
-			if (EnumDef)
+			if (const FStructProperty* AttributeProperty = CastField<FStructProperty>(InnerStructProperty->Struct->FindPropertyByName(TEXT("Attribute"))))
 			{
-				Props->SetStringField(TEXT("stacking_type"), EnumDef->GetNameStringByValue(Value));
+				FString AttributeExportText;
+				AttributeProperty->ExportTextItem_Direct(
+					AttributeExportText,
+					AttributeProperty->ContainerPtrToValuePtr<void>(ElementPtr),
+					nullptr,
+					nullptr,
+					PPF_None);
+				if (!AttributeExportText.IsEmpty())
+				{
+					ModifierObject->SetStringField(TEXT("attribute"), AttributeExportText);
+				}
 			}
-		}
-		else if (ByteProp && ByteProp->Enum)
-		{
-			uint8 Value = ByteProp->GetPropertyValue_InContainer(CDO);
-			Props->SetStringField(TEXT("stacking_type"), ByteProp->Enum->GetNameStringByValue(Value));
-		}
-	}
 
-	// Modifiers array
-	FProperty* ModsProp = CDO->GetClass()->FindPropertyByName(TEXT("Modifiers"));
-	if (ModsProp)
-	{
-		FArrayProperty* ArrayProp = CastField<FArrayProperty>(ModsProp);
-		if (ArrayProp)
-		{
-			FScriptArrayHelper ArrayHelper(ArrayProp, ArrayProp->ContainerPtrToValuePtr<void>(CDO));
-			TArray<TSharedPtr<FJsonValue>> ModArray;
-
-			for (int32 i = 0; i < ArrayHelper.Num(); i++)
+			FString ModifierOp;
+			if (const FProperty* ModifierOpProperty = InnerStructProperty->Struct->FindPropertyByName(TEXT("ModifierOp")))
 			{
-				void* ElemPtr = ArrayHelper.GetRawPtr(i);
-				FStructProperty* InnerStructProp = CastField<FStructProperty>(ArrayProp->Inner);
-				if (!InnerStructProp) continue;
-
-				auto ModObj = MakeShared<FJsonObject>();
-
-				// Attribute
-				FProperty* AttrProp = InnerStructProp->Struct->FindPropertyByName(TEXT("Attribute"));
-				if (AttrProp)
+				if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(ModifierOpProperty))
 				{
-					FString AttrExport;
-					FStructProperty* AttrStructProp = CastField<FStructProperty>(AttrProp);
-					if (AttrStructProp)
+					const FNumericProperty* UnderlyingProperty = EnumProperty->GetUnderlyingProperty();
+					const void* ValuePtr = EnumProperty->ContainerPtrToValuePtr<void>(ElementPtr);
+					if (UnderlyingProperty && EnumProperty->GetEnum() && ValuePtr)
 					{
-						const void* AttrPtr = AttrStructProp->ContainerPtrToValuePtr<void>(ElemPtr);
-						AttrStructProp->ExportTextItem_Direct(AttrExport, AttrPtr, nullptr, nullptr, PPF_None);
-					}
-					ModObj->SetStringField(TEXT("attribute"), AttrExport);
-				}
-
-				// ModifierOp
-				FProperty* OpProp = InnerStructProp->Struct->FindPropertyByName(TEXT("ModifierOp"));
-				if (OpProp)
-				{
-					FByteProperty* ByteProp = CastField<FByteProperty>(OpProp);
-					FEnumProperty* EnumProp = CastField<FEnumProperty>(OpProp);
-					if (EnumProp)
-					{
-						FNumericProperty* UnderlyingProp = EnumProp->GetUnderlyingProperty();
-						const void* ValuePtr = EnumProp->ContainerPtrToValuePtr<void>(ElemPtr);
-						int64 Value = UnderlyingProp->GetSignedIntPropertyValue(ValuePtr);
-						const UEnum* EnumDef = EnumProp->GetEnum();
-						if (EnumDef) ModObj->SetStringField(TEXT("modifier_op"), EnumDef->GetNameStringByValue(Value));
-					}
-					else if (ByteProp && ByteProp->Enum)
-					{
-						uint8 Value = ByteProp->GetPropertyValue_InContainer(ElemPtr);
-						ModObj->SetStringField(TEXT("modifier_op"), ByteProp->Enum->GetNameStringByValue(Value));
+						ModifierOp = EnumProperty->GetEnum()->GetNameStringByValue(UnderlyingProperty->GetSignedIntPropertyValue(ValuePtr));
 					}
 				}
-
-				// ModifierMagnitude — extract magnitude type
-				FProperty* MagProp = InnerStructProp->Struct->FindPropertyByName(TEXT("ModifierMagnitude"));
-				if (MagProp)
+				else if (const FByteProperty* ByteProperty = CastField<FByteProperty>(ModifierOpProperty))
 				{
-					FStructProperty* MagStructProp = CastField<FStructProperty>(MagProp);
-					if (MagStructProp)
+					if (ByteProperty->Enum)
 					{
-						const void* MagPtr = MagStructProp->ContainerPtrToValuePtr<void>(ElemPtr);
-						// Get MagnitudeCalculationType from FGameplayEffectModifierMagnitude
-						FProperty* MagTypeProp = MagStructProp->Struct->FindPropertyByName(TEXT("MagnitudeCalculationType"));
-						if (MagTypeProp)
+						ModifierOp = ByteProperty->Enum->GetNameStringByValue(ByteProperty->GetPropertyValue_InContainer(ElementPtr));
+					}
+				}
+			}
+			if (!ModifierOp.IsEmpty())
+			{
+				ModifierObject->SetStringField(TEXT("modifier_op"), ModifierOp);
+			}
+
+			if (const FStructProperty* MagnitudeProperty = CastField<FStructProperty>(InnerStructProperty->Struct->FindPropertyByName(TEXT("ModifierMagnitude"))))
+			{
+				const void* MagnitudePtr = MagnitudeProperty->ContainerPtrToValuePtr<void>(ElementPtr);
+				if (const FProperty* MagnitudeTypeProperty = MagnitudeProperty->Struct->FindPropertyByName(TEXT("MagnitudeCalculationType")))
+				{
+					FString MagnitudeType;
+					if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(MagnitudeTypeProperty))
+					{
+						const FNumericProperty* UnderlyingProperty = EnumProperty->GetUnderlyingProperty();
+						const void* ValuePtr = EnumProperty->ContainerPtrToValuePtr<void>(MagnitudePtr);
+						if (UnderlyingProperty && EnumProperty->GetEnum() && ValuePtr)
 						{
-							FByteProperty* MagByteProp = CastField<FByteProperty>(MagTypeProp);
-							FEnumProperty* MagEnumProp = CastField<FEnumProperty>(MagTypeProp);
-							if (MagEnumProp)
+							MagnitudeType = EnumProperty->GetEnum()->GetNameStringByValue(UnderlyingProperty->GetSignedIntPropertyValue(ValuePtr));
+						}
+					}
+					else if (const FByteProperty* ByteProperty = CastField<FByteProperty>(MagnitudeTypeProperty))
+					{
+						if (ByteProperty->Enum)
+						{
+							const uint8* ByteValue = ByteProperty->ContainerPtrToValuePtr<uint8>(MagnitudePtr);
+							if (ByteValue)
 							{
-								FNumericProperty* UnderlyingProp = MagEnumProp->GetUnderlyingProperty();
-								const void* ValuePtr = MagEnumProp->ContainerPtrToValuePtr<void>(MagPtr);
-								int64 Value = UnderlyingProp->GetSignedIntPropertyValue(ValuePtr);
-								const UEnum* EnumDef = MagEnumProp->GetEnum();
-								if (EnumDef) ModObj->SetStringField(TEXT("magnitude_type"), EnumDef->GetNameStringByValue(Value));
-							}
-							else if (MagByteProp && MagByteProp->Enum)
-							{
-								uint8 Value = *MagByteProp->ContainerPtrToValuePtr<uint8>(MagPtr);
-								ModObj->SetStringField(TEXT("magnitude_type"), MagByteProp->Enum->GetNameStringByValue(Value));
+								MagnitudeType = ByteProperty->Enum->GetNameStringByValue(*ByteValue);
 							}
 						}
 					}
-				}
-
-				ModArray.Add(MakeShared<FJsonValueObject>(ModObj));
-			}
-			Props->SetArrayField(TEXT("modifiers"), ModArray);
-		}
-	}
-
-	// GameplayCues array
-	FProperty* CuesProp = CDO->GetClass()->FindPropertyByName(TEXT("GameplayCues"));
-	if (CuesProp)
-	{
-		FArrayProperty* CuesArrayProp = CastField<FArrayProperty>(CuesProp);
-		if (CuesArrayProp)
-		{
-			FScriptArrayHelper CueHelper(CuesArrayProp, CuesArrayProp->ContainerPtrToValuePtr<void>(CDO));
-			TArray<TSharedPtr<FJsonValue>> CueArray;
-
-			for (int32 i = 0; i < CueHelper.Num(); i++)
-			{
-				void* CueElemPtr = CueHelper.GetRawPtr(i);
-				FStructProperty* CueInnerProp = CastField<FStructProperty>(CuesArrayProp->Inner);
-				if (!CueInnerProp) continue;
-
-				// Extract cue tags
-				FProperty* CueTagsProp = CueInnerProp->Struct->FindPropertyByName(TEXT("GameplayCueTags"));
-				if (CueTagsProp)
-				{
-					FStructProperty* CueTagsStructProp = CastField<FStructProperty>(CueTagsProp);
-					if (CueTagsStructProp)
+					if (!MagnitudeType.IsEmpty())
 					{
-						const void* CueTagsPtr = CueTagsStructProp->ContainerPtrToValuePtr<void>(CueElemPtr);
-						const FGameplayTagContainer* CueTagContainer = static_cast<const FGameplayTagContainer*>(CueTagsPtr);
-						if (CueTagContainer)
-						{
-							for (const FGameplayTag& Tag : *CueTagContainer)
-							{
-								CueArray.Add(MakeShared<FJsonValueString>(Tag.ToString()));
-							}
-						}
+						ModifierObject->SetStringField(TEXT("magnitude_type"), MagnitudeType);
 					}
 				}
 			}
-			Props->SetArrayField(TEXT("gameplay_cues"), CueArray);
+
+			Modifiers.Add(MakeShared<FJsonValueObject>(ModifierObject));
+		}
+
+		if (Modifiers.Num() > 0)
+		{
+			Properties->SetArrayField(TEXT("modifiers"), Modifiers);
 		}
 	}
 
-	// GE Components via default subobjects
+	if (const FArrayProperty* GameplayCuesProperty = CastField<FArrayProperty>(Effect->GetClass()->FindPropertyByName(TEXT("GameplayCues"))))
 	{
-		TArray<TSharedPtr<FJsonValue>> ComponentArray;
-		TArray<UObject*> SubObjects;
-		CDO->GetDefaultSubobjects(SubObjects);
-		for (UObject* SubObj : SubObjects)
+		FScriptArrayHelper CueArray(GameplayCuesProperty, GameplayCuesProperty->ContainerPtrToValuePtr<void>(Effect));
+		TArray<TSharedPtr<FJsonValue>> CueTags;
+		for (int32 Index = 0; Index < CueArray.Num(); ++Index)
 		{
-			if (SubObj)
+			const FStructProperty* CueStructProperty = CastField<FStructProperty>(GameplayCuesProperty->Inner);
+			if (!CueStructProperty)
 			{
-				ComponentArray.Add(MakeShared<FJsonValueString>(SubObj->GetClass()->GetName()));
+				continue;
+			}
+
+			void* ElementPtr = CueArray.GetRawPtr(Index);
+			if (const FStructProperty* CueTagsProperty = CastField<FStructProperty>(CueStructProperty->Struct->FindPropertyByName(TEXT("GameplayCueTags"))))
+			{
+				const void* CueTagsPtr = CueTagsProperty->ContainerPtrToValuePtr<void>(ElementPtr);
+				const FGameplayTagContainer* CueTagContainer = static_cast<const FGameplayTagContainer*>(CueTagsPtr);
+				if (!CueTagContainer)
+				{
+					continue;
+				}
+
+				for (const FGameplayTag& CueTag : *CueTagContainer)
+				{
+					CueTags.Add(MakeShared<FJsonValueString>(CueTag.ToString()));
+				}
 			}
 		}
-		if (ComponentArray.Num() > 0)
+
+		if (CueTags.Num() > 0)
 		{
-			Props->SetArrayField(TEXT("components"), ComponentArray);
+			Properties->SetArrayField(TEXT("gameplay_cues"), CueTags);
 		}
 	}
 
-	FIndexedNode Node;
-	Node.AssetId = AssetId;
-	Node.NodeName = CDO->GetClass()->GetName();
-	Node.NodeClass = TEXT("GameplayEffect");
-	Node.NodeType = TEXT("GameplayEffect");
-	Node.Properties = JsonToString(Props);
-	return DB.InsertNode(Node);
+	TArray<UObject*> DefaultSubobjects;
+	Effect->GetDefaultSubobjects(DefaultSubobjects);
+	if (DefaultSubobjects.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> ComponentClasses;
+		for (UObject* Subobject : DefaultSubobjects)
+		{
+			if (Subobject)
+			{
+				ComponentClasses.Add(MakeShared<FJsonValueString>(Subobject->GetClass()->GetName()));
+			}
+		}
+		if (ComponentClasses.Num() > 0)
+		{
+			Properties->SetArrayField(TEXT("components"), ComponentClasses);
+		}
+	}
+
+	return GASIndexerInternal::BuildNode(AssetData, Blueprint, TEXT("GameplayEffect"), Properties, OutNode);
 }
 
-// ─────────────────────────────────────────────────────────────
-// IndexAttributeSet
-// ─────────────────────────────────────────────────────────────
-
-int64 FGASIndexer::IndexAttributeSet(UClass* Class, FMonolithIndexDatabase& DB, int64 AssetId)
+bool FGASIndexer::BuildAttributeSetNode(
+	const FAssetData& AssetData,
+	UBlueprint* Blueprint,
+	FIndexedNode& OutNode) const
 {
-	if (!Class) return -1;
+	UAttributeSet* AttributeSet = Blueprint && Blueprint->GeneratedClass
+		? Cast<UAttributeSet>(Blueprint->GeneratedClass->GetDefaultObject(false))
+		: nullptr;
+	if (!AttributeSet || !Blueprint->GeneratedClass)
+	{
+		return false;
+	}
 
-	UObject* CDO = Class->GetDefaultObject(false);
-	if (!CDO) return -1;
-
-	auto Props = MakeShared<FJsonObject>();
-	Props->SetStringField(TEXT("class"), Class->GetName());
-	Props->SetStringField(TEXT("parent_class"), Class->GetSuperClass() ? Class->GetSuperClass()->GetName() : TEXT("None"));
-	Props->SetBoolField(TEXT("is_native"), Class->ClassGeneratedBy == nullptr);
+	TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+	GASIndexerInternal::PopulateCommonNodeFields(AssetData, Blueprint, Properties);
+	Properties->SetBoolField(TEXT("is_native"), false);
 
 	TArray<TSharedPtr<FJsonValue>> Attributes;
-	for (TFieldIterator<FProperty> It(Class); It; ++It)
+	for (TFieldIterator<FProperty> PropertyIt(Blueprint->GeneratedClass, EFieldIteratorFlags::IncludeSuper, EFieldIteratorFlags::ExcludeDeprecated); PropertyIt; ++PropertyIt)
 	{
-		FStructProperty* StructProp = CastField<FStructProperty>(*It);
-		if (!StructProp || !StructProp->Struct) continue;
-		if (StructProp->Struct->GetName() != TEXT("GameplayAttributeData")) continue;
-
-		auto AttrObj = MakeShared<FJsonObject>();
-		AttrObj->SetStringField(TEXT("name"), It->GetName());
-
-		// Extract default value via reflection
-		const void* ValuePtr = StructProp->ContainerPtrToValuePtr<void>(CDO);
-		// FGameplayAttributeData has BaseValue and CurrentValue (both float)
-		FProperty* BaseValueProp = StructProp->Struct->FindPropertyByName(TEXT("BaseValue"));
-		if (BaseValueProp)
+		const FStructProperty* StructProperty = CastField<FStructProperty>(*PropertyIt);
+		if (!StructProperty || !StructProperty->Struct || StructProperty->Struct->GetName() != TEXT("GameplayAttributeData"))
 		{
-			FFloatProperty* FloatProp = CastField<FFloatProperty>(BaseValueProp);
-			FDoubleProperty* DoubleProp = CastField<FDoubleProperty>(BaseValueProp);
-			if (FloatProp)
+			continue;
+		}
+
+		TSharedPtr<FJsonObject> AttributeObject = MakeShared<FJsonObject>();
+		AttributeObject->SetStringField(TEXT("name"), PropertyIt->GetName());
+		AttributeObject->SetStringField(TEXT("owning_class"), Blueprint->GeneratedClass->GetName());
+
+		const void* ValuePtr = StructProperty->ContainerPtrToValuePtr<void>(AttributeSet);
+		if (const FProperty* BaseValueProperty = StructProperty->Struct->FindPropertyByName(TEXT("BaseValue")))
+		{
+			if (const FFloatProperty* FloatProperty = CastField<FFloatProperty>(BaseValueProperty))
 			{
-				float Val = *FloatProp->ContainerPtrToValuePtr<float>(ValuePtr);
-				AttrObj->SetNumberField(TEXT("base_value"), Val);
+				AttributeObject->SetNumberField(TEXT("base_value"), FloatProperty->GetPropertyValue_InContainer(ValuePtr));
 			}
-			else if (DoubleProp)
+			else if (const FDoubleProperty* DoubleProperty = CastField<FDoubleProperty>(BaseValueProperty))
 			{
-				double Val = *DoubleProp->ContainerPtrToValuePtr<double>(ValuePtr);
-				AttrObj->SetNumberField(TEXT("base_value"), Val);
+				AttributeObject->SetNumberField(TEXT("base_value"), DoubleProperty->GetPropertyValue_InContainer(ValuePtr));
 			}
 		}
 
-		// Owning class for the attribute
-		AttrObj->SetStringField(TEXT("owning_class"), Class->GetName());
-
-		Attributes.Add(MakeShared<FJsonValueObject>(AttrObj));
+		Attributes.Add(MakeShared<FJsonValueObject>(AttributeObject));
 	}
-	Props->SetArrayField(TEXT("attributes"), Attributes);
 
-	FIndexedNode Node;
-	Node.AssetId = AssetId;
-	Node.NodeName = Class->GetName();
-	Node.NodeClass = TEXT("AttributeSet");
-	Node.NodeType = TEXT("AttributeSet");
-	Node.Properties = JsonToString(Props);
-	return DB.InsertNode(Node);
+	if (Attributes.Num() > 0)
+	{
+		Properties->SetArrayField(TEXT("attributes"), Attributes);
+	}
+
+	return GASIndexerInternal::BuildNode(AssetData, Blueprint, TEXT("AttributeSet"), Properties, OutNode);
 }
 
-// ─────────────────────────────────────────────────────────────
-// IndexGameplayCue
-// ─────────────────────────────────────────────────────────────
-
-int64 FGASIndexer::IndexGameplayCue(UObject* CDO, const FString& AssetPath, FMonolithIndexDatabase& DB, int64 AssetId, bool bIsActor)
+bool FGASIndexer::BuildGameplayCueNode(
+	const FAssetData& AssetData,
+	UBlueprint* Blueprint,
+	FIndexedNode& OutNode) const
 {
-	if (!CDO) return -1;
-
-	auto Props = MakeShared<FJsonObject>();
-	Props->SetStringField(TEXT("asset_path"), AssetPath);
-	Props->SetStringField(TEXT("class"), CDO->GetClass()->GetName());
-	Props->SetStringField(TEXT("notify_type"), bIsActor ? TEXT("Actor") : TEXT("Static"));
-
-	// GameplayCueTag
-	FProperty* TagProp = CDO->GetClass()->FindPropertyByName(TEXT("GameplayCueTag"));
-	if (TagProp)
+	if (!Blueprint || !Blueprint->GeneratedClass)
 	{
-		FStructProperty* TagStructProp = CastField<FStructProperty>(TagProp);
-		if (TagStructProp)
+		return false;
+	}
+
+	UObject* DefaultObject = Blueprint->GeneratedClass->GetDefaultObject(false);
+	if (!DefaultObject)
+	{
+		return false;
+	}
+
+	const bool bIsActorCue = Blueprint->GeneratedClass->IsChildOf(AGameplayCueNotify_Actor::StaticClass());
+	TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+	GASIndexerInternal::PopulateCommonNodeFields(AssetData, Blueprint, Properties);
+	Properties->SetStringField(TEXT("notify_type"), bIsActorCue ? TEXT("Actor") : TEXT("Static"));
+
+	if (const FStructProperty* CueTagProperty = CastField<FStructProperty>(DefaultObject->GetClass()->FindPropertyByName(TEXT("GameplayCueTag"))))
+	{
+		const void* TagPtr = CueTagProperty->ContainerPtrToValuePtr<void>(DefaultObject);
+		const FGameplayTag* CueTag = static_cast<const FGameplayTag*>(TagPtr);
+		if (CueTag && CueTag->IsValid())
 		{
-			const void* TagPtr = TagStructProp->ContainerPtrToValuePtr<void>(CDO);
-			const FGameplayTag* Tag = static_cast<const FGameplayTag*>(TagPtr);
-			if (Tag && Tag->IsValid())
-			{
-				Props->SetStringField(TEXT("gameplay_cue_tag"), Tag->ToString());
-			}
-			else
-			{
-				Props->SetStringField(TEXT("gameplay_cue_tag"), TEXT("None"));
-			}
+			Properties->SetStringField(TEXT("gameplay_cue_tag"), CueTag->ToString());
 		}
 	}
 
-	FIndexedNode Node;
-	Node.AssetId = AssetId;
-	Node.NodeName = CDO->GetClass()->GetName();
-	Node.NodeClass = bIsActor ? TEXT("GameplayCueNotify_Actor") : TEXT("GameplayCueNotify_Static");
-	Node.NodeType = TEXT("GameplayCue");
-	Node.Properties = JsonToString(Props);
-	return DB.InsertNode(Node);
+	return GASIndexerInternal::BuildNode(AssetData, Blueprint, TEXT("GameplayCue"), Properties, OutNode);
 }

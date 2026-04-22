@@ -1,53 +1,45 @@
 #include "Actions/ProjectSearchAction.h"
+#include "Actions/MonolithProjectActionUtils.h"
 #include "MonolithIndexSubsystem.h"
+#include "MonolithProjectQueryPayload.h"
 #include "MonolithParamSchema.h"
-#include "Editor.h"
+#include "Dom/JsonObject.h"
+
+/*
+ * 这个 action 是最常用的“项目全文搜索”入口。
+ *
+ * 它会调用子系统的 Search，
+ * 然后把结果整理成 MCP 友好的 JSON：
+ * - 命中的资产列表；
+ * - 当前是否正在索引；
+ * - 进度、剩余数量、ETA 这些状态信息。
+ */
 
 FMonolithActionResult FProjectSearchAction::Execute(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Query = Params->GetStringField(TEXT("query"));
-	int32 Limit = Params->HasField(TEXT("limit")) ? Params->GetIntegerField(TEXT("limit")) : 50;
-
-	if (Query.IsEmpty())
+	FString Query;
+	if (!MonolithProjectActionUtils::TryGetRequiredStringParam(Params, TEXT("query"), Query))
 	{
-		return FMonolithActionResult::Error(TEXT("'query' parameter is required"), -32602);
+		return MonolithProjectActionUtils::MakeMissingStringParamError(TEXT("query"));
 	}
 
-	UMonolithIndexSubsystem* Subsystem = GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>();
+	const int32 Limit = MonolithProjectActionUtils::GetOptionalIntParam(Params, TEXT("limit"), 50);
+	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
 	if (!Subsystem)
 	{
-		return FMonolithActionResult::Error(TEXT("Index subsystem not available"));
+		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
 	}
 
-	if (Subsystem->IsIndexing())
-	{
-		auto Result = MakeShared<FJsonObject>();
-		Result->SetBoolField(TEXT("success"), false);
-		Result->SetStringField(TEXT("error"), TEXT("Indexing is currently in progress"));
-		Result->SetNumberField(TEXT("progress"), Subsystem->GetProgress());
-		return FMonolithActionResult::Success(Result);
-	}
-
-	TArray<FSearchResult> SearchResults = Subsystem->Search(Query, Limit);
-
-	auto Result = MakeShared<FJsonObject>();
-	TArray<TSharedPtr<FJsonValue>> ResultsArr;
-	for (const FSearchResult& SR : SearchResults)
-	{
-		auto Entry = MakeShared<FJsonObject>();
-		Entry->SetStringField(TEXT("asset_path"), SR.AssetPath);
-		Entry->SetStringField(TEXT("asset_name"), SR.AssetName);
-		Entry->SetStringField(TEXT("asset_class"), SR.AssetClass);
-		Entry->SetStringField(TEXT("module_name"), SR.ModuleName);
-		Entry->SetStringField(TEXT("match_context"), SR.MatchContext);
-		Entry->SetNumberField(TEXT("rank"), SR.Rank);
-		ResultsArr.Add(MakeShared<FJsonValueObject>(Entry));
-	}
-
-	Result->SetBoolField(TEXT("success"), true);
-	Result->SetArrayField(TEXT("results"), ResultsArr);
-	Result->SetNumberField(TEXT("count"), SearchResults.Num());
-	return FMonolithActionResult::Success(Result);
+	const TArray<FSearchResult> SearchResults = Subsystem->Search(Query, Limit);
+	const bool bIndexingInProgress = Subsystem->IsIndexing();
+	const float Progress = Subsystem->GetProgress();
+	const TSharedPtr<FJsonObject> Stats = Subsystem->GetStats();
+	return FMonolithActionResult::Success(
+		MonolithProjectQueryPayload::BuildSearchResponse(
+			SearchResults,
+			bIndexingInProgress,
+			Progress,
+			Stats));
 }
 
 TSharedPtr<FJsonObject> FProjectSearchAction::GetSchema()
