@@ -218,9 +218,6 @@ public:
 	bool bEnableConfig = true;
 
 	UPROPERTY(config, EditAnywhere, Category="Modules")
-	bool bEnableAudio = true;
-
-	UPROPERTY(config, EditAnywhere, Category="Modules")
 	bool bEnableIndex = true;
 
 	UPROPERTY(config, EditAnywhere, Category="Modules")
