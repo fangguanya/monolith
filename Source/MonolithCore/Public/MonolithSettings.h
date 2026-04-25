@@ -164,9 +164,9 @@ public:
 		meta=(ClampMin="0.0", ClampMax="1.0", ToolTip="Sleep time when throttling due to memory pressure."))
 	float YieldTimeSeconds = 0.1f;
 
-	/** Defer first-time indexing until explicitly triggered via console command. Useful for very large projects. */
+	/** 兼容旧配置保留的开关；full index 现在统一改成手动触发。 */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Performance", DisplayName="Defer First-Time Index",
-		meta=(ToolTip="If true, first-time indexing won't run automatically. Use 'Monolith.StartIndex' console command to trigger."))
+		meta=(ToolTip="Deprecated: full index is manual-only now. Use 'Monolith.StartIndex full' to trigger a rebuild when needed."))
 	bool bDeferFirstTimeIndex = false;
 
 	/** Log memory statistics periodically during indexing. Off by default to keep shipped-project logs quiet — opt in when debugging indexer behavior. */

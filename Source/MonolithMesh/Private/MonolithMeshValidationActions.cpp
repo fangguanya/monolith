@@ -572,7 +572,7 @@ FMonolithActionResult FMonolithMeshTemplateActions::BatchValidate(const TSharedP
 
 	if (!IndexSubsystem)
 	{
-		Result->SetStringField(TEXT("warning"), TEXT("Mesh catalog not available — run monolith_reindex() first for catalog pre-filtering. Falling back to slower asset-load validation."));
+		Result->SetStringField(TEXT("warning"), TEXT("Mesh catalog not available — run 'Monolith.StartIndex full' first for catalog pre-filtering. Falling back to slower asset-load validation."));
 	}
 
 	return FMonolithActionResult::Success(Result);

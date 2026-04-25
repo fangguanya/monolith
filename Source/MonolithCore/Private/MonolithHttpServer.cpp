@@ -5,7 +5,9 @@
 #include "MonolithSettings.h"
 #include "HttpServerModule.h"
 #include "HttpServerResponse.h"
+#include "Async/Async.h"
 #include "GenericPlatform/GenericPlatformProcess.h"
+#include "HAL/PlatformTime.h"
 
 FMonolithHttpServer::FMonolithHttpServer()
 {
@@ -164,50 +166,24 @@ bool FMonolithHttpServer::HandlePostMcp(const FHttpServerRequest& Request, const
 		}
 	}
 
-	// Process each request
-	for (const TSharedPtr<FJsonObject>& Req : Requests)
+	AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [this, Requests, OnComplete]()
 	{
-		TSharedPtr<FJsonObject> Resp = ProcessJsonRpcRequest(Req);
-		if (Resp.IsValid())
+		TArray<TSharedPtr<FJsonObject>> AsyncResponses;
+		AsyncResponses.Reserve(Requests.Num());
+		for (const TSharedPtr<FJsonObject>& Req : Requests)
 		{
-			// Only add response if it's not a notification (notifications have no id)
-			Responses.Add(Resp);
+			TSharedPtr<FJsonObject> Resp = ProcessJsonRpcRequest(Req);
+			if (Resp.IsValid())
+			{
+				AsyncResponses.Add(Resp);
+			}
 		}
-	}
 
-	// Build response
-	FString ResponseBody;
-	if (Responses.Num() == 0)
-	{
-		// All notifications — 202 Accepted with no body
-		auto Response = FHttpServerResponse::Ok();
-		Response->Code = EHttpServerResponseCodes::Accepted;
-		AddCorsHeaders(*Response);
-		OnComplete(MoveTemp(Response));
-		return true;
-	}
-	else if (Responses.Num() == 1)
-	{
-		ResponseBody = FMonolithJsonUtils::Serialize(Responses[0]);
-	}
-	else
-	{
-		// Batch response — serialize as array
-		TArray<TSharedPtr<FJsonValue>> JsonArray;
-		for (const TSharedPtr<FJsonObject>& Resp : Responses)
+		AsyncTask(ENamedThreads::GameThread, [this, OnComplete, AsyncResponses]()
 		{
-			JsonArray.Add(MakeShared<FJsonValueObject>(Resp));
-		}
-		FString ArrayStr;
-		TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&ArrayStr);
-		FJsonSerializer::Serialize(JsonArray, Writer);
-		ResponseBody = ArrayStr;
-	}
-
-	auto Response = MakeJsonResponse(ResponseBody);
-	AddCorsHeaders(*Response);
-	OnComplete(MoveTemp(Response));
+			OnComplete(BuildPostMcpResponse(AsyncResponses));
+		});
+	});
 	return true;
 }
 
@@ -592,40 +568,54 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandleToolsCall(const TSharedPtr<FJ
 			FString::Printf(TEXT("Unknown tool: %s"), *ToolName));
 	}
 
-	// Execute via registry
-	FMonolithActionResult ActionResult = FMonolithToolRegistry::Get().ExecuteAction(Namespace, Action, Arguments);
-
-	// Build MCP tool result
-	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-	TArray<TSharedPtr<FJsonValue>> Content;
-
-	if (ActionResult.bSuccess)
+	EMonolithActionExecutionPolicy ExecutionPolicy = EMonolithActionExecutionPolicy::GameThread;
+	bool bActionInfoFound = false;
+	for (const FMonolithActionInfo& ActionInfo : FMonolithToolRegistry::Get().GetActions(Namespace))
 	{
-		TSharedPtr<FJsonObject> TextContent = MakeShared<FJsonObject>();
-		TextContent->SetStringField(TEXT("type"), TEXT("text"));
-		if (ActionResult.Result.IsValid())
+		if (ActionInfo.Action == Action)
 		{
-			TextContent->SetStringField(TEXT("text"), FMonolithJsonUtils::Serialize(ActionResult.Result));
+			ExecutionPolicy = ActionInfo.ExecutionPolicy;
+			bActionInfoFound = true;
+			break;
 		}
-		else
+	}
+	if (!bActionInfoFound)
+	{
+		ExecutionPolicy = EMonolithActionExecutionPolicy::BackgroundThread;
+	}
+
+	const FString RequestId = Id.IsValid() ? Id->AsString() : TEXT("notification");
+	const double StartSeconds = FPlatformTime::Seconds();
+	FMonolithActionResult ActionResult;
+	if (ExecutionPolicy == EMonolithActionExecutionPolicy::GameThread && !IsInGameThread())
+	{
+		FEvent* CompletionEvent = FPlatformProcess::GetSynchEventFromPool(true);
+		AsyncTask(ENamedThreads::GameThread, [&ActionResult, Namespace, Action, Arguments, CompletionEvent]()
 		{
-			TextContent->SetStringField(TEXT("text"), TEXT("{}"));
-		}
-		Content.Add(MakeShared<FJsonValueObject>(TextContent));
-		Result->SetBoolField(TEXT("isError"), false);
+			UE_LOG(LogMonolith, Display, TEXT("MCP started %s.%s policy=game_thread thread=GameThread"), *Namespace, *Action);
+			ActionResult = FMonolithToolRegistry::Get().ExecuteAction(Namespace, Action, Arguments);
+			CompletionEvent->Trigger();
+		});
+		CompletionEvent->Wait();
+		FPlatformProcess::ReturnSynchEventToPool(CompletionEvent);
 	}
 	else
 	{
-		TSharedPtr<FJsonObject> TextContent = MakeShared<FJsonObject>();
-		TextContent->SetStringField(TEXT("type"), TEXT("text"));
-		TextContent->SetStringField(TEXT("text"), ActionResult.ErrorMessage);
-		Content.Add(MakeShared<FJsonValueObject>(TextContent));
-		Result->SetBoolField(TEXT("isError"), true);
+		LogMcpExecution(RequestId, Namespace, Action, ExecutionPolicy, TEXT("started"));
+		ActionResult = FMonolithToolRegistry::Get().ExecuteAction(Namespace, Action, Arguments);
 	}
+	const double ElapsedMs = (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
+	if (ExecutionPolicy == EMonolithActionExecutionPolicy::GameThread && !IsInGameThread())
+	{
+		AsyncTask(ENamedThreads::GameThread, [this, RequestId, Namespace, Action, ExecutionPolicy, ElapsedMs, ErrorMessage = ActionResult.ErrorMessage, bSuccess = ActionResult.bSuccess]()
+		{
+			LogMcpExecution(RequestId, Namespace, Action, ExecutionPolicy, bSuccess ? TEXT("completed") : TEXT("failed"), ElapsedMs, ErrorMessage);
+		});
+		return BuildToolResultResponse(Id, ActionResult);
+	}
+	LogMcpExecution(RequestId, Namespace, Action, ExecutionPolicy, ActionResult.bSuccess ? TEXT("completed") : TEXT("failed"), ElapsedMs, ActionResult.ErrorMessage);
 
-	Result->SetArrayField(TEXT("content"), Content);
-
-	return FMonolithJsonUtils::SuccessResponse(Id, MakeShared<FJsonValueObject>(Result));
+	return BuildToolResultResponse(Id, ActionResult);
 }
 
 TSharedPtr<FJsonObject> FMonolithHttpServer::HandlePing(const TSharedPtr<FJsonValue>& Id)
@@ -633,9 +623,91 @@ TSharedPtr<FJsonObject> FMonolithHttpServer::HandlePing(const TSharedPtr<FJsonVa
 	return FMonolithJsonUtils::SuccessResponse(Id, MakeShared<FJsonValueObject>(MakeShared<FJsonObject>()));
 }
 
+TSharedPtr<FJsonObject> FMonolithHttpServer::BuildToolResultResponse(
+	const TSharedPtr<FJsonValue>& Id,
+	const FMonolithActionResult& ActionResult) const
+{
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> Content;
+	TSharedPtr<FJsonObject> TextContent = MakeShared<FJsonObject>();
+	TextContent->SetStringField(TEXT("type"), TEXT("text"));
+
+	if (ActionResult.bSuccess)
+	{
+		TextContent->SetStringField(
+			TEXT("text"),
+			ActionResult.Result.IsValid() ? FMonolithJsonUtils::Serialize(ActionResult.Result) : FString(TEXT("{}")));
+		Result->SetBoolField(TEXT("isError"), false);
+	}
+	else
+	{
+		TextContent->SetStringField(TEXT("text"), ActionResult.ErrorMessage);
+		Result->SetBoolField(TEXT("isError"), true);
+	}
+
+	Content.Add(MakeShared<FJsonValueObject>(TextContent));
+	Result->SetArrayField(TEXT("content"), Content);
+	return FMonolithJsonUtils::SuccessResponse(Id, MakeShared<FJsonValueObject>(Result));
+}
+
+void FMonolithHttpServer::LogMcpExecution(
+	const FString& RequestId,
+	const FString& Namespace,
+	const FString& Action,
+	EMonolithActionExecutionPolicy ExecutionPolicy,
+	const TCHAR* Phase,
+	double ElapsedMs,
+	const FString& ErrorMessage) const
+{
+	const TCHAR* ThreadName = IsInGameThread() ? TEXT("GameThread") : TEXT("BackgroundThread");
+	const TCHAR* PolicyName = ExecutionPolicy == EMonolithActionExecutionPolicy::BackgroundThread ? TEXT("background") : TEXT("game_thread");
+	const FString ToolName = FString::Printf(TEXT("%s.%s"), *Namespace, *Action);
+	if (ErrorMessage.IsEmpty())
+	{
+		UE_LOG(LogMonolith, Display, TEXT("MCP[%s] %s %s policy=%s thread=%s elapsed=%.2fms"), *RequestId, Phase, *ToolName, PolicyName, ThreadName, ElapsedMs);
+	}
+	else
+	{
+		UE_LOG(LogMonolith, Warning, TEXT("MCP[%s] %s %s policy=%s thread=%s elapsed=%.2fms error=%s"), *RequestId, Phase, *ToolName, PolicyName, ThreadName, ElapsedMs, *ErrorMessage);
+	}
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
+
+TUniquePtr<FHttpServerResponse> FMonolithHttpServer::BuildPostMcpResponse(const TArray<TSharedPtr<FJsonObject>>& Responses)
+{
+	if (Responses.Num() == 0)
+	{
+		auto Response = FHttpServerResponse::Ok();
+		Response->Code = EHttpServerResponseCodes::Accepted;
+		AddCorsHeaders(*Response);
+		return Response;
+	}
+
+	FString ResponseBody;
+	if (Responses.Num() == 1)
+	{
+		ResponseBody = FMonolithJsonUtils::Serialize(Responses[0]);
+	}
+	else
+	{
+		TArray<TSharedPtr<FJsonValue>> JsonArray;
+		JsonArray.Reserve(Responses.Num());
+		for (const TSharedPtr<FJsonObject>& Resp : Responses)
+		{
+			JsonArray.Add(MakeShared<FJsonValueObject>(Resp));
+		}
+		TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+			TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&ResponseBody);
+		FJsonSerializer::Serialize(JsonArray, Writer);
+	}
+
+	auto Response = MakeJsonResponse(ResponseBody);
+	AddCorsHeaders(*Response);
+	return Response;
+}
 
 TUniquePtr<FHttpServerResponse> FMonolithHttpServer::MakeJsonResponse(const FString& JsonBody, EHttpServerResponseCodes Code)
 {
@@ -665,4 +737,3 @@ void FMonolithHttpServer::AddCorsHeaders(FHttpServerResponse& Response)
 	Response.Headers.Add(TEXT("Access-Control-Allow-Methods"), {TEXT("GET, POST, DELETE, OPTIONS")});
 	Response.Headers.Add(TEXT("Access-Control-Allow-Headers"), {TEXT("Content-Type")});
 }
-

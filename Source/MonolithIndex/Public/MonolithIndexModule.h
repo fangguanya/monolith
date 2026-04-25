@@ -7,7 +7,7 @@
  *
  * 它主要做两件事：
  * 1. 启动时把 project.* 这批 MCP action 注册出去；
- * 2. 在编辑器模式下把状态栏小部件挂到 LevelEditor 的工具条上。
+ * 2. 在编辑器模式下把状态栏小部件和顶部索引按钮挂到 LevelEditor 的工具条上。
  *
  * 真正的索引逻辑不在这里跑。
  * 这个模块更像“接线员”，负责把外界入口和 MonolithIndex 子系统接起来。
@@ -21,6 +21,6 @@ public:
 	virtual void ShutdownModule() override;
 
 private:
-	/** 把 MonolithIndex 状态栏小部件挂到编辑器工具条。 */
+	/** 把 MonolithIndex 的状态栏和顶部工具栏入口挂到编辑器工具条。 */
 	void RegisterMenus();
 };

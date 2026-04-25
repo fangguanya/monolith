@@ -22,24 +22,22 @@ FMonolithActionResult FProjectGetAssetDetailsAction::Execute(const TSharedPtr<FJ
 		return MonolithProjectActionUtils::MakeMissingStringParamError(TEXT("package_path"));
 	}
 
-	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
-	if (!Subsystem)
-	{
-		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
-	}
+	return MonolithProjectActionUtils::RunReadDatabaseAction(
+		[&](FMonolithIndexDatabase& Database) -> FMonolithActionResult
+		{
+			const TSharedPtr<FJsonObject> Details = Database.GetAssetDetails(PackagePath);
+			if (!Details.IsValid() || !Details->HasField(TEXT("asset_name")))
+			{
+				return FMonolithActionResult::Error(TEXT("Asset not found in index"));
+			}
 
-	const TSharedPtr<FJsonObject> Details = Subsystem->GetAssetDetails(PackagePath);
-	if (!Details.IsValid() || !Details->HasField(TEXT("asset_name")))
-	{
-		return FMonolithActionResult::Error(TEXT("Asset not found in index"));
-	}
-
-	auto Result = MakeShared<FJsonObject>();
-	Result->SetBoolField(TEXT("success"), true);
-	Result->SetObjectField(TEXT("asset"), Details);
-	// stale 字段不是每条详情都一定有，所以这里做一次“有就拿，没有就 false”。
-	Result->SetBoolField(TEXT("stale"), Details->HasTypedField<EJson::Boolean>(TEXT("stale")) ? Details->GetBoolField(TEXT("stale")) : false);
-	return FMonolithActionResult::Success(Result);
+			auto Result = MakeShared<FJsonObject>();
+			Result->SetBoolField(TEXT("success"), true);
+			Result->SetObjectField(TEXT("asset"), Details);
+			// stale 字段不是每条详情都一定有，所以这里做一次“有就拿，没有就 false”。
+			Result->SetBoolField(TEXT("stale"), Details->HasTypedField<EJson::Boolean>(TEXT("stale")) ? Details->GetBoolField(TEXT("stale")) : false);
+			return FMonolithActionResult::Success(Result);
+		});
 }
 
 TSharedPtr<FJsonObject> FProjectGetAssetDetailsAction::GetSchema()

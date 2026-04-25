@@ -15,32 +15,30 @@ FMonolithActionResult FProjectListGameplayTagsAction::Execute(const TSharedPtr<F
 {
 	const FString Prefix = MonolithProjectActionUtils::GetOptionalStringParam(Params, TEXT("prefix"));
 
-	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
-	if (!Subsystem)
-	{
-		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
-	}
+	return MonolithProjectActionUtils::RunReadDatabaseAction(
+		[&](FMonolithIndexDatabase& Database) -> FMonolithActionResult
+		{
+			const TArray<FIndexedGameplayTagSummary> TagSummaries = Database.ListGameplayTags(Prefix);
+			TArray<TSharedPtr<FJsonValue>> TagsArr;
+			for (const FIndexedGameplayTagSummary& TagSummary : TagSummaries)
+			{
+				auto Entry = MakeShared<FJsonObject>();
+				Entry->SetStringField(TEXT("tag_name"), TagSummary.TagName);
+				Entry->SetStringField(TEXT("parent_tag"), TagSummary.ParentTag);
+				Entry->SetNumberField(TEXT("reference_count"), static_cast<double>(TagSummary.ReferenceCount));
+				TagsArr.Add(MakeShared<FJsonValueObject>(Entry));
+			}
 
-	const TArray<FIndexedGameplayTagSummary> TagSummaries = Subsystem->ListGameplayTags(Prefix);
-	TArray<TSharedPtr<FJsonValue>> TagsArr;
-	for (const FIndexedGameplayTagSummary& TagSummary : TagSummaries)
-	{
-		auto Entry = MakeShared<FJsonObject>();
-		Entry->SetStringField(TEXT("tag_name"), TagSummary.TagName);
-		Entry->SetStringField(TEXT("parent_tag"), TagSummary.ParentTag);
-		Entry->SetNumberField(TEXT("reference_count"), static_cast<double>(TagSummary.ReferenceCount));
-		TagsArr.Add(MakeShared<FJsonValueObject>(Entry));
-	}
-
-	auto Result = MakeShared<FJsonObject>();
-	Result->SetBoolField(TEXT("success"), true);
-	Result->SetArrayField(TEXT("tags"), TagsArr);
-	Result->SetNumberField(TEXT("count"), TagsArr.Num());
-	if (!Prefix.IsEmpty())
-	{
-		Result->SetStringField(TEXT("prefix_filter"), Prefix);
-	}
-	return FMonolithActionResult::Success(Result);
+			auto Result = MakeShared<FJsonObject>();
+			Result->SetBoolField(TEXT("success"), true);
+			Result->SetArrayField(TEXT("tags"), TagsArr);
+			Result->SetNumberField(TEXT("count"), TagsArr.Num());
+			if (!Prefix.IsEmpty())
+			{
+				Result->SetStringField(TEXT("prefix_filter"), Prefix);
+			}
+			return FMonolithActionResult::Success(Result);
+		});
 }
 
 TSharedPtr<FJsonObject> FProjectListGameplayTagsAction::GetSchema()

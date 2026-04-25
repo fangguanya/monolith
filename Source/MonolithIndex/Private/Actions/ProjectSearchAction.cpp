@@ -24,22 +24,19 @@ FMonolithActionResult FProjectSearchAction::Execute(const TSharedPtr<FJsonObject
 	}
 
 	const int32 Limit = MonolithProjectActionUtils::GetOptionalIntParam(Params, TEXT("limit"), 50);
-	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
-	if (!Subsystem)
-	{
-		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
-	}
 
-	const TArray<FSearchResult> SearchResults = Subsystem->Search(Query, Limit);
-	const bool bIndexingInProgress = Subsystem->IsIndexing();
-	const float Progress = Subsystem->GetProgress();
-	const TSharedPtr<FJsonObject> Stats = Subsystem->GetStats();
-	return FMonolithActionResult::Success(
-		MonolithProjectQueryPayload::BuildSearchResponse(
-			SearchResults,
-			bIndexingInProgress,
-			Progress,
-			Stats));
+	return MonolithProjectActionUtils::RunReadDatabaseAction(
+		[&](FMonolithIndexDatabase& Database) -> FMonolithActionResult
+		{
+			const TArray<FSearchResult> SearchResults = Database.FullTextSearch(Query, Limit);
+			const TSharedPtr<FJsonObject> Stats = Database.GetStats();
+			return FMonolithActionResult::Success(
+				MonolithProjectQueryPayload::BuildSearchResponse(
+					SearchResults,
+					false,
+					0.0f,
+					Stats));
+		});
 }
 
 TSharedPtr<FJsonObject> FProjectSearchAction::GetSchema()

@@ -3,8 +3,12 @@
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
 #include "Editor.h"
+#include "Interfaces/IPluginManager.h"
+#include "MonolithIndexDatabase.h"
 #include "MonolithIndexSubsystem.h"
+#include "MonolithSettings.h"
 #include "MonolithToolRegistry.h"
+#include "Misc/Paths.h"
 #include "Serialization/JsonTypes.h"
 
 /*
@@ -43,6 +47,71 @@ namespace MonolithProjectActionUtils
 	inline UMonolithIndexSubsystem* GetIndexSubsystem()
 	{
 		return GEditor ? GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>() : nullptr;
+	}
+
+	/** 在不触碰 editor subsystem 的情况下解析 ProjectIndex.db 路径，供后台只读查询使用。 */
+	inline FString ResolveIndexDatabasePath()
+	{
+		const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
+		if (Settings && !Settings->DatabasePathOverride.Path.IsEmpty())
+		{
+			FString OverridePath = FPaths::ConvertRelativePathToFull(Settings->DatabasePathOverride.Path);
+			if (FPaths::GetExtension(OverridePath).Equals(TEXT("db"), ESearchCase::IgnoreCase))
+			{
+				return OverridePath;
+			}
+			return OverridePath / TEXT("ProjectIndex.db");
+		}
+
+		TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Monolith"));
+		if (Plugin.IsValid())
+		{
+			return Plugin->GetBaseDir() / TEXT("Saved") / TEXT("ProjectIndex.db");
+		}
+		return FPaths::ProjectPluginsDir() / TEXT("Monolith") / TEXT("Saved") / TEXT("ProjectIndex.db");
+	}
+
+	/** 在 commandlet / 无 GEditor 场景下打开一个独立查询连接。
+	 * 编辑器进程内有 UMonolithIndexSubsystem 时不要再走这条路 —— 
+	 * 用 RunReadDatabaseAction 复用子系统持有的主连接更稳。 */
+	inline bool OpenQueryOnlyIndexDatabase(FMonolithIndexDatabase& Database, FString& OutError)
+	{
+		const FString DatabasePath = ResolveIndexDatabasePath();
+		if (!FPaths::FileExists(DatabasePath))
+		{
+			OutError = FString::Printf(TEXT("Index database not found: %s"), *DatabasePath);
+			return false;
+		}
+		if (!Database.OpenQueryOnly(DatabasePath))
+		{
+			OutError = FString::Printf(TEXT("Failed to open index database query-only: %s"), *DatabasePath);
+			return false;
+		}
+		return true;
+	}
+
+	/** project.* 查询统一入口。
+	 * 编辑器里走 UMonolithIndexSubsystem 持有的主连接 + 互斥锁，
+	 * 没有 GEditor 时（比如 commandlet）退回去自己开一个一次性 query-only 连接。
+	 *
+	 * 这样所有 action 不再各自反复 sqlite3_open —— 这是“频繁 Failed to open index database”
+	 * 这类错误最容易出现的地方。 */
+	inline FMonolithActionResult RunReadDatabaseAction(
+		TFunctionRef<FMonolithActionResult(FMonolithIndexDatabase&)> Func)
+	{
+		if (UMonolithIndexSubsystem* Subsystem = GetIndexSubsystem())
+		{
+			return Subsystem->RunReadDatabaseAction(Func);
+		}
+
+		// commandlet / 无编辑器场景 —— 自己开一个一次性查询连接。
+		FMonolithIndexDatabase Database;
+		FString Error;
+		if (!OpenQueryOnlyIndexDatabase(Database, Error))
+		{
+			return FMonolithActionResult::Error(Error);
+		}
+		return Func(Database);
 	}
 
 	/** 读取可选字符串参数；缺失或类型不对时，返回调用方提供的默认值。 */

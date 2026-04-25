@@ -28,6 +28,12 @@ namespace MonolithIndexStatusBarInternal
 		return Snapshot.LocalHitCount + Snapshot.RemoteHitCount + Snapshot.RemoteMissCount;
 	}
 
+	/** 远端读取次数 = 远端命中 + 远端 miss。 */
+	static uint64 GetRemoteReadTotal(const FMonolithIndexStatusBarSnapshot& Snapshot)
+	{
+		return Snapshot.RemoteHitCount + Snapshot.RemoteMissCount;
+	}
+
 	/** 把分子/分母格式化成整数字百分比。 */
 	static FString FormatPercent(const uint64 Numerator, const uint64 Denominator)
 	{
@@ -74,6 +80,12 @@ namespace MonolithIndexStatusBarInternal
 		return bOpen ? FString::Printf(TEXT("open %s"), *FormatDurationShort(RemainingSeconds)) : TEXT("ready");
 	}
 
+	/** 本地 cache 只要对象还活着，就认为本地层是 ready。 */
+	static FString FormatLocalCacheState(const bool bAvailable)
+	{
+		return bAvailable ? TEXT("ready") : TEXT("unavailable");
+	}
+
 	/** 生成状态栏里最短那一行摘要文本。 */
 	static FString FormatSummary(const FMonolithIndexStatusBarSnapshot& Snapshot)
 	{
@@ -110,11 +122,13 @@ namespace MonolithIndexStatusBarInternal
 
 		const uint64 ReadTotal = GetReadTotal(Snapshot);
 		Summary += FString::Printf(
-			TEXT(" | local %s | remote %s | miss %s | write %s | GT %s | remote %s"),
+			TEXT(" | local %s | remote %s | miss %s | write %s | sync %d/%d | GT %s | remote %s"),
 			*FormatPercent(Snapshot.LocalHitCount, ReadTotal),
 			*FormatPercent(Snapshot.RemoteHitCount, ReadTotal),
 			*FormatPercent(Snapshot.RemoteMissCount, ReadTotal),
 			*FormatMegabytes(Snapshot.RemoteWriteBytes),
+			Snapshot.PendingRemoteWriteCount,
+			Snapshot.InFlightRemoteWriteCount,
 			*FormatBreakerState(Snapshot.bGtBreakerOpen, Snapshot.GtBreakerRemainingSeconds),
 			*FormatBreakerState(Snapshot.bRemoteDisabled, Snapshot.RemoteBreakerRemainingSeconds));
 		return Summary;
@@ -224,19 +238,25 @@ TSharedRef<SWidget> SMonolithIndexStatusBarWidget::CreateStatusBarMenu()
 				.AutoHeight()
 				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
 				[
+					SNew(STextBlock).Text(this, &SMonolithIndexStatusBarWidget::GetDetailLocalCacheLine)
+				]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
+				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
+				[
 					SNew(STextBlock).Text(this, &SMonolithIndexStatusBarWidget::GetDetailWriteLine)
 				]
 				+ SVerticalBox::Slot()
 				.AutoHeight()
 				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
 				[
-					SNew(STextBlock).Text(this, &SMonolithIndexStatusBarWidget::GetDetailGtLine)
+					SNew(STextBlock).Text(this, &SMonolithIndexStatusBarWidget::GetDetailRemoteLine)
 				]
 				+ SVerticalBox::Slot()
 				.AutoHeight()
 				.Padding(0.0f, 4.0f, 0.0f, 0.0f)
 				[
-					SNew(STextBlock).Text(this, &SMonolithIndexStatusBarWidget::GetDetailRemoteLine)
+					SNew(STextBlock).Text(this, &SMonolithIndexStatusBarWidget::GetDetailGtLine)
 				]
 			]
 		];
@@ -322,7 +342,8 @@ FText SMonolithIndexStatusBarWidget::GetDetailReadLine() const
 {
 	const uint64 ReadTotal = MonolithIndexStatusBarInternal::GetReadTotal(DetailSnapshot);
 	return FText::FromString(FString::Printf(
-		TEXT("读取: local=%llu (%s), remote=%llu (%s), miss=%llu (%s)"),
+		TEXT("本次启动读取: total=%llu, local=%llu (%s), remote=%llu (%s), miss=%llu (%s)"),
+		ReadTotal,
 		DetailSnapshot.LocalHitCount,
 		*MonolithIndexStatusBarInternal::FormatPercent(DetailSnapshot.LocalHitCount, ReadTotal),
 		DetailSnapshot.RemoteHitCount,
@@ -331,12 +352,24 @@ FText SMonolithIndexStatusBarWidget::GetDetailReadLine() const
 		*MonolithIndexStatusBarInternal::FormatPercent(DetailSnapshot.RemoteMissCount, ReadTotal)));
 }
 
+FText SMonolithIndexStatusBarWidget::GetDetailLocalCacheLine() const
+{
+	const uint64 ReadTotal = MonolithIndexStatusBarInternal::GetReadTotal(DetailSnapshot);
+	return FText::FromString(FString::Printf(
+		TEXT("本地缓存: state=%s, reused=%llu, read_total=%llu"),
+		*MonolithIndexStatusBarInternal::FormatLocalCacheState(DetailSnapshot.bLocalCacheAvailable),
+		DetailSnapshot.LocalHitCount,
+		ReadTotal));
+}
+
 FText SMonolithIndexStatusBarWidget::GetDetailWriteLine() const
 {
 	return FText::FromString(FString::Printf(
-		TEXT("写入: ok=%llu, fail=%llu, encoded=%s, oversized=%llu"),
+		TEXT("远端写入: ok=%llu, fail=%llu, pending=%d, inflight=%d, encoded=%s, oversized=%llu"),
 		DetailSnapshot.RemoteWriteOkCount,
 		DetailSnapshot.RemoteWriteFailCount,
+		DetailSnapshot.PendingRemoteWriteCount,
+		DetailSnapshot.InFlightRemoteWriteCount,
 		*MonolithIndexStatusBarInternal::FormatMegabytes(DetailSnapshot.RemoteWriteBytes),
 		DetailSnapshot.OversizedArtifactCount));
 }
@@ -354,11 +387,17 @@ FText SMonolithIndexStatusBarWidget::GetDetailGtLine() const
 
 FText SMonolithIndexStatusBarWidget::GetDetailRemoteLine() const
 {
+	const uint64 RemoteReadTotal = MonolithIndexStatusBarInternal::GetRemoteReadTotal(DetailSnapshot);
 	return FText::FromString(FString::Printf(
-		TEXT("Remote: breaker=%s"),
+		TEXT("远端缓存: state=%s, read_total=%llu, hit=%llu, miss=%llu, sync=%d/%d"),
 		*MonolithIndexStatusBarInternal::FormatBreakerState(
 			DetailSnapshot.bRemoteDisabled,
-			DetailSnapshot.RemoteBreakerRemainingSeconds)));
+			DetailSnapshot.RemoteBreakerRemainingSeconds),
+		RemoteReadTotal,
+		DetailSnapshot.RemoteHitCount,
+		DetailSnapshot.RemoteMissCount,
+		DetailSnapshot.PendingRemoteWriteCount,
+		DetailSnapshot.InFlightRemoteWriteCount));
 }
 
 void SMonolithIndexStatusBarWidget::RefreshSummarySnapshot()

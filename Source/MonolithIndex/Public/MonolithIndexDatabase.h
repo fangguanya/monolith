@@ -513,6 +513,20 @@ public:
 
 	/** 打开或创建数据库文件。 */
 	bool Open(const FString& InDbPath);
+	/** 只读打开数据库文件，供 MCP 后台查询使用。 */
+	/** 以“查询专用”模式打开现有数据库。
+	 *
+	 * 这里故意不用 SQLite 的原生 ReadOnly 打开模式。
+	 * 在 Windows 上，Monolith 的 writer 持锁期间用 ReadOnly 新开连接，
+	 * 很容易直接在 sqlite3_open 阶段返回 I/O / busy 失败。
+	 *
+	 * 正确做法是：
+	 * - 先用 ReadWrite 打开现有库文件；
+	 * - 再强制 `PRAGMA journal_mode=DELETE`；
+	 * - 再强制 `PRAGMA query_only=ON`；
+	 *
+	 * 这样查询连接仍然不会执行写入，但能避开只读打开模式的已知问题。 */
+	bool OpenQueryOnly(const FString& InDbPath);
 
 	/** 关闭数据库连接。 */
 	void Close();
@@ -807,8 +821,8 @@ private:
 	bool EnsureShadowMeshCatalogTable(const FString& CohortName);
 	/** 首次打开数据库时建表。 */
 	bool CreateTables();
-	/** 执行一段原始 SQL。 */
-	bool ExecuteSQL(const FString& SQL);
+	/** 执行一段原始 SQL。Context 只用于日志定位。 */
+	bool ExecuteSQL(const FString& SQL, const TCHAR* Context = nullptr);
 	/** SQLite 连接本体。 */
 	FSQLiteDatabase* Database = nullptr;
 	/** 数据库文件路径。 */

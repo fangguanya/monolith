@@ -33,6 +33,10 @@ struct FMonolithArtifactCacheStats
 	uint64 RemoteWriteBytes = 0;
 	/** 因为原始 payload 超过 16MB 而被跳过共享缓存的次数。 */
 	uint64 OversizedArtifactCount = 0;
+	/** 还排队等着同步到远端 DDC 的请求数。 */
+	int32 PendingRemoteWriteCount = 0;
+	/** 当前已经发出去、还没完成的远端写请求数。 */
+	int32 InFlightRemoteWriteCount = 0;
 	/** 熔断器当前是否把远端暂时关掉了。 */
 	bool bRemoteDisabled = false;
 	/** 如果远端被关掉，还要等多久才允许再试。 */

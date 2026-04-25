@@ -3,10 +3,11 @@
 #include "CoreMinimal.h"
 #include "HttpRouteHandle.h"
 #include "IHttpRouter.h"
+#include "MonolithToolRegistry.h"
+#include "Templates/SharedPointer.h"
 
 class FJsonObject;
 class FJsonValue;
-class FMonolithToolRegistry;
 
 /**
  * Embedded MCP HTTP server.
@@ -44,11 +45,23 @@ private:
 	TSharedPtr<FJsonObject> HandleToolsList(const TSharedPtr<FJsonValue>& Id, const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandleToolsCall(const TSharedPtr<FJsonValue>& Id, const TSharedPtr<FJsonObject>& Params);
 	TSharedPtr<FJsonObject> HandlePing(const TSharedPtr<FJsonValue>& Id);
+	TSharedPtr<FJsonObject> BuildToolResultResponse(
+		const TSharedPtr<FJsonValue>& Id,
+		const FMonolithActionResult& ActionResult) const;
+	void LogMcpExecution(
+		const FString& RequestId,
+		const FString& Namespace,
+		const FString& Action,
+		EMonolithActionExecutionPolicy ExecutionPolicy,
+		const TCHAR* Phase,
+		double ElapsedMs = 0.0,
+		const FString& ErrorMessage = FString()) const;
 
 	// --- Helpers ---
 	TUniquePtr<FHttpServerResponse> MakeJsonResponse(const FString& JsonBody, EHttpServerResponseCodes Code = EHttpServerResponseCodes::Ok);
 	TUniquePtr<FHttpServerResponse> MakeSseResponse(const TArray<TSharedPtr<FJsonObject>>& Messages);
 	void AddCorsHeaders(FHttpServerResponse& Response);
+	TUniquePtr<FHttpServerResponse> BuildPostMcpResponse(const TArray<TSharedPtr<FJsonObject>>& Responses);
 
 	// --- State ---
 	TSharedPtr<IHttpRouter> HttpRouter;

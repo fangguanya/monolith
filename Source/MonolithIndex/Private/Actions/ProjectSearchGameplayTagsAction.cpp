@@ -18,37 +18,35 @@ FMonolithActionResult FProjectSearchGameplayTagsAction::Execute(const TSharedPtr
 		return MonolithProjectActionUtils::MakeMissingStringParamError(TEXT("query"));
 	}
 
-	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
-	if (!Subsystem)
-	{
-		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
-	}
-
-	const TArray<FIndexedGameplayTagSummary> TagSummaries = Subsystem->SearchGameplayTags(Query);
-	TArray<TSharedPtr<FJsonValue>> TagsArr;
-	for (const FIndexedGameplayTagSummary& TagSummary : TagSummaries)
-	{
-		auto Entry = MakeShared<FJsonObject>();
-		Entry->SetStringField(TEXT("tag_name"), TagSummary.TagName);
-		Entry->SetStringField(TEXT("parent_tag"), TagSummary.ParentTag);
-		Entry->SetNumberField(TEXT("reference_count"), static_cast<double>(TagSummary.ReferenceCount));
-
-		TArray<TSharedPtr<FJsonValue>> AssetsArr;
-		for (const FString& AssetPath : TagSummary.ReferencingAssets)
+	return MonolithProjectActionUtils::RunReadDatabaseAction(
+		[&](FMonolithIndexDatabase& Database) -> FMonolithActionResult
 		{
-			AssetsArr.Add(MakeShared<FJsonValueString>(AssetPath));
-		}
-		Entry->SetArrayField(TEXT("referencing_assets"), AssetsArr);
+			const TArray<FIndexedGameplayTagSummary> TagSummaries = Database.SearchGameplayTags(Query);
+			TArray<TSharedPtr<FJsonValue>> TagsArr;
+			for (const FIndexedGameplayTagSummary& TagSummary : TagSummaries)
+			{
+				auto Entry = MakeShared<FJsonObject>();
+				Entry->SetStringField(TEXT("tag_name"), TagSummary.TagName);
+				Entry->SetStringField(TEXT("parent_tag"), TagSummary.ParentTag);
+				Entry->SetNumberField(TEXT("reference_count"), static_cast<double>(TagSummary.ReferenceCount));
 
-		TagsArr.Add(MakeShared<FJsonValueObject>(Entry));
-	}
+				TArray<TSharedPtr<FJsonValue>> AssetsArr;
+				for (const FString& AssetPath : TagSummary.ReferencingAssets)
+				{
+					AssetsArr.Add(MakeShared<FJsonValueString>(AssetPath));
+				}
+				Entry->SetArrayField(TEXT("referencing_assets"), AssetsArr);
 
-	auto Result = MakeShared<FJsonObject>();
-	Result->SetBoolField(TEXT("success"), true);
-	Result->SetArrayField(TEXT("tags"), TagsArr);
-	Result->SetNumberField(TEXT("count"), TagsArr.Num());
-	Result->SetStringField(TEXT("query"), Query);
-	return FMonolithActionResult::Success(Result);
+				TagsArr.Add(MakeShared<FJsonValueObject>(Entry));
+			}
+
+			auto Result = MakeShared<FJsonObject>();
+			Result->SetBoolField(TEXT("success"), true);
+			Result->SetArrayField(TEXT("tags"), TagsArr);
+			Result->SetNumberField(TEXT("count"), TagsArr.Num());
+			Result->SetStringField(TEXT("query"), Query);
+			return FMonolithActionResult::Success(Result);
+		});
 }
 
 TSharedPtr<FJsonObject> FProjectSearchGameplayTagsAction::GetSchema()

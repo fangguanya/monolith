@@ -1390,7 +1390,7 @@ FMonolithActionResult FMonolithMeshInspectionActions::SearchMeshesBySize(const T
 	UMonolithIndexSubsystem* IndexSubsystem = MeshInspectionHelpers::GetIndexSubsystem();
 	if (!IndexSubsystem)
 	{
-		return FMonolithActionResult::Error(TEXT("Mesh catalog not available — run monolith_reindex() first"));
+		return FMonolithActionResult::Error(TEXT("Mesh catalog not available — run 'Monolith.StartIndex full' first"));
 	}
 
 	const TSharedPtr<FJsonObject> Result = IndexSubsystem->SearchMeshCatalogBySize(
@@ -1412,7 +1412,7 @@ FMonolithActionResult FMonolithMeshInspectionActions::GetMeshCatalogStats(const 
 	UMonolithIndexSubsystem* IndexSubsystem = MeshInspectionHelpers::GetIndexSubsystem();
 	if (!IndexSubsystem)
 	{
-		return FMonolithActionResult::Error(TEXT("Mesh catalog not available — run monolith_reindex() first"));
+		return FMonolithActionResult::Error(TEXT("Mesh catalog not available — run 'Monolith.StartIndex full' first"));
 	}
 
 	const TSharedPtr<FJsonObject> Result = IndexSubsystem->GetMeshCatalogStats();

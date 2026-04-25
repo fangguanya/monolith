@@ -83,14 +83,6 @@ void FMonolithCoreTools::RegisterAll()
 		);
 	}
 
-	// monolith_reindex
-	{
-		Registry.RegisterAction(
-			TEXT("monolith"), TEXT("reindex"),
-			TEXT("Re-index the Monolith project database. Incremental by default (delta only). Pass force=true for full wipe+rebuild."),
-			FMonolithActionHandler::CreateStatic(&FMonolithCoreTools::HandleReindex)
-		);
-	}
 }
 
 FMonolithActionResult FMonolithCoreTools::HandleDiscover(const TSharedPtr<FJsonObject>& Params)
@@ -172,6 +164,11 @@ FMonolithActionResult FMonolithCoreTools::HandleDiscover(const TSharedPtr<FJsonO
 			TSharedPtr<FJsonObject> ActionObj = MakeShared<FJsonObject>();
 			ActionObj->SetStringField(TEXT("action"), ActionInfo.Action);
 			ActionObj->SetStringField(TEXT("description"), ActionInfo.Description);
+			ActionObj->SetStringField(
+				TEXT("execution_policy"),
+				ActionInfo.ExecutionPolicy == EMonolithActionExecutionPolicy::BackgroundThread
+					? TEXT("background")
+					: TEXT("game_thread"));
 			if (ActionInfo.ParamSchema.IsValid())
 			{
 				ActionObj->SetObjectField(TEXT("params"), ActionInfo.ParamSchema);
@@ -264,6 +261,16 @@ FMonolithActionResult FMonolithCoreTools::HandleStatus(const TSharedPtr<FJsonObj
 	Result->SetNumberField(TEXT("total_actions"), Registry.GetActionCount());
 	Result->SetNumberField(TEXT("namespaces"), Registry.GetNamespaces().Num());
 
+	int32 BackgroundActions = 0;
+	for (const FMonolithActionInfo& ActionInfo : Registry.GetAllActions())
+	{
+		if (ActionInfo.ExecutionPolicy == EMonolithActionExecutionPolicy::BackgroundThread)
+		{
+			++BackgroundActions;
+		}
+	}
+	Result->SetNumberField(TEXT("background_actions"), BackgroundActions);
+
 	// Engine info
 	Result->SetStringField(TEXT("engine_version"), FApp::GetBuildVersion());
 
@@ -330,81 +337,4 @@ FMonolithActionResult FMonolithCoreTools::HandleUpdate(const TSharedPtr<FJsonObj
 		FString::Printf(TEXT("Unknown update action: %s. Use 'check' or 'install'."), *Action),
 		FMonolithJsonUtils::ErrInvalidParams
 	);
-}
-
-FMonolithActionResult FMonolithCoreTools::HandleReindex(const TSharedPtr<FJsonObject>& Params)
-{
-	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-
-	if (!FModuleManager::Get().IsModuleLoaded(TEXT("MonolithIndex")))
-	{
-		Result->SetStringField(TEXT("status"), TEXT("module_not_loaded"));
-		Result->SetStringField(TEXT("message"), TEXT("MonolithIndex module is not loaded."));
-		return FMonolithActionResult::Success(Result);
-	}
-
-	if (!GEditor)
-	{
-		return FMonolithActionResult::Error(TEXT("GEditor not available"));
-	}
-
-	bool bForce = Params.IsValid() && Params->HasField(TEXT("force"))
-	              && Params->GetBoolField(TEXT("force"));
-
-	UClass* IndexSubsystemClass = FindObject<UClass>(nullptr, TEXT("/Script/MonolithIndex.MonolithIndexSubsystem"));
-	if (!IndexSubsystemClass)
-	{
-		Result->SetStringField(TEXT("status"), TEXT("subsystem_unavailable"));
-		Result->SetStringField(TEXT("message"), TEXT("MonolithIndexSubsystem class not found."));
-		return FMonolithActionResult::Success(Result);
-	}
-
-	UEditorSubsystem* IndexSubsystem = GEditor->GetEditorSubsystemBase(IndexSubsystemClass);
-	if (!IndexSubsystem)
-	{
-		Result->SetStringField(TEXT("status"), TEXT("subsystem_unavailable"));
-		Result->SetStringField(TEXT("message"), TEXT("MonolithIndexSubsystem instance not available."));
-		return FMonolithActionResult::Success(Result);
-	}
-
-	FString FuncName;
-	if (bForce)
-	{
-		FuncName = TEXT("StartFullIndex");
-	}
-	else
-	{
-		// Check if incremental is possible
-		UFunction* CanIncrementalFunc = IndexSubsystemClass->FindFunctionByName(TEXT("CanDoIncrementalIndex"));
-		if (CanIncrementalFunc)
-		{
-			struct { uint8 ReturnValue = 0; } Parms;
-			FMemory::Memzero(&Parms, sizeof(Parms));
-			IndexSubsystem->ProcessEvent(CanIncrementalFunc, &Parms);
-			FuncName = Parms.ReturnValue != 0 ? TEXT("StartIncrementalIndex") : TEXT("StartFullIndex");
-		}
-		else
-		{
-			// Fallback if CanDoIncrementalIndex not found (old MonolithIndex version)
-			FuncName = TEXT("StartFullIndex");
-		}
-	}
-
-	UFunction* Func = IndexSubsystemClass->FindFunctionByName(*FuncName);
-	if (Func)
-	{
-		IndexSubsystem->ProcessEvent(Func, nullptr);
-		Result->SetStringField(TEXT("status"), TEXT("reindex_started"));
-		Result->SetStringField(TEXT("message"),
-			FString::Printf(TEXT("%s triggered successfully."),
-				FuncName == TEXT("StartFullIndex") ? TEXT("Full re-index") : TEXT("Incremental index")));
-	}
-	else
-	{
-		Result->SetStringField(TEXT("status"), TEXT("function_not_found"));
-		Result->SetStringField(TEXT("message"),
-			FString::Printf(TEXT("Function %s not found."), *FuncName));
-	}
-
-	return FMonolithActionResult::Success(Result);
 }

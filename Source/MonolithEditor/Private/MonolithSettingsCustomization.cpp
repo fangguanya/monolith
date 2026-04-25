@@ -6,6 +6,7 @@
 #include "DetailCategoryBuilder.h"
 #include "DetailWidgetRow.h"
 #include "Editor.h"
+#include "OutputLogModule.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Text/STextBlock.h"
 
@@ -18,6 +19,49 @@ TSharedRef<IDetailCustomization> FMonolithSettingsCustomization::MakeInstance()
 
 void FMonolithSettingsCustomization::CustomizeDetails(IDetailLayoutBuilder& DetailBuilder)
 {
+	IDetailCategoryBuilder& McpCat = DetailBuilder.EditCategory("MCP Server");
+
+	McpCat.AddCustomRow(LOCTEXT("McpThreadingRow", "MCP Threading"))
+		.NameContent()
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("McpThreadingLabel", "MCP Threading"))
+			.Font(IDetailLayoutBuilder::GetDetailFont())
+		]
+		.ValueContent()
+		.MinDesiredWidth(420.0f)
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("McpThreadingValue", "Read-only project index queries now run on background threads. Asset edits and other editor-mutating actions stay on the game thread."))
+			.AutoWrapText(true)
+			.Font(IDetailLayoutBuilder::GetDetailFont())
+		];
+
+	McpCat.AddCustomRow(LOCTEXT("McpLogRow", "MCP Logs"))
+		.NameContent()
+		[
+			SNew(STextBlock)
+			.Text(LOCTEXT("McpLogLabel", "MCP Logs"))
+			.Font(IDetailLayoutBuilder::GetDetailFont())
+		]
+		.ValueContent()
+		[
+			SNew(SButton)
+			.Text(LOCTEXT("OpenMcpLogBtn", "Open MCP Log"))
+			.ToolTipText(LOCTEXT("OpenMcpLogTooltip", "Open Output Log and focus Monolith MCP execution logs."))
+			.OnClicked_Lambda([]()
+			{
+				FOutputLogModule& OutputLogModule = FOutputLogModule::Get();
+				OutputLogModule.UpdateOutputLogFilter(
+					{ FName(TEXT("LogMonolith")), FName(TEXT("LogMonolithIndex")) },
+					true,
+					true,
+					true);
+				OutputLogModule.FocusOutputLogAndScrollToEnd();
+				return FReply::Handled();
+			})
+		];
+
 	IDetailCategoryBuilder& IndexCat = DetailBuilder.EditCategory("Indexing");
 
 	// Re-Index Project button
@@ -47,10 +91,7 @@ void FMonolithSettingsCustomization::CustomizeDetails(IDetailLayoutBuilder& Deta
 			{
 				if (GEditor)
 				{
-					if (auto* Sub = GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>())
-					{
-						Sub->StartFullIndex();
-					}
+					GEditor->Exec(nullptr, TEXT("Monolith.StartIndex full"));
 				}
 				return FReply::Handled();
 			})

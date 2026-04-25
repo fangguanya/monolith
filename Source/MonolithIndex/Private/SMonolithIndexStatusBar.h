@@ -47,6 +47,8 @@ private:
 	FText GetDetailQueueLine() const;
 	/** 菜单里的“读取命中率”一行。 */
 	FText GetDetailReadLine() const;
+	/** 菜单里的“本地缓存状态”一行。 */
+	FText GetDetailLocalCacheLine() const;
 	/** 菜单里的“写入统计”一行。 */
 	FText GetDetailWriteLine() const;
 	/** 菜单里的“GT breaker”一行。 */

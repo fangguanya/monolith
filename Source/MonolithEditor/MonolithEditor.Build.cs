@@ -27,6 +27,7 @@ public class MonolithEditor : ModuleRules
 			"Json",
 			"JsonUtilities",
 			"MessageLog",
+			"OutputLog",
 			// Capture actions
 			"RenderCore",
 			"RHI",

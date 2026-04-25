@@ -32,6 +32,13 @@ struct FMonolithActionResult
 /** Delegate type for action handlers */
 DECLARE_DELEGATE_RetVal_OneParam(FMonolithActionResult, FMonolithActionHandler, const TSharedPtr<FJsonObject>& /* Params */);
 
+/** Where an action is allowed to execute. */
+enum class EMonolithActionExecutionPolicy : uint8
+{
+	GameThread,
+	BackgroundThread
+};
+
 /** Metadata describing a registered action */
 struct FMonolithActionInfo
 {
@@ -39,6 +46,7 @@ struct FMonolithActionInfo
 	FString Action;
 	FString Description;
 	TSharedPtr<FJsonObject> ParamSchema;  // JSON Schema for parameter validation
+	EMonolithActionExecutionPolicy ExecutionPolicy = EMonolithActionExecutionPolicy::GameThread;
 };
 
 /**
@@ -63,7 +71,8 @@ public:
 		const FString& Action,
 		const FString& Description,
 		const FMonolithActionHandler& Handler,
-		const TSharedPtr<FJsonObject>& ParamSchema = nullptr
+		const TSharedPtr<FJsonObject>& ParamSchema = nullptr,
+		EMonolithActionExecutionPolicy ExecutionPolicy = EMonolithActionExecutionPolicy::GameThread
 	);
 
 	/** Unregister all actions in a namespace (called during module shutdown) */

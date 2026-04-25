@@ -23,7 +23,4 @@ public:
 
 	/** monolith_update — Check or install updates */
 	static FMonolithActionResult HandleUpdate(const TSharedPtr<FJsonObject>& Params);
-
-	/** monolith_reindex — Trigger full project re-index */
-	static FMonolithActionResult HandleReindex(const TSharedPtr<FJsonObject>& Params);
 };

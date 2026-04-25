@@ -1064,7 +1064,10 @@ FMonolithArtifactCacheStats FMonolithDdcArtifactCache::GetStats() const
 	const double NowSeconds = FPlatformTime::Seconds();
 	FScopeLock Lock(&LocalImpl->Mutex);
 	RefreshBreakerSnapshot(*LocalImpl, NowSeconds);
-	return LocalImpl->Stats;
+	FMonolithArtifactCacheStats Snapshot = LocalImpl->Stats;
+	Snapshot.PendingRemoteWriteCount = LocalImpl->PendingRemoteWriteCount;
+	Snapshot.InFlightRemoteWriteCount = LocalImpl->InFlightRemoteWriteCount;
+	return Snapshot;
 }
 
 void FMonolithDdcArtifactCache::ResetStats()

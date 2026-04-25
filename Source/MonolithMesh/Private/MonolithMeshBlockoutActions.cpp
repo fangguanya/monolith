@@ -1257,7 +1257,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::MatchAssetToBlockout(const T
 	UMonolithIndexSubsystem* IndexSubsystem = BlockoutHelpers::GetIndexSubsystem();
 	if (!IndexSubsystem)
 	{
-		return FMonolithActionResult::Error(TEXT("Mesh catalog not available. Run monolith_reindex() first."));
+		return FMonolithActionResult::Error(TEXT("Mesh catalog not available. Run 'Monolith.StartIndex full' first."));
 	}
 
 	// Get blockout size
@@ -1438,7 +1438,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::MatchAllInVolume(const TShar
 	UMonolithIndexSubsystem* IndexSubsystem = BlockoutHelpers::GetIndexSubsystem();
 	if (!IndexSubsystem)
 	{
-		return FMonolithActionResult::Error(TEXT("No meshes indexed. Run monolith_reindex() first."));
+		return FMonolithActionResult::Error(TEXT("No meshes indexed. Run 'Monolith.StartIndex full' first."));
 	}
 
 	// Check catalog isn't empty
@@ -1451,7 +1451,7 @@ FMonolithActionResult FMonolithMeshBlockoutActions::MatchAllInVolume(const TShar
 	if (Stats) Stats->TryGetNumberField(TEXT("total_meshes"), TotalMeshes);
 	if (TotalMeshes == 0)
 	{
-		return FMonolithActionResult::Error(TEXT("No meshes indexed. Run monolith_reindex() first."));
+		return FMonolithActionResult::Error(TEXT("No meshes indexed. Run 'Monolith.StartIndex full' first."));
 	}
 
 	UWorld* World = MonolithMeshUtils::GetEditorWorld();

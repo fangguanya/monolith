@@ -17,23 +17,30 @@ FMonolithActionResult FProjectGetStatsAction::Execute(const TSharedPtr<FJsonObje
 {
 	(void)Params;
 
-	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
-	if (!Subsystem)
-	{
-		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
-	}
+	return MonolithProjectActionUtils::RunReadDatabaseAction(
+		[&](FMonolithIndexDatabase& Database) -> FMonolithActionResult
+		{
+			const TSharedPtr<FJsonObject> Stats = Database.GetStats();
+			if (!Stats.IsValid())
+			{
+				return FMonolithActionResult::Error(TEXT("Failed to retrieve stats"));
+			}
 
-	const TSharedPtr<FJsonObject> Stats = Subsystem->GetStats();
-	if (!Stats.IsValid())
-	{
-		return FMonolithActionResult::Error(TEXT("Failed to retrieve stats"));
-	}
-	return FMonolithActionResult::Success(
-		MonolithProjectQueryPayload::BuildStatsResponse(
-			Stats,
-			Subsystem->IsIndexing(),
-			Subsystem->GetProgress(),
-			Subsystem->GetStatusMessage()));
+			Stats->SetBoolField(TEXT("indexing_in_progress"), false);
+			Stats->SetNumberField(TEXT("progress"), 0.0);
+			Stats->SetNumberField(TEXT("completed_items"), 0.0);
+			Stats->SetNumberField(TEXT("total_items"), 0.0);
+			Stats->SetNumberField(TEXT("queue_depth"), 0.0);
+			Stats->SetNumberField(TEXT("remaining_items"), 0.0);
+			Stats->SetNumberField(TEXT("eta_seconds"), 0.0);
+			Stats->SetStringField(TEXT("status"), TEXT("ready"));
+			return FMonolithActionResult::Success(
+				MonolithProjectQueryPayload::BuildStatsResponse(
+					Stats,
+					false,
+					0.0f,
+					TEXT("ready")));
+		});
 }
 
 TSharedPtr<FJsonObject> FProjectGetStatsAction::GetSchema()

@@ -1,6 +1,7 @@
 #include "MonolithIndexSubsystem.h"
 #include "MonolithIndexDatabase.h"
 #include "MonolithSettings.h"
+#include "MonolithToolRegistry.h"
 #include "MonolithArtifactTypes.h"
 #include "MonolithIndexerShadowMode.h"
 #include "MonolithIndexScheduler.h"
@@ -19,6 +20,7 @@
 #include "Misc/Paths.h"
 #include "Misc/ScopeExit.h"
 #include "HAL/FileManager.h"
+#include "HAL/IConsoleManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "IO/IoHash.h"
 #include "Async/Async.h"
@@ -479,6 +481,79 @@ namespace MonolithIndexInternal
 	}
 }
 
+struct FMonolithIndexConsoleCommands
+{
+	static FString NormalizeMode(const TArray<FString>& Args)
+	{
+		if (Args.Num() == 0)
+		{
+			return TEXT("auto");
+		}
+
+		FString Mode = Args[0];
+		Mode.TrimStartAndEndInline();
+		Mode.ToLowerInline();
+		return Mode;
+	}
+
+	static UMonolithIndexSubsystem* GetSubsystem()
+	{
+		return GEditor ? GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>() : nullptr;
+	}
+
+	static void StartIndex(const TArray<FString>& Args, UWorld* /*World*/)
+	{
+		UMonolithIndexSubsystem* const Subsystem = GetSubsystem();
+		if (!Subsystem)
+		{
+			UE_LOG(LogMonolithIndex, Error, TEXT("Monolith.StartIndex failed because MonolithIndexSubsystem is unavailable"));
+			return;
+		}
+
+		const FString Mode = NormalizeMode(Args);
+		if (Mode == TEXT("full"))
+		{
+			Subsystem->RequestManualFullIndex();
+			return;
+		}
+
+		if (Mode == TEXT("incremental"))
+		{
+			if (!Subsystem->CanDoIncrementalIndex())
+			{
+				UE_LOG(LogMonolithIndex, Warning, TEXT("Monolith.StartIndex incremental skipped because no incremental baseline is available; run 'Monolith.StartIndex full' instead"));
+				return;
+			}
+
+			Subsystem->StartIncrementalIndex();
+			return;
+		}
+
+		if (Mode == TEXT("auto"))
+		{
+			if (Subsystem->CanDoIncrementalIndex())
+			{
+				Subsystem->StartIncrementalIndex();
+			}
+			else
+			{
+				Subsystem->RequestManualFullIndex();
+			}
+			return;
+		}
+
+		UE_LOG(LogMonolithIndex, Warning, TEXT("Monolith.StartIndex received unknown mode '%s'; supported modes are auto, full, incremental"), *Mode);
+	}
+};
+
+namespace
+{
+	static FAutoConsoleCommandWithWorldAndArgs GMonolithStartIndexCommand(
+		TEXT("Monolith.StartIndex"),
+		TEXT("Manually start Monolith indexing. Usage: Monolith.StartIndex [auto|full|incremental]. Full indexing only runs from this manual command."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FMonolithIndexConsoleCommands::StartIndex));
+}
+
 UMonolithIndexSubsystem::UMonolithIndexSubsystem() = default;
 
 UMonolithIndexSubsystem::~UMonolithIndexSubsystem() = default;
@@ -563,15 +638,7 @@ void UMonolithIndexSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 	UE_LOG(LogMonolithIndex, Log, TEXT("Initialize: asset registry ready, evaluating startup path"));
 
-	if (ShouldAutoIndex())
-	{
-		UE_LOG(LogMonolithIndex, Log, TEXT("First launch — deferring full index until AR ready"));
-		if (AR.IsLoadingAssets())
-			AR.OnFilesLoaded().AddUObject(this, &UMonolithIndexSubsystem::OnAssetRegistryFilesLoaded);
-		else
-			StartFullIndex();
-	}
-	else if (CanDoIncrementalIndex())
+	if (CanDoIncrementalIndex())
 	{
 		UE_LOG(LogMonolithIndex, Log, TEXT("Existing index found — deferring incremental catch-up until AR ready"));
 		if (AR.IsLoadingAssets())
@@ -581,11 +648,8 @@ void UMonolithIndexSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	}
 	else
 	{
-		UE_LOG(LogMonolithIndex, Log, TEXT("Schema v1 DB — forcing full reindex to populate hashes"));
-		if (AR.IsLoadingAssets())
-			AR.OnFilesLoaded().AddUObject(this, &UMonolithIndexSubsystem::OnAssetRegistryFilesLoaded);
-		else
-			StartFullIndex();
+		IndexingStatusMessage = TEXT("Full index required. Run 'Monolith.StartIndex full' from the editor console.");
+		UE_LOG(LogMonolithIndex, Log, TEXT("Full index is manual-only; waiting for 'Monolith.StartIndex full'"));
 	}
 }
 
@@ -595,14 +659,15 @@ void UMonolithIndexSubsystem::OnAssetRegistryFilesLoaded()
 	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
 	AssetRegistry.OnFilesLoaded().RemoveAll(this);
 
-	if (ShouldAutoIndex())
+	if (bPendingManualFullIndex)
 	{
-		UE_LOG(LogMonolithIndex, Log, TEXT("Asset Registry fully loaded -- starting full project index"));
-		StartFullIndex();
+		bPendingManualFullIndex = false;
+		UE_LOG(LogMonolithIndex, Log, TEXT("Asset Registry fully loaded -- starting requested full project index"));
+		StartFullIndexInternal();
 	}
 	else
 	{
-		UE_LOG(LogMonolithIndex, Log, TEXT("Asset Registry loaded but auto-index no longer needed (already indexed)"));
+		UE_LOG(LogMonolithIndex, Verbose, TEXT("Asset Registry files loaded with no pending manual full index request"));
 	}
 }
 
@@ -655,6 +720,9 @@ void UMonolithIndexSubsystem::Deinitialize()
 	IndexingTaskPtr.Reset();
 
 	bIsIndexing = false;
+	bPendingManualFullIndex = false;
+	bRestoreLiveCallbacksAfterFullIndex = false;
+	bTaskNotificationCancelRequested = false;
 	if (RuntimeState.IsValid())
 	{
 		RuntimeState->FinishSession();
@@ -748,11 +816,42 @@ void UMonolithIndexSubsystem::RegisterDefaultIndexers()
 	UE_LOG(LogMonolithIndex, Log, TEXT("Registered %d indexers"), Indexers.Num());
 }
 
-void UMonolithIndexSubsystem::StartFullIndex()
+void UMonolithIndexSubsystem::RequestManualFullIndex()
 {
+	check(IsInGameThread());
 	if (!IsIndexingEnabled())
 	{
-		UE_LOG(LogMonolithIndex, Log, TEXT("StartFullIndex skipped because indexing is disabled"));
+		UE_LOG(LogMonolithIndex, Log, TEXT("RequestManualFullIndex skipped because indexing is disabled"));
+		return;
+	}
+
+	if (bIsIndexing)
+	{
+		UE_LOG(LogMonolithIndex, Warning, TEXT("RequestManualFullIndex skipped because indexing is already in progress"));
+		return;
+	}
+
+	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+	if (AssetRegistry.IsLoadingAssets())
+	{
+		bPendingManualFullIndex = true;
+		IndexingStatusMessage = TEXT("Full index requested; waiting for Asset Registry to finish loading...");
+		AssetRegistry.OnFilesLoaded().RemoveAll(this);
+		AssetRegistry.OnFilesLoaded().AddUObject(this, &UMonolithIndexSubsystem::OnAssetRegistryFilesLoaded);
+		UE_LOG(LogMonolithIndex, Log, TEXT("Manual full index requested; waiting for Asset Registry files to finish loading"));
+		return;
+	}
+
+	bPendingManualFullIndex = false;
+	StartFullIndexInternal();
+}
+
+void UMonolithIndexSubsystem::StartFullIndexInternal()
+{
+	check(IsInGameThread());
+	if (!IsIndexingEnabled())
+	{
+		UE_LOG(LogMonolithIndex, Log, TEXT("StartFullIndexInternal skipped because indexing is disabled"));
 		return;
 	}
 
@@ -763,7 +862,16 @@ void UMonolithIndexSubsystem::StartFullIndex()
 	}
 
 	bIsIndexing = true;
+	bPendingManualFullIndex = false;
+	bRestoreLiveCallbacksAfterFullIndex =
+		OnAssetsAddedHandle.IsValid()
+		|| OnAssetsRemovedHandle.IsValid()
+		|| OnAssetRenamedHandle.IsValid()
+		|| OnAssetsUpdatedOnDiskHandle.IsValid();
 	GtBudgetState.Reset();
+	bTaskNotificationCancelRequested = false;
+	UnregisterLiveCallbacks();
+	IndexingStatusMessage = TEXT("Running full index...");
 
 	// Gather marketplace plugin paths for indexing
 	IndexedPlugins = GatherMarketplacePluginPaths();
@@ -781,7 +889,7 @@ void UMonolithIndexSubsystem::StartFullIndex()
 	}
 	else
 	{
-		UE_LOG(LogMonolithIndex, Verbose, TEXT("StartFullIndex: skipping task notification because Slate is not initialized"));
+		UE_LOG(LogMonolithIndex, Verbose, TEXT("StartFullIndexInternal: skipping task notification because Slate is not initialized"));
 	}
 
 	// Launch background thread
@@ -820,12 +928,45 @@ void UMonolithIndexSubsystem::StartFullIndex()
 	{
 		UE_LOG(LogMonolithIndex, Error, TEXT("Failed to start Monolith scheduler background job"));
 		bIsIndexing = false;
+		IndexingStatusMessage = TEXT("Full index failed to start.");
 		IndexingTaskPtr.Reset();
 		TaskNotification.Reset();
+		if (bRestoreLiveCallbacksAfterFullIndex && IsIndexingEnabled() && Database.IsValid() && Database->IsOpen())
+		{
+			RegisterLiveCallbacks();
+		}
+		bRestoreLiveCallbacksAfterFullIndex = false;
 		return;
 	}
 
-	UE_LOG(LogMonolithIndex, Log, TEXT("Background indexing started"));
+	UE_LOG(LogMonolithIndex, Log, TEXT("Background full indexing started"));
+}
+
+void UMonolithIndexSubsystem::QueueTaskNotificationProgressUpdate(
+	const int32 Current,
+	const int32 Total,
+	const FString& ProgressText)
+{
+	TWeakObjectPtr<UMonolithIndexSubsystem> WeakThis(this);
+	AsyncTask(ENamedThreads::GameThread, [WeakThis, Current, Total, ProgressText]()
+	{
+		UMonolithIndexSubsystem* const StrongThis = WeakThis.Get();
+		if (!StrongThis)
+		{
+			return;
+		}
+
+		if (StrongThis->TaskNotification)
+		{
+			StrongThis->TaskNotification->SetProgressText(FText::FromString(ProgressText));
+			if (StrongThis->TaskNotification->GetPromptAction() == EAsyncTaskNotificationPromptAction::Cancel)
+			{
+				StrongThis->bTaskNotificationCancelRequested = true;
+			}
+		}
+
+		StrongThis->OnProgress.Broadcast(Current, Total);
+	});
 }
 
 bool UMonolithIndexSubsystem::IsIndexing() const
@@ -920,6 +1061,7 @@ FMonolithIndexStatusBarSnapshot UMonolithIndexSubsystem::GetStatusBarSnapshot(co
 	FMonolithIndexStatusBarSnapshot Snapshot;
 	Snapshot.bDatabaseOpen = Database.IsValid() && Database->IsOpen();
 	Snapshot.bIndexEnabled = IsIndexingEnabled();
+	Snapshot.bLocalCacheAvailable = ArtifactCache.IsValid();
 	Snapshot.StatusMessage = IndexingStatusMessage;
 
 	const FMonolithIndexRuntimeSnapshot RuntimeSnapshot = RuntimeState.IsValid()
@@ -943,6 +1085,8 @@ FMonolithIndexStatusBarSnapshot UMonolithIndexSubsystem::GetStatusBarSnapshot(co
 	Snapshot.RemoteWriteFailCount = CacheStats.RemoteWriteFailCount;
 	Snapshot.RemoteWriteBytes = CacheStats.RemoteWriteBytes;
 	Snapshot.OversizedArtifactCount = CacheStats.OversizedArtifactCount;
+	Snapshot.PendingRemoteWriteCount = CacheStats.PendingRemoteWriteCount;
+	Snapshot.InFlightRemoteWriteCount = CacheStats.InFlightRemoteWriteCount;
 	Snapshot.bRemoteDisabled = CacheStats.bRemoteDisabled;
 	Snapshot.RemoteBreakerRemainingSeconds = CacheStats.RemoteBreakerRemainingSeconds;
 
@@ -1158,6 +1302,27 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	Owner->IndexingStatusMessage = FString::Printf(TEXT("Scanning %d assets..."), TotalAssets.Load());
 	UE_LOG(LogMonolithIndex, Log, TEXT("Indexing %d assets..."), TotalAssets.Load());
 
+	constexpr double NotificationUpdateIntervalSeconds = 0.25;
+	double LastNotificationUpdateSeconds = 0.0;
+	auto MaybeQueueProgressUpdate =
+		[this, &LastNotificationUpdateSeconds](const int32 Current, const int32 Total, const FString& Text, const bool bForce = false)
+	{
+		const double NowSeconds = FPlatformTime::Seconds();
+		if (!bForce && LastNotificationUpdateSeconds > 0.0
+			&& (NowSeconds - LastNotificationUpdateSeconds) < NotificationUpdateIntervalSeconds)
+		{
+			return;
+		}
+
+		LastNotificationUpdateSeconds = NowSeconds;
+		Owner->QueueTaskNotificationProgressUpdate(Current, Total, Text);
+	};
+	MaybeQueueProgressUpdate(
+		0,
+		TotalAssets.Load(),
+		FString::Printf(TEXT("Indexing %d / %d assets..."), 0, TotalAssets.Load()),
+		true);
+
 	TUniquePtr<FMonolithIndexDatabase> BuildDatabase = MakeUnique<FMonolithIndexDatabase>();
 	IFileManager::Get().Delete(*BuildDatabasePath, false, true);
 	if (!BuildDatabase->Open(BuildDatabasePath))
@@ -1169,7 +1334,14 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 		return 1;
 	}
 
-	BuildDatabase->ResetDatabase();
+	UE_LOG(LogMonolithIndex, Log, TEXT("Full index: resetting build database at %s"), *BuildDatabasePath);
+	const bool bResetOk = BuildDatabase->ResetDatabase();
+	UE_LOG(
+		LogMonolithIndex,
+		Log,
+		TEXT("Full index: build database reset %s at %s"),
+		bResetOk ? TEXT("succeeded") : TEXT("failed"),
+		*BuildDatabasePath);
 	FMonolithIndexDatabase* DB = BuildDatabase.Get();
 
 	DB->BeginTransaction();
@@ -1195,7 +1367,7 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	{
 		if (bShouldStop) break;
 
-		if (Owner->TaskNotification && Owner->TaskNotification->GetPromptAction() == EAsyncTaskNotificationPromptAction::Cancel)
+		if (Owner->bTaskNotificationCancelRequested.Load())
 		{
 			bShouldStop = true;
 			break;
@@ -1243,16 +1415,10 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 			UE_LOG(LogMonolithIndex, Log, TEXT("Indexed %d / %d assets (%d errors)"),
 				Indexed, TotalAssets.Load(), Errors);
 
-			if (Owner->TaskNotification)
-			{
-				Owner->TaskNotification->SetProgressText(FText::FromString(
-					FString::Printf(TEXT("Indexing %d / %d assets..."), CurrentIndex.Load(), TotalAssets.Load())));
-			}
-
-			AsyncTask(ENamedThreads::GameThread, [this]()
-			{
-				Owner->OnProgress.Broadcast(CurrentIndex.Load(), TotalAssets.Load());
-			});
+			MaybeQueueProgressUpdate(
+				CurrentIndex.Load(),
+				TotalAssets.Load(),
+				FString::Printf(TEXT("Indexing %d / %d assets..."), CurrentIndex.Load(), TotalAssets.Load()));
 
 			if (Owner->RuntimeState.IsValid())
 			{
@@ -1288,6 +1454,11 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	// We process in small batches with GC and memory management to prevent OOM.
 	// ============================================================
 	Owner->IndexingStatusMessage = FString::Printf(TEXT("Deep indexing %d assets..."), DeepIndexQueue.Num());
+	MaybeQueueProgressUpdate(
+		Indexed,
+		Indexed + DeepIndexQueue.Num(),
+		FString::Printf(TEXT("Deep indexing %d / %d assets..."), 0, DeepIndexQueue.Num()),
+		true);
 
 	if (!bShouldStop && DeepIndexQueue.Num() > 0)
 	{
@@ -1314,7 +1485,7 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 		for (int32 BatchStart = 0; BatchStart < TotalDeep && !bShouldStop; BatchStart += DeepBatchSize)
 		{
 			// Check for cancellation from notification
-			if (Owner->TaskNotification && Owner->TaskNotification->GetPromptAction() == EAsyncTaskNotificationPromptAction::Cancel)
+			if (Owner->bTaskNotificationCancelRequested.Load())
 			{
 				bShouldStop = true;
 				break;
@@ -1402,16 +1573,10 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 			CurrentIndex = Indexed + BatchEnd;
 			TotalAssets = Indexed + TotalDeep;
 
-			if (Owner->TaskNotification)
-			{
-				Owner->TaskNotification->SetProgressText(FText::FromString(
-					FString::Printf(TEXT("Deep indexing %d / %d assets..."), BatchEnd, TotalDeep)));
-			}
-
-			AsyncTask(ENamedThreads::GameThread, [this]()
-			{
-				Owner->OnProgress.Broadcast(CurrentIndex.Load(), TotalAssets.Load());
-			});
+			MaybeQueueProgressUpdate(
+				CurrentIndex.Load(),
+				TotalAssets.Load(),
+				FString::Printf(TEXT("Deep indexing %d / %d assets..."), BatchEnd, TotalDeep));
 
 			if (Owner->RuntimeState.IsValid())
 			{
@@ -1462,7 +1627,7 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 	auto CheckCancellation = [this]() -> bool
 	{
 		if (bShouldStop) return true;
-		if (Owner->TaskNotification && Owner->TaskNotification->GetPromptAction() == EAsyncTaskNotificationPromptAction::Cancel)
+		if (Owner->bTaskNotificationCancelRequested.Load())
 		{
 			bShouldStop = true;
 			return true;
@@ -1609,6 +1774,7 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 void UMonolithIndexSubsystem::OnIndexingFinished(bool bSuccess, const FString& CompletedDatabasePath)
 {
 	bIsIndexing = false;
+	bTaskNotificationCancelRequested = false;
 	IndexingStatusMessage.Empty();
 
 	IndexingTaskPtr.Reset();
@@ -1621,6 +1787,7 @@ void UMonolithIndexSubsystem::OnIndexingFinished(bool bSuccess, const FString& C
 			const FString BackupDatabasePath = FinalDatabasePath + TEXT(".bak");
 			IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 
+			FScopeLock DatabaseLock(&DatabaseAccessMutex);
 			if (Database.IsValid())
 			{
 				Database->Close();
@@ -1694,10 +1861,11 @@ void UMonolithIndexSubsystem::OnIndexingFinished(bool bSuccess, const FString& C
 		RuntimeState->FinishSession();
 	}
 
-	if (bSuccess && IsIndexingEnabled())
+	if ((bSuccess || bRestoreLiveCallbacksAfterFullIndex) && IsIndexingEnabled() && Database.IsValid() && Database->IsOpen())
 	{
 		RegisterLiveCallbacks();
 	}
+	bRestoreLiveCallbacksAfterFullIndex = false;
 
 	if (TaskNotification)
 	{
@@ -1713,6 +1881,31 @@ void UMonolithIndexSubsystem::OnIndexingFinished(bool bSuccess, const FString& C
 
 	UE_LOG(LogMonolithIndex, Log, TEXT("Indexing %s"),
 		bSuccess ? TEXT("completed successfully") : TEXT("failed or was cancelled"));
+}
+
+FMonolithActionResult UMonolithIndexSubsystem::RunReadDatabaseAction(
+	TFunctionRef<FMonolithActionResult(FMonolithIndexDatabase&)> Func)
+{
+	/*
+	 * 这里把所有 project.* 查询统一收口到“主数据库连接 + DatabaseAccessMutex”。
+	 *
+	 * 之前我们单独维护了一个 ReadDatabase，想把查询和写入拆成两份 sqlite3 连接。
+	 * 但真实验证已经证明：在这个工程环境里，“同进程第二个连接”本身就会反复报
+	 * disk I/O error，哪怕主连接在同一时刻是健康可用的。
+	 *
+	 * 所以这里回到唯一正确实现：
+	 * - 查询直接复用启动时已经打开成功的主连接；
+	 * - 查询和增量/live 写入统一串在 DatabaseAccessMutex 上；
+	 * - 不再保留第二个“看似只读、实际上更脆弱”的连接分支。
+	 */
+	FScopeLock Lock(&DatabaseAccessMutex);
+	if (!Database.IsValid() || !Database->IsOpen())
+	{
+		return FMonolithActionResult::Error(
+			FString::Printf(TEXT("Index database not available: %s"), *GetDatabasePath()));
+	}
+
+	return Func(*Database);
 }
 
 FString UMonolithIndexSubsystem::GetDatabasePath() const
@@ -2760,13 +2953,24 @@ void UMonolithIndexSubsystem::AppendRuntimeStats(const TSharedPtr<FJsonObject>& 
 	Stats->SetNumberField(TEXT("local_hit"), static_cast<double>(CacheStats.LocalHitCount));
 	Stats->SetNumberField(TEXT("remote_hit"), static_cast<double>(CacheStats.RemoteHitCount));
 	Stats->SetNumberField(TEXT("remote_miss"), static_cast<double>(CacheStats.RemoteMissCount));
+	Stats->SetNumberField(
+		TEXT("cache_read_total"),
+		static_cast<double>(CacheStats.LocalHitCount + CacheStats.RemoteHitCount + CacheStats.RemoteMissCount));
+	Stats->SetNumberField(
+		TEXT("cache_hit_total"),
+		static_cast<double>(CacheStats.LocalHitCount + CacheStats.RemoteHitCount));
 	Stats->SetNumberField(TEXT("remote_write_ok"), static_cast<double>(CacheStats.RemoteWriteOkCount));
 	Stats->SetNumberField(TEXT("remote_write_fail"), static_cast<double>(CacheStats.RemoteWriteFailCount));
 	Stats->SetNumberField(TEXT("remote_write_bytes"), static_cast<double>(CacheStats.RemoteWriteBytes));
 	Stats->SetNumberField(TEXT("remote_write_mb"), static_cast<double>(CacheStats.RemoteWriteBytes) / (1024.0 * 1024.0));
 	Stats->SetNumberField(TEXT("oversized_artifact"), static_cast<double>(CacheStats.OversizedArtifactCount));
+	Stats->SetNumberField(TEXT("remote_write_pending"), static_cast<double>(CacheStats.PendingRemoteWriteCount));
+	Stats->SetNumberField(TEXT("remote_write_inflight"), static_cast<double>(CacheStats.InFlightRemoteWriteCount));
 	Stats->SetNumberField(TEXT("offline_queue_depth"), static_cast<double>(OfflineQueueRequests.Num()));
+	Stats->SetBoolField(TEXT("local_cache_available"), ArtifactCache.IsValid());
+	Stats->SetStringField(TEXT("local_cache_state"), ArtifactCache.IsValid() ? TEXT("ready") : TEXT("unavailable"));
 	Stats->SetBoolField(TEXT("remote_disabled"), CacheStats.bRemoteDisabled);
+	Stats->SetStringField(TEXT("remote_cache_state"), CacheStats.bRemoteDisabled ? TEXT("open") : TEXT("ready"));
 	Stats->SetNumberField(TEXT("remote_breaker_remaining_seconds"), CacheStats.RemoteBreakerRemainingSeconds);
 	Stats->SetNumberField(TEXT("gt_overrun_count"), static_cast<double>(GtSnapshot.OverrunCount));
 	Stats->SetNumberField(TEXT("gt_downgrade_count"), static_cast<double>(GtSnapshot.DowngradeCount));
@@ -3336,6 +3540,10 @@ void UMonolithIndexSubsystem::UnregisterLiveCallbacks()
 		AR->OnAssetRenamed().Remove(OnAssetRenamedHandle);
 		AR->OnAssetsUpdatedOnDisk().Remove(OnAssetsUpdatedOnDiskHandle);
 	}
+	OnAssetsAddedHandle.Reset();
+	OnAssetsRemovedHandle.Reset();
+	OnAssetRenamedHandle.Reset();
+	OnAssetsUpdatedOnDiskHandle.Reset();
 
 	if (GEditor)
 	{

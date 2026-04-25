@@ -1,5 +1,6 @@
 #include "MonolithIndexModule.h"
 #include "MonolithIndexDatabase.h"
+#include "MonolithIndexSubsystem.h"
 #include "MonolithToolRegistry.h"
 #include "Actions/ProjectSearchAction.h"
 #include "Actions/ProjectFindReferencesAction.h"
@@ -9,21 +10,50 @@
 #include "Actions/ProjectListStalePackagesAction.h"
 #include "Actions/ProjectListGameplayTagsAction.h"
 #include "Actions/ProjectSearchGameplayTagsAction.h"
+#include "Editor.h"
 #include "SMonolithIndexStatusBar.h"
 #include "ToolMenus.h"
+#include "Widgets/Input/SButton.h"
+#include "Widgets/Text/STextBlock.h"
 
 /*
  * 这个文件是 MonolithIndex 模块的“门厅”。
  *
  * 进入点很少，但很重要：
  * - StartupModule 负责把 MCP action 一口气注册完；
- * - RegisterMenus 负责把状态栏 UI 挂进编辑器；
+ * - RegisterMenus 负责把状态栏 UI 和顶部工具栏按钮挂进编辑器；
  * - ShutdownModule 负责把这些入口安全拆掉。
  *
  * 这里不做重业务计算，重点是“把入口接好、关干净”。
  */
 
 #define LOCTEXT_NAMESPACE "FMonolithIndexModule"
+
+namespace
+{
+bool CanStartManualFullIndex(const FToolMenuContext&)
+{
+	if (!GEditor)
+	{
+		return false;
+	}
+
+	if (const UMonolithIndexSubsystem* const Subsystem = GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>())
+	{
+		return !Subsystem->IsIndexing();
+	}
+
+	return false;
+}
+
+void StartManualFullIndex(const FToolMenuContext&)
+{
+	if (GEditor)
+	{
+		GEditor->Exec(nullptr, TEXT("Monolith.StartIndex full"));
+	}
+}
+}
 
 void FMonolithIndexModule::StartupModule()
 {
@@ -36,42 +66,50 @@ void FMonolithIndexModule::StartupModule()
 	Registry.RegisterAction(TEXT("project"), FProjectSearchAction::GetName(),
 		FProjectSearchAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectSearchAction::Execute),
-		FProjectSearchAction::GetSchema());
+		FProjectSearchAction::GetSchema(),
+		EMonolithActionExecutionPolicy::BackgroundThread);
 
 	Registry.RegisterAction(TEXT("project"), FProjectFindReferencesAction::GetName(),
 		FProjectFindReferencesAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectFindReferencesAction::Execute),
-		FProjectFindReferencesAction::GetSchema());
+		FProjectFindReferencesAction::GetSchema(),
+		EMonolithActionExecutionPolicy::BackgroundThread);
 
 	Registry.RegisterAction(TEXT("project"), FProjectFindByTypeAction::GetName(),
 		FProjectFindByTypeAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectFindByTypeAction::Execute),
-		FProjectFindByTypeAction::GetSchema());
+		FProjectFindByTypeAction::GetSchema(),
+		EMonolithActionExecutionPolicy::BackgroundThread);
 
 	Registry.RegisterAction(TEXT("project"), FProjectGetStatsAction::GetName(),
 		FProjectGetStatsAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectGetStatsAction::Execute),
-		FProjectGetStatsAction::GetSchema());
+		FProjectGetStatsAction::GetSchema(),
+		EMonolithActionExecutionPolicy::BackgroundThread);
 
 	Registry.RegisterAction(TEXT("project"), FProjectGetAssetDetailsAction::GetName(),
 		FProjectGetAssetDetailsAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectGetAssetDetailsAction::Execute),
-		FProjectGetAssetDetailsAction::GetSchema());
+		FProjectGetAssetDetailsAction::GetSchema(),
+		EMonolithActionExecutionPolicy::BackgroundThread);
 
 	Registry.RegisterAction(TEXT("project"), FProjectListStalePackagesAction::GetName(),
 		FProjectListStalePackagesAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectListStalePackagesAction::Execute),
-		FProjectListStalePackagesAction::GetSchema());
+		FProjectListStalePackagesAction::GetSchema(),
+		EMonolithActionExecutionPolicy::BackgroundThread);
 
 	Registry.RegisterAction(TEXT("project"), FProjectListGameplayTagsAction::GetName(),
 		FProjectListGameplayTagsAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectListGameplayTagsAction::Execute),
-		FProjectListGameplayTagsAction::GetSchema());
+		FProjectListGameplayTagsAction::GetSchema(),
+		EMonolithActionExecutionPolicy::BackgroundThread);
 
 	Registry.RegisterAction(TEXT("project"), FProjectSearchGameplayTagsAction::GetName(),
 		FProjectSearchGameplayTagsAction::GetDescription(),
 		FMonolithActionHandler::CreateStatic(&FProjectSearchGameplayTagsAction::Execute),
-		FProjectSearchGameplayTagsAction::GetSchema());
+		FProjectSearchGameplayTagsAction::GetSchema(),
+		EMonolithActionExecutionPolicy::BackgroundThread);
 
 	if (!IsRunningCommandlet())
 	{
@@ -105,13 +143,45 @@ void FMonolithIndexModule::RegisterMenus()
 	FModuleManager::Get().LoadModule(TEXT("LevelEditor"));
 
 	FToolMenuOwnerScoped OwnerScoped(this);
-	UToolMenu* const Menu = UToolMenus::Get()->ExtendMenu("LevelEditor.StatusBar.ToolBar");
-	if (!Menu)
+
+	UToolMenu* const AssetsToolbarMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.LevelEditorToolBar.AssetsToolBar");
+	if (AssetsToolbarMenu)
+	{
+		FToolMenuSection& ToolbarSection = AssetsToolbarMenu->AddSection(
+			TEXT("MonolithIndexToolbar"),
+			FText::GetEmpty(),
+			FToolMenuInsert(TEXT("Content"), EToolMenuInsertType::After));
+
+		ToolbarSection.AddEntry(
+			FToolMenuEntry::InitWidget(
+				TEXT("MonolithFullIndex"),
+				SNew(SButton)
+				.Text(LOCTEXT("MonolithFullIndexShortLabel", "Full Index"))
+				.ToolTipText(LOCTEXT("MonolithFullIndexTooltip", "Run a manual full Monolith index rebuild via 'Monolith.StartIndex full'."))
+				.IsEnabled_Lambda([]()
+				{
+					return CanStartManualFullIndex(FToolMenuContext());
+				})
+				.OnClicked_Lambda([]()
+				{
+					StartManualFullIndex(FToolMenuContext());
+					return FReply::Handled();
+				}),
+				LOCTEXT("MonolithFullIndexLabel", "Monolith Full Index"),
+				true,
+				false)
+		);
+
+		UE_LOG(LogMonolithIndex, Log, TEXT("Registered Monolith full index button in LevelEditor.LevelEditorToolBar.AssetsToolBar"));
+	}
+
+	UToolMenu* const StatusBarMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.StatusBar.ToolBar");
+	if (!StatusBarMenu)
 	{
 		return;
 	}
 
-	FToolMenuSection& Section = Menu->AddSection(
+	FToolMenuSection& Section = StatusBarMenu->AddSection(
 		TEXT("MonolithIndex"),
 		FText::GetEmpty(),
 		FToolMenuInsert(TEXT("Compile"), EToolMenuInsertType::Before));

@@ -2,6 +2,8 @@
 
 #include "Actions/MonolithProjectActionUtils.h"
 #include "MonolithIndexSubsystem.h"
+#include "MonolithIndexRuntimeState.h"
+#include "MonolithOfflineWarmupQueue.h"
 #include "MonolithParamSchema.h"
 
 /*
@@ -20,19 +22,17 @@ FMonolithActionResult FProjectListStalePackagesAction::Execute(const TSharedPtr<
 	const int32 Limit = MonolithProjectActionUtils::GetOptionalIntParam(Params, TEXT("limit"), 100);
 	const FString Cursor = MonolithProjectActionUtils::GetOptionalStringParam(Params, TEXT("cursor"));
 
-	UMonolithIndexSubsystem* const Subsystem = MonolithProjectActionUtils::GetIndexSubsystem();
-	if (!Subsystem)
-	{
-		return MonolithProjectActionUtils::MakeSubsystemUnavailableError();
-	}
+	TSet<FString> Packages;
+	AppendMonolithOfflineWarmupQueuedPackages(Packages);
 
-	const TSharedPtr<FJsonObject> Result = Subsystem->ListStalePackages(Limit, Cursor);
+	const TSharedPtr<FJsonObject> Result = FMonolithIndexRuntimeState::BuildPackagePage(Packages, Limit, Cursor);
 	if (!Result.IsValid())
 	{
 		return FMonolithActionResult::Error(TEXT("Failed to list stale packages"));
 	}
 
 	Result->SetBoolField(TEXT("success"), true);
+	Result->SetBoolField(TEXT("indexing_in_progress"), false);
 	return FMonolithActionResult::Success(Result);
 }
 

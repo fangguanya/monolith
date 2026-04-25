@@ -11,6 +11,8 @@
 #include "MonolithIndexer.h"
 #include "MonolithIndexSubsystem.generated.h"
 
+struct FMonolithActionResult;
+
 /*
  * UMonolithIndexSubsystem 是 MonolithIndex 的“大总管”。
  *
@@ -88,6 +90,8 @@ struct FMonolithIndexStatusBarSnapshot
 	bool bDatabaseOpen = false;
 	/** 索引功能是否启用。 */
 	bool bIndexEnabled = false;
+	/** 本地 artifact cache 是否可用。 */
+	bool bLocalCacheAvailable = false;
 	/** 当前是否有索引任务正在跑。 */
 	bool bIndexingInProgress = false;
 	/** 进度百分比，范围 0 到 1。 */
@@ -120,6 +124,10 @@ struct FMonolithIndexStatusBarSnapshot
 	uint64 RemoteWriteBytes = 0;
 	/** 因 oversized 而跳过共享缓存的 artifact 次数。 */
 	uint64 OversizedArtifactCount = 0;
+	/** 还排队等着同步到远端 DDC 的请求数。 */
+	int32 PendingRemoteWriteCount = 0;
+	/** 当前已经发出去、还没完成的远端写请求数。 */
+	int32 InFlightRemoteWriteCount = 0;
 	/** GT 超预算次数。 */
 	uint64 GtOverrunCount = 0;
 	/** GT 被迫降级次数。 */
@@ -161,11 +169,6 @@ public:
 	/** 子系统关闭入口，负责停后台任务、解绑回调、关数据库。 */
 	virtual void Deinitialize() override;
 
-	/** 触发 full index。
-	 * 它会清库后把受管范围重新完整扫描一遍。 */
-	UFUNCTION()
-	void StartFullIndex();
-
 	/** 触发增量 catch-up。
 	 * 它只处理“上次之后发生变化”的资产，而不是把全项目重扫一遍。 */
 	UFUNCTION()
@@ -186,6 +189,19 @@ public:
 
 	/** 拿数据库对象给查询侧使用。 */
 	FMonolithIndexDatabase* GetDatabase() { return Database.Get(); }
+
+	/** 跑一段 project.* 查询。
+	 * 这里直接复用子系统已经打开的主数据库连接，并通过 `DatabaseAccessMutex`
+	 * 把查询和 live/incremental 写入串行化。
+	 *
+	 * 这样做的原因是：
+	 * - 当前工程环境里“同进程第二个 SQLite 连接”不稳定；
+	 * - 但主连接本身在启动时就是稳定可用的；
+	 * - 统一走一份连接，才能彻底消掉 project.* 那条额外的失败路径。
+	 *
+	 * 数据库不可用时不会调用 Func，并返回带错误信息的 FMonolithActionResult。 */
+	FMonolithActionResult RunReadDatabaseAction(
+		TFunctionRef<FMonolithActionResult(FMonolithIndexDatabase&)> Func);
 
 	/** 生成一个轻量状态栏快照。
 	 * 某些贵查询只会在明确要求时才补进去。 */
@@ -228,6 +244,8 @@ public:
 	FOnIndexingComplete OnComplete;
 
 private:
+	friend struct FMonolithIndexConsoleCommands;
+
 	/** full index 的后台任务小对象。 */
 	class FIndexingTask
 	{
@@ -274,6 +292,10 @@ private:
 		TMap<FName, FIoHash> InCurrentHashes);
 	/** live job 结束后统一收尾并决定是否重新挂回调。 */
 	void FinalizeLiveDatabaseJob(bool bSuccess, bool bReRegisterLiveCallbacks, const TCHAR* SuccessMessage, const TCHAR* FailureMessage);
+	/** 真正执行 full index 的内部入口，只允许手动命令链路调用。 */
+	void StartFullIndexInternal();
+	/** 收到手动 full index 请求后，必要时等待 Asset Registry 就绪。 */
+	void RequestManualFullIndex();
 	/** Asset Registry 文件加载完成后触发的启动回调。 */
 	void OnAssetRegistryFilesLoaded();
 	/** 注册默认内建 indexer。 */
@@ -380,6 +402,8 @@ private:
 	void OnAssetsUpdatedOnDiskCallback(TConstArrayView<FAssetData> Assets);
 	/** 把累计的 live 变化打包交给后台处理。 */
 	void ProcessPendingChanges();
+	/** 在 GT 上刷新右下角异步任务提示，并顺手同步取消状态。 */
+	void QueueTaskNotificationProgressUpdate(int32 Current, int32 Total, const FString& ProgressText);
 
 	// --- 实时增量跟踪状态 ---
 	/** 等待处理的实时变化队列。 */
@@ -400,7 +424,8 @@ private:
 	/** 当前 full index 期间缓存的插件列表。 */
 	TArray<FIndexedPluginInfo> IndexedPlugins;
 
-	/** 正式 SQLite 数据库对象。 */
+	/** 正式 SQLite 数据库对象。
+	 * 现在查询和写入都统一走这一份连接，避免第二连接在当前工程环境下反复打开失败。 */
 	TUniquePtr<FMonolithIndexDatabase> Database;
 	/** artifact cache 抽象，可能落到本地或远端 DDC。 */
 	TUniquePtr<IMonolithArtifactCache> ArtifactCache;
@@ -422,6 +447,10 @@ private:
 	TUniquePtr<FIndexingTask> IndexingTaskPtr;
 	/** 有没有后台索引在跑。 */
 	TAtomic<bool> bIsIndexing{false};
+	/** 手动 full index 是否还在等 Asset Registry 把文件扫完。 */
+	bool bPendingManualFullIndex = false;
+	/** 手动 full index 前如果已经挂着 live callbacks，失败/取消后要恢复它们。 */
+	bool bRestoreLiveCallbacksAfterFullIndex = false;
 	/** 保护数据库访问的互斥锁。 */
 	mutable FCriticalSection DatabaseAccessMutex;
 
@@ -429,4 +458,6 @@ private:
 	FString IndexingStatusMessage;
 	/** 编辑器角落里弹出的异步任务提示。 */
 	TUniquePtr<FAsyncTaskNotification> TaskNotification;
+	/** 右下角任务提示是否已经被用户点了 Cancel。 */
+	TAtomic<bool> bTaskNotificationCancelRequested{false};
 };

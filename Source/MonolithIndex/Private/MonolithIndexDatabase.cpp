@@ -3,6 +3,7 @@
 #include "SQLiteDatabase.h"
 #include "Misc/Paths.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformProcess.h"
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -31,6 +32,26 @@ DEFINE_LOG_CATEGORY(LogMonolithIndex);
 
 namespace MonolithIndexDatabaseInternal
 {
+	static FString CompactSqlForLog(const FString& SQL, const int32 MaxLen = 220)
+	{
+		FString Compact = SQL;
+		Compact.ReplaceInline(TEXT("\r"), TEXT(" "));
+		Compact.ReplaceInline(TEXT("\n"), TEXT(" "));
+		Compact.ReplaceInline(TEXT("\t"), TEXT(" "));
+		while (Compact.Contains(TEXT("  ")))
+		{
+			Compact.ReplaceInline(TEXT("  "), TEXT(" "));
+		}
+
+		Compact.TrimStartAndEndInline();
+		if (Compact.Len() > MaxLen)
+		{
+			return Compact.Left(MaxLen) + TEXT("...");
+		}
+
+		return Compact;
+	}
+
 	static bool TableExists(FSQLiteDatabase& Database, const FString& TableName)
 	{
 		FSQLitePreparedStatement Stmt;
@@ -451,6 +472,12 @@ bool FMonolithIndexDatabase::Open(const FString& InDbPath)
 	{
 		FString SchemaVersion = ReadMeta(TEXT("schema_version"));
 		int32 SchemaVersionInt = SchemaVersion.IsEmpty() ? 0 : FCString::Atoi(*SchemaVersion);
+		UE_LOG(
+			LogMonolithIndex,
+			Log,
+			TEXT("Index DB schema check: path=%s current_schema_version=%d"),
+			*DbPath,
+			SchemaVersionInt);
 		if (SchemaVersionInt < 4)
 		{
 			if (!MonolithIndexDatabaseInternal::TableHasColumn(*Database, TEXT("assets"), TEXT("saved_hash")))
@@ -575,6 +602,87 @@ bool FMonolithIndexDatabase::Open(const FString& InDbPath)
 	return true;
 }
 
+bool FMonolithIndexDatabase::OpenQueryOnly(const FString& InDbPath)
+{
+	if (Database)
+	{
+		Close();
+	}
+
+	DbPath = InDbPath;
+	Database = new FSQLiteDatabase();
+
+	/*
+	 * 这里绝不能再用 SQLite 的 ReadOnly 打开模式。
+	 *
+	 * Monolith 自带的离线查询工具已经验证过：
+	 * - Windows 上在 writer 持锁窗口里用 ReadOnly 新开连接；
+	 * - 很容易在 sqlite3_open 阶段直接报 disk I/O / SQLITE_BUSY；
+	 * - 即使库文件本身完全健康，也会把 project.* 查询打崩。
+	 *
+	 * 所以这里和 monolith_query 保持完全一致，保证编辑器内查询链和离线查询链不再各走各的：
+	 * - 先用 ReadWrite 打开现有数据库；
+	 * - 再把连接降成 query_only；
+	 * - 同时强制 journal_mode=DELETE，避免只读/WAL 组合在 Windows 上的异常行为。
+	 *
+	 * 下面这段重试仍然保留，因为 writer 切换事务的瞬间依然可能让 open 失败；
+	 * 但现在失败窗口会小很多，而且打开成功后连接就能长期复用，不会每次查询都重新撞锁。
+	 */
+	constexpr int32 MaxOpenAttempts = 30;
+	constexpr float OpenRetrySeconds = 0.1f;
+	bool bOpened = false;
+	for (int32 Attempt = 0; Attempt < MaxOpenAttempts; ++Attempt)
+	{
+		if (Database->Open(*DbPath, ESQLiteDatabaseOpenMode::ReadWrite))
+		{
+			bOpened = true;
+			if (Attempt > 0)
+			{
+				UE_LOG(
+					LogMonolithIndex,
+					Verbose,
+					TEXT("Index database opened query-only after %d retr%s: %s"),
+					Attempt,
+					Attempt == 1 ? TEXT("y") : TEXT("ies"),
+					*DbPath);
+			}
+			break;
+		}
+		if (Attempt + 1 < MaxOpenAttempts)
+		{
+			FPlatformProcess::Sleep(OpenRetrySeconds);
+		}
+	}
+
+	if (!bOpened)
+	{
+		UE_LOG(LogMonolithIndex, Error, TEXT("Failed to open index database query-only after retries: %s"), *DbPath);
+		delete Database;
+		Database = nullptr;
+		return false;
+	}
+
+	/*
+	 * 这三个 PRAGMA 是查询连接的固定配置，缺一不可：
+	 * - journal_mode=DELETE：避免 Windows 上 WAL + 只读/查询连接的异常读结果；
+	 * - query_only=ON：把这个连接彻底锁成“只能查，不能写”；
+	 * - busy_timeout=5000：单条 statement 命中 writer 时，交给 SQLite 自己排队等待。
+	 *
+	 * 它们必须在打开成功之后再设。
+	 */
+	if (!ExecuteSQL(TEXT("PRAGMA journal_mode=DELETE;"), TEXT("OpenQueryOnly/JournalMode"))
+		|| !ExecuteSQL(TEXT("PRAGMA query_only=ON;"), TEXT("OpenQueryOnly/QueryOnly"))
+		|| !ExecuteSQL(TEXT("PRAGMA busy_timeout=5000;"), TEXT("OpenQueryOnly/BusyTimeout")))
+	{
+		UE_LOG(LogMonolithIndex, Error, TEXT("Failed to configure query-only SQLite pragmas for %s"), *DbPath);
+		Close();
+		return false;
+	}
+
+	UE_LOG(LogMonolithIndex, Verbose, TEXT("Index database opened query-only: %s"), *DbPath);
+	return true;
+}
+
 void FMonolithIndexDatabase::Close()
 {
 	ActiveAssetRevisions.Reset();
@@ -595,42 +703,71 @@ bool FMonolithIndexDatabase::ResetDatabase()
 {
 	if (!IsOpen()) return false;
 	ActiveAssetRevisions.Reset();
+	bool bResetSucceeded = true;
+
+	UE_LOG(LogMonolithIndex, Log, TEXT("ResetDatabase: rebuilding schema for %s"), *DbPath);
 
 	// Drop all tables and recreate — order matters for foreign keys
-	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_assets_ai;"));
-	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_assets_ad;"));
-	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_assets_au;"));
-	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_ai;"));
-	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_ad;"));
-	ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_au;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_assets;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_nodes;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS tag_references;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS tags;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS connections;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS nodes;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS variables;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS parameters;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS dependencies;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS actors;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS configs;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS cpp_symbols;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS datatable_rows;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS mesh_catalog;"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_assets_ai;"), TEXT("ResetDatabase/DropTrigger"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_assets_ad;"), TEXT("ResetDatabase/DropTrigger"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_assets_au;"), TEXT("ResetDatabase/DropTrigger"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_ai;"), TEXT("ResetDatabase/DropTrigger"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_ad;"), TEXT("ResetDatabase/DropTrigger"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TRIGGER IF EXISTS fts_nodes_au;"), TEXT("ResetDatabase/DropTrigger"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_assets;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS fts_nodes;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS tag_references;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS tags;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS connections;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS nodes;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS variables;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS parameters;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS dependencies;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS actors;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS configs;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS cpp_symbols;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS datatable_rows;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS mesh_catalog;"), TEXT("ResetDatabase/DropTable"));
 	{
-		FSQLitePreparedStatement ShadowTableStmt;
-		ShadowTableStmt.Create(*Database, TEXT("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'shadow_%';"));
-		while (ShadowTableStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		TArray<FString> ShadowTableNames;
 		{
-			FString ShadowTableName;
-			ShadowTableStmt.GetColumnValueByIndex(0, ShadowTableName);
-			ExecuteSQL(FString::Printf(TEXT("DROP TABLE IF EXISTS %s;"), *ShadowTableName));
+			FSQLitePreparedStatement ShadowTableStmt;
+			if (!ShadowTableStmt.Create(*Database, TEXT("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'shadow_%';")))
+			{
+				UE_LOG(
+					LogMonolithIndex,
+					Error,
+					TEXT("ResetDatabase: failed to enumerate shadow tables for %s: %s"),
+					*DbPath,
+					*Database->GetLastError());
+				bResetSucceeded = false;
+			}
+			while (ShadowTableStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				FString ShadowTableName;
+				ShadowTableStmt.GetColumnValueByIndex(0, ShadowTableName);
+				ShadowTableNames.Add(MoveTemp(ShadowTableName));
+			}
+		}
+
+		// 先结束 sqlite_master 的扫描，再修改 schema，避免 SQLite 因为同连接下的 schema 读写冲突而锁表。
+		for (const FString& ShadowTableName : ShadowTableNames)
+		{
+			UE_LOG(
+				LogMonolithIndex,
+				Log,
+				TEXT("ResetDatabase: dropping shadow table %s from %s"),
+				*ShadowTableName,
+				*DbPath);
+			bResetSucceeded &= ExecuteSQL(
+				FString::Printf(TEXT("DROP TABLE IF EXISTS %s;"), *ShadowTableName),
+				TEXT("ResetDatabase/DropShadowTable"));
 		}
 	}
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS meta;"));
-	ExecuteSQL(TEXT("DROP TABLE IF EXISTS assets;"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS meta;"), TEXT("ResetDatabase/DropTable"));
+	bResetSucceeded &= ExecuteSQL(TEXT("DROP TABLE IF EXISTS assets;"), TEXT("ResetDatabase/DropTable"));
 
-	return CreateTables();
+	return bResetSucceeded && CreateTables();
 }
 
 // ============================================================
@@ -3104,7 +3241,16 @@ int32 FMonolithIndexDatabase::DropExpiredShadowTables(const FDateTime& NowUtc)
 
 	TArray<FString> ExpiredTableNames;
 	FSQLitePreparedStatement SelectStmt;
-	SelectStmt.Create(*Database, TEXT("SELECT table_name FROM shadow_table_retention WHERE expires_at_utc <= ?;"));
+	if (!SelectStmt.Create(*Database, TEXT("SELECT table_name FROM shadow_table_retention WHERE expires_at_utc <= ?;")))
+	{
+		UE_LOG(
+			LogMonolithIndex,
+			Error,
+			TEXT("DropExpiredShadowTables: failed to prepare retention scan for %s: %s"),
+			*DbPath,
+			*Database->GetLastError());
+		return 0;
+	}
 	SelectStmt.SetBindingValueByIndex(1, NowUtc.ToIso8601());
 	while (SelectStmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
@@ -3113,17 +3259,55 @@ int32 FMonolithIndexDatabase::DropExpiredShadowTables(const FDateTime& NowUtc)
 		ExpiredTableNames.Add(MoveTemp(TableName));
 	}
 
+	if (ExpiredTableNames.Num() > 0)
+	{
+		UE_LOG(
+			LogMonolithIndex,
+			Log,
+			TEXT("DropExpiredShadowTables: found %d expired shadow table(s) in %s"),
+			ExpiredTableNames.Num(),
+			*DbPath);
+	}
+
 	int32 DroppedCount = 0;
 	for (const FString& TableName : ExpiredTableNames)
 	{
-		ExecuteSQL(FString::Printf(TEXT("DROP TABLE IF EXISTS %s;"), *TableName));
+		UE_LOG(
+			LogMonolithIndex,
+			Log,
+			TEXT("DropExpiredShadowTables: dropping expired shadow table %s from %s"),
+			*TableName,
+			*DbPath);
+		ExecuteSQL(
+			FString::Printf(TEXT("DROP TABLE IF EXISTS %s;"), *TableName),
+			TEXT("DropExpiredShadowTables/DropShadowTable"));
 
 		FSQLitePreparedStatement DeleteStmt;
-		DeleteStmt.Create(*Database, TEXT("DELETE FROM shadow_table_retention WHERE table_name = ?;"));
+		if (!DeleteStmt.Create(*Database, TEXT("DELETE FROM shadow_table_retention WHERE table_name = ?;")))
+		{
+			UE_LOG(
+				LogMonolithIndex,
+				Error,
+				TEXT("DropExpiredShadowTables: failed to prepare retention delete for %s (table=%s): %s"),
+				*DbPath,
+				*TableName,
+				*Database->GetLastError());
+			continue;
+		}
 		DeleteStmt.SetBindingValueByIndex(1, TableName);
 		if (DeleteStmt.Execute())
 		{
 			++DroppedCount;
+		}
+		else
+		{
+			UE_LOG(
+				LogMonolithIndex,
+				Error,
+				TEXT("DropExpiredShadowTables: failed to delete retention row for %s (table=%s): %s"),
+				*DbPath,
+				*TableName,
+				*Database->GetLastError());
 		}
 	}
 
@@ -3826,17 +4010,33 @@ bool FMonolithIndexDatabase::CreateTables()
 	return true; // Return true even if FTS fails -- basic tables should work
 }
 
-bool FMonolithIndexDatabase::ExecuteSQL(const FString& SQL)
+bool FMonolithIndexDatabase::ExecuteSQL(const FString& SQL, const TCHAR* Context)
 {
+	const TCHAR* SafeContext = Context ? Context : TEXT("General");
+	const FString CompactSql = MonolithIndexDatabaseInternal::CompactSqlForLog(SQL);
+
 	if (!Database || !Database->IsValid())
 	{
-		UE_LOG(LogMonolithIndex, Error, TEXT("Cannot execute SQL -- database not open"));
+		UE_LOG(
+			LogMonolithIndex,
+			Error,
+			TEXT("Cannot execute SQL -- database not open (context=%s, db=%s, sql=%s)"),
+			SafeContext,
+			*DbPath,
+			*CompactSql);
 		return false;
 	}
 
 	if (!Database->Execute(*SQL))
 	{
-		UE_LOG(LogMonolithIndex, Error, TEXT("SQL execution failed: %s"), *Database->GetLastError());
+		UE_LOG(
+			LogMonolithIndex,
+			Error,
+			TEXT("SQL execution failed (context=%s, db=%s, sql=%s): %s"),
+			SafeContext,
+			*DbPath,
+			*CompactSql,
+			*Database->GetLastError());
 		return false;
 	}
 	return true;
