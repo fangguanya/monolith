@@ -6,6 +6,9 @@ DerivedDataCache/
 *.patch_*
 __pycache__/
 *.pyc
+
+# Large model weights — must be downloaded out-of-band, not committed
+Resources/Models/*.onnx
 Docs/plans/
 Docs/TESTING.md
 Docs/TODO_VFX_Issues.md
