@@ -1,5 +1,6 @@
 ﻿#include "MonolithCaptureActions.h"
 #include "MonolithCaptureModule.h"
+#include "MonolithCaptureUtils.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 
@@ -371,12 +372,11 @@ void FMonolithCaptureActions::RegisterActions()
 
 	// --- 资产预览截图 ---
 	Registry.RegisterAction(TEXT("capture"), TEXT("capture_static_mesh"),
-		TEXT("对 StaticMesh 资产进行离屏 3D 预览截图"),
+		TEXT("对 StaticMesh 资产进行离屏 canonical iso 3D 预览截图（与 AssetVisual cohort 共享 render recipe）"),
 		FMonolithActionHandler::CreateStatic(&HandleCaptureStaticMesh),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("StaticMesh 资产路径"))
-			.Optional(TEXT("camera"), TEXT("object"), TEXT("{location:[x,y,z], rotation:[p,y,r], fov:60}"))
-			.Optional(TEXT("resolution"), TEXT("array"), TEXT("[width, height]"), TEXT("[512,512]"))
+			.Optional(TEXT("resolution"), TEXT("integer"), TEXT("正方形输出边长（像素），默认 256，与 AssetVisual cohort 一致"), TEXT("256"))
 			.Optional(TEXT("output_path"), TEXT("string"), TEXT("输出 PNG 路径"))
 			.Build());
 
@@ -834,32 +834,40 @@ bool FMonolithCaptureActions::CaptureMaterialFrame(
 
 bool FMonolithCaptureActions::CaptureStaticMeshFrame(
 	UStaticMesh* Mesh,
-	const FVector& CameraLocation, const FRotator& CameraRotation, float FOV,
-	int32 ResX, int32 ResY, const FString& OutputPath,
-	ESceneCaptureSource CaptureSource)
+	const int32 Resolution,
+	const FString& OutputPath)
 {
-	if (!Mesh) return false;
-
-	UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
-	if (!World)
+	if (!Mesh)
 	{
-		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureStaticMeshFrame: 编辑器世界不可用"));
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureStaticMeshFrame: Mesh 为空"));
 		return false;
 	}
 
-	UStaticMeshComponent* MeshComp = NewObject<UStaticMeshComponent>(
-		GetTransientPackage(), NAME_None, RF_Transient);
-	MeshComp->SetStaticMesh(Mesh);
-	MeshComp->CastShadow = false;
-	MeshComp->bCastDynamicShadow = false;
-	MeshComp->SetMobility(EComponentMobility::Movable);
-	MeshComp->RegisterComponentWithWorld(World);
+	if (Resolution <= 0 || Resolution > 4096)
+	{
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureStaticMeshFrame: Resolution=%d 越界"), Resolution);
+		return false;
+	}
 
-	bool bSuccess = CaptureComponentInEditorWorld(
-		MeshComp, CameraLocation, CameraRotation, FOV, ResX, ResY, OutputPath);
+	using namespace MonolithCapture;
 
-	MeshComp->UnregisterComponent();
-	return bSuccess;
+	FCanonicalRenderRequest Request;
+	Request.Asset = Mesh;
+	Request.Resolution = Resolution;
+	// capture_static_mesh action 只关心一张 iso 视图作为可视摘要，
+	// 与 AssetVisual cohort 持久化的 iso PNG 完全一致。
+	Request.Views.Add(ECanonicalView::Iso);
+	Request.bComputeSilhouette = false;
+
+	TArray<FCanonicalRenderResult> Results;
+	IAssetCanonicalRenderer& Renderer = GetAssetCanonicalRenderer();
+	if (!Renderer.RenderCanonical(Request, Results) || Results.Num() != 1)
+	{
+		UE_LOG(LogMonolithCapture, Error, TEXT("CaptureStaticMeshFrame: 预览渲染失败"));
+		return false;
+	}
+
+	return Renderer.SaveImageAsPng(Results[0].ColorImage, OutputPath);
 }
 
 bool FMonolithCaptureActions::CaptureSkeletalMeshFrame(
@@ -1216,7 +1224,7 @@ FMonolithActionResult FMonolithCaptureActions::HandleListRunArtifacts(const TSha
 
 FMonolithActionResult FMonolithCaptureActions::HandleCaptureStaticMesh(const TSharedPtr<FJsonObject>& Params)
 {
-	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	const FString AssetPath = Params->GetStringField(TEXT("asset_path"));
 	if (AssetPath.IsEmpty())
 	{
 		return FMonolithActionResult::Error(TEXT("asset_path is required"));
@@ -1229,29 +1237,26 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureStaticMesh(const TSh
 			FString::Printf(TEXT("Failed to load StaticMesh: %s"), *AssetPath));
 	}
 
-	FVector CameraLocation; FRotator CameraRotation; float FOV;
-	ParseCameraParams(Params, CameraLocation, CameraRotation, FOV);
-
-	// 根据 mesh bounds 自动计算默认相机距离
-	if (!Params->HasField(TEXT("camera")))
+	// resolution 走整数；缺省 256，和 AssetVisual cohort 持久化的 iso PNG 完全一致。
+	int32 Resolution = 256;
+	if (Params->HasTypedField<EJson::Number>(TEXT("resolution")))
 	{
-		FBoxSphereBounds Bounds = Mesh->GetBounds();
-		float Radius = Bounds.SphereRadius;
-		if (Radius < 1.0f) Radius = 100.0f;
-		CameraLocation = Bounds.Origin + FVector(Radius * 2.0f, Radius * 0.5f, Radius * 0.8f);
-		CameraRotation = (Bounds.Origin - CameraLocation).Rotation();
+		Resolution = static_cast<int32>(Params->GetNumberField(TEXT("resolution")));
+	}
+	if (Resolution <= 0 || Resolution > 4096)
+	{
+		return FMonolithActionResult::Error(
+			FString::Printf(TEXT("resolution 必须在 (0, 4096] 范围内，当前 %d"), Resolution));
 	}
 
-	int32 ResX, ResY;
-	ParseResolutionParams(Params, ResX, ResY);
-	FString OutputPath = ResolveOutputPath(Params, AssetPath);
+	const FString OutputPath = ResolveOutputPath(Params, AssetPath);
 
 	check(IsInGameThread());
-	double StartTime = FPlatformTime::Seconds();
+	const double StartSeconds = FPlatformTime::Seconds();
 
-	bool bSuccess = CaptureStaticMeshFrame(Mesh, CameraLocation, CameraRotation, FOV, ResX, ResY, OutputPath);
+	const bool bSuccess = CaptureStaticMeshFrame(Mesh, Resolution, OutputPath);
 
-	double ElapsedMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+	const double ElapsedMs = (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
 
 	if (!bSuccess)
 	{
@@ -1262,6 +1267,9 @@ FMonolithActionResult FMonolithCaptureActions::HandleCaptureStaticMesh(const TSh
 	Result->SetBoolField(TEXT("success"), true);
 	Result->SetStringField(TEXT("output_file"), OutputPath);
 	Result->SetNumberField(TEXT("capture_time_ms"), ElapsedMs);
+	Result->SetNumberField(
+		TEXT("render_recipe_version"),
+		static_cast<double>(MonolithCapture::GetAssetCanonicalRenderer().GetRenderRecipeVersion()));
 	return FMonolithActionResult::Success(Result);
 }
 

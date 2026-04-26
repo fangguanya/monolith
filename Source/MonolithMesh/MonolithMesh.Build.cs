@@ -19,6 +19,8 @@ public class MonolithMesh : ModuleRules
 		{
 			"MonolithCore",
 			"MonolithIndex",
+			// 新 selection / search action 也复用 MonolithCapture 的 IAssetCanonicalRenderer。
+			"MonolithCapture",
 			"SQLiteCore",
 			"UnrealEd",
 			"EditorSubsystem",
@@ -39,7 +41,9 @@ public class MonolithMesh : ModuleRules
 			"MeshReductionInterface",
 			"MeshMergeUtilities",
 			"LevelInstanceEditor",
-			"ImageCore"
+			"ImageCore",
+			// search action 解码任意图片 + 选择/cursor action 走 line trace
+			"ImageWrapper"
 		});
 
 		// Optional: GeometryScripting (Tier 5 mesh operations only)

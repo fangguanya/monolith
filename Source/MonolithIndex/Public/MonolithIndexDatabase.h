@@ -4,6 +4,7 @@
 #include "IO/IoHash.h"
 #include "SQLiteDatabase.h"
 #include "MonolithIndexLog.h"
+#include "AssetVisualEntry.h"
 
 /*
  * 这份头文件描述的是 Monolith 的本地索引数据库长什么样、能做什么。
@@ -668,11 +669,41 @@ public:
 	/** 获取 mesh catalog 聚合统计。 */
 	TSharedPtr<FJsonObject> GetMeshCatalogStats();
 
+	// --- Mesh visual CRUD（双 cohort 共享同套接口，按 CohortName 落到不同物理表）---
+	/** 把一行视觉 cohort 数据写入 production 表。CohortName 必须是 `AssetVisualGeometric` 或 `AssetVisualSemantic`。 */
+	int64 InsertAssetVisualEntry(const FString& CohortName, const FIndexedAssetVisualEntry& Entry);
+	/** 读取某资产当前可见 revision 下的视觉行；不存在时返回空。 */
+	TOptional<FIndexedAssetVisualEntry> GetAssetVisualEntryForAsset(const FString& CohortName, int64 AssetId);
+	/** 读取整张视觉 cohort 表，可选按 ShardId 过滤；用于 shard reducer 重建 ANN 快照。 */
+	TArray<FIndexedAssetVisualEntry> GetAssetVisualEntries(const FString& CohortName, const FString& ShardIdFilter = FString());
+	/** 用一整份新快照替换某资产在视觉 shadow 表里的行。 */
+	bool ReplaceShadowAssetVisualEntriesForAsset(
+		const FString& CohortName,
+		const FString& ShadowCohortName,
+		int64 AssetId,
+		const TArray<FMonolithShadowIndexedAssetVisualEntry>& Entries);
+	/** 读取某资产当前可见 revision 下的视觉 shadow 行。 */
+	TArray<FMonolithShadowIndexedAssetVisualEntry> GetShadowAssetVisualEntriesForAsset(
+		const FString& CohortName,
+		const FString& ShadowCohortName,
+		int64 AssetId);
+	/** 视觉 production 行的 Level 1 聚合摘要。 */
+	FMonolithShadowAssetVisualAggregate GetProductionAssetVisualAggregateForAsset(const FString& CohortName, int64 AssetId);
+	/** 视觉 shadow 行的 Level 1 聚合摘要。 */
+	FMonolithShadowAssetVisualAggregate GetShadowAssetVisualAggregateForAsset(
+		const FString& CohortName,
+		const FString& ShadowCohortName,
+		int64 AssetId);
+
 	// --- Index metadata ---
 	/** 更新资产对应的索引元数据。 */
 	bool UpsertAssetIndexMetadata(const FMonolithAssetIndexMetadata& Metadata);
 	/** 按资产 id 读取索引元数据。 */
 	TOptional<FMonolithAssetIndexMetadata> GetAssetIndexMetadataByAssetId(int64 AssetId);
+	/** 一次性把整张 asset_index_metadata 表读出来，按 asset_id 建索引返回。
+	 *  循环里大量调 GetAssetIndexMetadataByAssetId 时（如 GatherKnownStalePackages 33K+ 资产场景）
+	 *  请用这个，避免 N 次 prepared statement 创建/绑定/拆销造成 GT 卡顿。 */
+	TMap<int64, FMonolithAssetIndexMetadata> GetAllAssetIndexMetadata();
 	/** 读取所有资产。 */
 	TArray<FIndexedAsset> GetAllAssets();
 

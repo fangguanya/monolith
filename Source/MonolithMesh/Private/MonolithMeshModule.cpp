@@ -25,6 +25,8 @@
 #include "MonolithMeshFurnishingActions.h"
 #include "MonolithMeshDebugViewActions.h"
 #include "MonolithMeshBuildingValidationActions.h"
+#include "MonolithMeshSelectionActions.h"
+#include "MonolithAssetVisualSearchActions.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
@@ -53,6 +55,9 @@ void FMonolithMeshModule::StartupModule()
 	}
 
 	FMonolithMeshInspectionActions::RegisterActions(FMonolithToolRegistry::Get());
+	// AssetVisual cohort 配套的 mesh-level action：编辑器上下文直达 + 图片视觉检索。
+	FMonolithMeshSelectionActions::RegisterActions(FMonolithToolRegistry::Get());
+	FMonolithAssetVisualSearchActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshSceneActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshSpatialActions::RegisterActions(FMonolithToolRegistry::Get());
 	FMonolithMeshBlockoutActions::RegisterActions(FMonolithToolRegistry::Get());

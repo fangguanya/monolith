@@ -19,6 +19,11 @@
 #include "Indexers/LevelIndexer.h"
 #include "Indexers/MaterialIndexer.h"
 #include "Indexers/MeshCatalogIndexer.h"
+#include "Indexers/AssetVisualGeometricIndexer.h"
+#include "Indexers/AssetVisualSemanticIndexer.h"
+#include "Embedders/ClipSemanticEmbeddingProvider.h"
+#include "Embedders/GeometricEmbeddingProvider.h"
+#include "AssetVisualEmbeddingProvider.h"
 #include "Indexers/NiagaraIndexer.h"
 #include "Indexers/EQSIndexer.h"
 #if WITH_STATETREE
@@ -190,6 +195,26 @@ namespace MonolithWarmupCommandletInternal
 			// 它不应该覆盖 GenericAsset 的主 class dispatch，
 			// 但显式 `Scope=Cohort:MeshCatalog` 时应该允许逐资产 warmup。
 			RegisterIndexerInstance(MakeShared<FMeshCatalogIndexer>(), false, true);
+		}
+
+		// AssetVisual 双 cohort 与 MeshCatalog 同样属于 StaticMesh companion，
+		// 必须由 -Scope=Cohort:AssetVisualGeometric / AssetVisualSemantic 显式触发。
+		// commandlet 进程独立于编辑器，必须自己再注册一次 provider 单例。
+		if (Settings && Settings->bIndexAssetVisualGeometric)
+		{
+			if (!FAssetVisualEmbeddingProviderRegistry::Get().FindProvider(FName(TEXT("geometric_v1"))).IsValid())
+			{
+				FAssetVisualEmbeddingProviderRegistry::Get().RegisterProvider(MakeShared<FGeometricEmbeddingProvider>());
+			}
+			RegisterIndexerInstance(MakeShared<FAssetVisualGeometricIndexer>(), false, true);
+		}
+		if (Settings && Settings->bIndexAssetVisualSemantic)
+		{
+			if (!FAssetVisualEmbeddingProviderRegistry::Get().FindProvider(FName(TEXT("clip_vit_b32_v1"))).IsValid())
+			{
+				FAssetVisualEmbeddingProviderRegistry::Get().RegisterProvider(MakeShared<FClipSemanticEmbeddingProvider>());
+			}
+			RegisterIndexerInstance(MakeShared<FAssetVisualSemanticIndexer>(), false, true);
 		}
 
 		if (Settings && Settings->bIndexGAS)
@@ -403,7 +428,7 @@ int32 UMonolithIndexWarmupCommandlet::Main(const FString& Params)
 	TMap<FString, TSharedPtr<IMonolithIndexer>> IndexerIdToIndexer;
 	MonolithWarmupCommandletInternal::RegisterArtifactCapableIndexers(Indexers, ClassToIndexer, IndexerIdToIndexer);
 
-	TUniquePtr<IMonolithArtifactCache> ArtifactCache = MakeUnique<FMonolithDdcArtifactCache>();
+	TUniquePtr<IMonolithArtifactCache> ArtifactCache = MakeUnique<FMonolithDdcArtifactCache>(FString(MonolithCacheBuckets::Default));
 	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
 	const double StartSeconds = FPlatformTime::Seconds();
 	int32 WarmedCount = 0;

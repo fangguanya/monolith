@@ -112,6 +112,8 @@ uint64 ComputeTagReferenceRowHash(const FString& TagName, const FString& Context
 uint64 ComputeParameterRowHash(const FIndexedParameter& Parameter);
 /** 计算 mesh catalog 行的稳定哈希。 */
 uint64 ComputeMeshCatalogRowHash(const FIndexedMeshCatalogEntry& Entry);
+/** 计算 mesh visual 行的稳定哈希（geometric / semantic 共用，按 provider id + 字节流哈希）。 */
+uint64 ComputeAssetVisualRowHash(const struct FIndexedAssetVisualEntry& Entry);
 /** 用两端节点哈希和 pin 信息计算 connection 行哈希。 */
 uint64 ComputeConnectionRowHash(
 	uint64 SourceNodeRowHash,

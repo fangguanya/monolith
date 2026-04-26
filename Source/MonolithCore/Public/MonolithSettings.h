@@ -133,6 +133,19 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Post-Pass Indexers")
 	bool bIndexMeshCatalog = true;
 
+	/** Enable AssetVisualGeometric cohort（canonical iso silhouette + Hu moments + phash → 64 维向量；in-process，零外部依赖）。
+	 * 覆盖 StaticMesh / SkeletalMesh / Material / WidgetBlueprint 4 类资产；
+	 * 结果用于 asset.search_assets_by_image 的 geometric 召回路径。 */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Post-Pass Indexers")
+	bool bIndexAssetVisualGeometric = true;
+
+	/** Enable AssetVisualSemantic cohort（CLIP-ViT-B/32 ONNX FP16 → 512 维向量；需要 NNE + ONNXRuntime + GPU）。
+	 * 覆盖 StaticMesh / SkeletalMesh / Material / WidgetBlueprint 4 类资产；
+	 * 结果用于 asset.search_assets_by_image 的 semantic 召回路径。
+	 * NNE 不可用时 provider 自动降级为 stale-only。 */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Post-Pass Indexers")
+	bool bIndexAssetVisualSemantic = true;
+
 	/** Index content from enabled marketplace plugins (installed via Fab/Epic launcher) */
 	UPROPERTY(config, EditAnywhere, Category="Indexing")
 	bool bIndexMarketplacePlugins = true;

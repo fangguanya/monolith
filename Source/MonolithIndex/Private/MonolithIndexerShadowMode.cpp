@@ -342,6 +342,31 @@ uint64 ComputeMeshCatalogRowHash(const FIndexedMeshCatalogEntry& Entry)
 	return FXxHash64::HashBuffer(Bytes.GetData(), static_cast<uint64>(Bytes.Num())).Hash;
 }
 
+uint64 ComputeAssetVisualRowHash(const FIndexedAssetVisualEntry& Entry)
+{
+	// AssetVisual 行哈希必须把 provider triple + embedding 字节都纳入，
+	// 这样 provider 升级或视觉特征任何变化都能立刻在 shadow Level 1 diff 里被发现。
+	TArray<uint8> Bytes;
+	Bytes.Reserve(96 + Entry.AssetPath.Len() + Entry.ShardId.Len() + Entry.ProviderId.Len() + Entry.PreviewViewPath.Len() + Entry.EmbeddingBytes.Num());
+
+	MonolithIndexerShadowModeInternal::WriteString(Bytes, Entry.AssetPath);
+	MonolithIndexerShadowModeInternal::WriteString(Bytes, Entry.ShardId);
+	MonolithIndexerShadowModeInternal::WriteUInt32(Bytes, static_cast<uint32>(Entry.ShardPrefixDepth));
+	MonolithIndexerShadowModeInternal::WriteString(Bytes, Entry.ProviderId);
+	MonolithIndexerShadowModeInternal::WriteUInt32(Bytes, Entry.ProviderVersion);
+	MonolithIndexerShadowModeInternal::WriteUInt32(Bytes, Entry.RenderRecipeVersion);
+	MonolithIndexerShadowModeInternal::WriteUInt32(Bytes, static_cast<uint32>(Entry.EmbeddingDim));
+	MonolithIndexerShadowModeInternal::WriteUInt32(Bytes, static_cast<uint32>(Entry.EmbeddingDtype));
+	// embedding 字节流直接 append；不会与 dtype/dim 字段产生歧义解析。
+	if (Entry.EmbeddingBytes.Num() > 0)
+	{
+		Bytes.Append(Entry.EmbeddingBytes.GetData(), Entry.EmbeddingBytes.Num());
+	}
+	MonolithIndexerShadowModeInternal::WriteString(Bytes, Entry.PreviewViewPath);
+
+	return FXxHash64::HashBuffer(Bytes.GetData(), static_cast<uint64>(Bytes.Num())).Hash;
+}
+
 uint64 ComputeConnectionRowHash(
 	const uint64 SourceNodeRowHash,
 	const FString& SourcePin,

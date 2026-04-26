@@ -233,8 +233,9 @@ public:
 	TArray<FIndexedGameplayTagSummary> ListGameplayTags(const FString& Prefix);
 	/** 按子串搜索 GameplayTag，并返回引用它们的资产。 */
 	TArray<FIndexedGameplayTagSummary> SearchGameplayTags(const FString& Query);
-	/** 列出 stale 包。 */
-	TSharedPtr<FJsonObject> ListStalePackages(int32 Limit = 100, const FString& Cursor = FString());
+	/** 列出 stale 包；可选按 cohort 名过滤（例如 `AssetVisualGeometric`）。
+	 * 空 cohort 表示返回全部 cohort 贡献的并集，行为与历史版本一致。 */
+	TSharedPtr<FJsonObject> ListStalePackages(int32 Limit = 100, const FString& Cursor = FString(), const FString& CohortFilter = FString());
 
 	/** 注册一个 indexer，并把所有权交给子系统。 */
 	void RegisterIndexer(TSharedPtr<IMonolithIndexer> Indexer);
@@ -346,8 +347,18 @@ private:
 		TArray<TSharedPtr<IMonolithIndexer>>* OutShadowDiffIndexers = nullptr);
 	/** 把一次离线 warmup 请求排进队列。 */
 	bool QueueOfflineWarmupRequest(const FAssetData& AssetData, const IMonolithIndexer& Indexer, const TCHAR* Reason) const;
-	/** 按 metadata 判断资产是否 stale。 */
+	/** 按 metadata 判断资产是否 stale。
+	 *  单次调用便利重载：内部会从磁盘 load offline warmup queue 一次 + 单 asset metadata SQLite 查询。
+	 *  在循环里大量调用时，请改用下面的批量重载，把 queue + metadata 预先批量加载，
+	 *  避免 N 次 SQLite prepared statement / N 次 JSON 文件 IO。 */
 	bool IsIndexedAssetStaleByMetadata(const FIndexedAsset& Asset) const;
+	/** 批量调用版本：调用方先调 GetAllAssetIndexMetadata + AppendMonolithOfflineWarmupQueuedPackages
+	 *  各一次，把结果传进来。函数走 TMap/TSet O(1) 命中查询，循环 N 次总成本 = O(N) 哈希查询。
+	 *  PreloadedMetadata 用 nullptr 表示"调用方还没准备 metadata，回退到 SQLite 单查询"。 */
+	bool IsIndexedAssetStaleByMetadata(
+		const FIndexedAsset& Asset,
+		const TSet<FString>& PreloadedQueuedSet,
+		const TMap<int64, FMonolithAssetIndexMetadata>* PreloadedMetadata) const;
 	/** 记录一次 GT 工作样本，用来做 breaker/预算统计。 */
 	void RecordGtWorkSample(const IMonolithIndexer& Indexer, double DurationSeconds);
 	/** 按 metadata 判断包是否 stale。 */
@@ -453,6 +464,23 @@ private:
 	bool bRestoreLiveCallbacksAfterFullIndex = false;
 	/** 保护数据库访问的互斥锁。 */
 	mutable FCriticalSection DatabaseAccessMutex;
+
+	/* GT 状态栏 tooltip 用的"昂贵字段"异步缓存。
+	 *
+	 * 历史背景：状态栏点击 / 0.5s 刷新 timer 同步调用 GatherKnownStalePackages()，
+	 * 33840 资产规模下要扫整张 assets + asset_index_metadata 再做 set union，
+	 * 每次卡 GT 几秒。修复方案：
+	 *  - GetStatusBarSnapshot(true) 永不阻塞，直接读 cache
+	 *  - 后台线程按 TTL 异步刷新，避免重复并发刷新
+	 *  - cache 未命中时返回 INDEX_NONE，UI 已有 "—" fallback */
+	mutable FCriticalSection StatusBarExpensiveCacheMutex;
+	mutable int32 CachedStalePackageCount = INDEX_NONE;
+	mutable int32 CachedOfflineQueueDepth = INDEX_NONE;
+	mutable double CachedStatusBarExpensiveAtSeconds = -1.0;
+	mutable TAtomic<bool> bStatusBarExpensiveRefreshInFlight{false};
+
+	/** 后台异步刷新 status bar 的"昂贵字段"，TTL 命中直接 noop。 */
+	void KickStatusBarExpensiveRefresh() const;
 
 	/** 给 UI 和日志展示的当前状态文字。 */
 	FString IndexingStatusMessage;

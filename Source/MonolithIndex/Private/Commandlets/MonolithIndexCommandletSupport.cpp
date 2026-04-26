@@ -1,6 +1,7 @@
 #include "Commandlets/MonolithIndexCommandletSupport.h"
 
 #include "HAL/PlatformTime.h"
+#include "Hash/xxhash.h"
 #include "Misc/Parse.h"
 
 bool FMonolithWarmupCommandletArgs::ShouldStopForTimeWindow(const double StartSeconds, const double NowSeconds) const
@@ -14,6 +15,26 @@ bool FMonolithWarmupCommandletArgs::ShouldStopForTimeWindow(const double StartSe
 	// 用分钟来比较，是为了和命令行参数保持同一单位。
 	const double ElapsedMinutes = (NowSeconds - StartSeconds) / 60.0;
 	return ElapsedMinutes >= static_cast<double>(TimeWindowMinutes);
+}
+
+bool FMonolithWarmupCommandletArgs::IsShardInRange(const FString& ShardId) const
+{
+	// 不切片场景：Begin == End == 0 表示"全 agent 消费"。
+	if (ShardRangeBegin <= 0 && ShardRangeEnd <= 0)
+	{
+		return true;
+	}
+	if (ShardRangeBegin >= ShardRangeEnd)
+	{
+		// 区间不合法时退化为不消费，避免歧义。
+		return false;
+	}
+
+	// 用 xxhash 截 32 位映射 shard 到固定区间，分布天然均匀；同 ShardId 多机得到相同值。
+	const FTCHARToUTF8 Conv(*ShardId);
+	const uint64 Hash = FXxHash64::HashBuffer(reinterpret_cast<const uint8*>(Conv.Get()), Conv.Length()).Hash;
+	const int32 Slot = static_cast<int32>(Hash % static_cast<uint64>(FMath::Max(1, ShardRangeEnd)));
+	return Slot >= ShardRangeBegin && Slot < ShardRangeEnd;
 }
 
 bool ParseMonolithWarmupCommandletArgs(
@@ -63,6 +84,28 @@ bool ParseMonolithWarmupCommandletArgs(
 	FParse::Value(*Params, TEXT("Priority="), OutArgs.Priority);
 	FParse::Value(*Params, TEXT("TimeWindowMinutes="), OutArgs.TimeWindowMinutes);
 	FParse::Value(*Params, TEXT("MaxPackages="), OutArgs.MaxPackages);
+
+	// ShardRange 形式：`-ShardRange=<begin>:<end>`，给 Horde 多机均衡负载用。
+	FString ShardRangeValue;
+	if (FParse::Value(*Params, TEXT("ShardRange="), ShardRangeValue))
+	{
+		FString BeginStr, EndStr;
+		if (ShardRangeValue.Split(TEXT(":"), &BeginStr, &EndStr))
+		{
+			OutArgs.ShardRangeBegin = FMath::Max(0, FCString::Atoi(*BeginStr));
+			OutArgs.ShardRangeEnd = FMath::Max(0, FCString::Atoi(*EndStr));
+			if (OutArgs.ShardRangeBegin >= OutArgs.ShardRangeEnd)
+			{
+				OutError = FString::Printf(TEXT("ShardRange 区间不合法：%s（必须 begin < end）"), *ShardRangeValue);
+				return false;
+			}
+		}
+		else
+		{
+			OutError = FString::Printf(TEXT("ShardRange 必须形如 `<begin>:<end>`，当前 %s"), *ShardRangeValue);
+			return false;
+		}
+	}
 
 	// 负数没有意义，这里直接钳成 0，避免下游再重复防御。
 	OutArgs.TimeWindowMinutes = FMath::Max(0, OutArgs.TimeWindowMinutes);

@@ -68,8 +68,6 @@ namespace MonolithArtifactCacheInternal
 
 	/** 给 DDC 请求打上的统一名字，方便日志和剖析里认出来源。 */
 	static const TCHAR* RequestName = TEXT("MonolithIndex");
-	/** 非兼容的 artifact 编码格式切到 V2 bucket，避免旧缓存和新格式混读。 */
-	static constexpr TCHAR CacheBucketName[] = TEXT("MonolithIndexV2");
 	/** chunk 前的统一 header schema 版本。 */
 	static constexpr uint8 ArtifactStorageSchemaVersion = 1;
 	/** 单个 payload value 的压缩后目标上限。 */
@@ -103,11 +101,11 @@ namespace MonolithArtifactCacheInternal
 		bool bValid = false;
 	};
 
-	/** 用 identity 生成 DDC 的 bucket + hash 组合 key。 */
-	static FCacheKey MakeCacheKey(const FMonolithArtifactIdentityV1& Identity)
+	/** 用 identity 和显式 bucket name 生成 DDC 的 bucket + hash 组合 key。 */
+	static FCacheKey MakeCacheKey(const FMonolithArtifactIdentityV1& Identity, const FString& BucketName)
 	{
 		FCacheKey Key;
-		Key.Bucket = FCacheBucket(CacheBucketName);
+		Key.Bucket = FCacheBucket(*BucketName);
 		Key.Hash = HashMonolithArtifactIdentity(Identity);
 		return Key;
 	}
@@ -656,6 +654,8 @@ struct FMonolithDdcArtifactCache::FImpl
 		}
 	}
 
+	/** 这个 cache 实例绑定的 DDC bucket 名（构造时一次性确定，运行期不可变）。 */
+	FString BucketName;
 	/** 保护统计信息、breaker、队列和线程池指针。 */
 	mutable FCriticalSection Mutex;
 	/** 对外展示的统计快照。 */
@@ -784,9 +784,19 @@ void FMonolithDdcArtifactCache::ScheduleRemoteWriteWorker(const TSharedPtr<FImpl
 	}
 }
 
-FMonolithDdcArtifactCache::FMonolithDdcArtifactCache()
+// Bucket 名称常量定义；声明位于 MonolithArtifactCache.h，所有调用方共享。
+namespace MonolithCacheBuckets
+{
+	const TCHAR* const Default = TEXT("MonolithIndexV2");
+	const TCHAR* const AssetVisualGeometric = TEXT("MonolithAssetVisualGeometricV1");
+	const TCHAR* const AssetVisualSemantic = TEXT("MonolithAssetVisualSemanticV1");
+}
+
+FMonolithDdcArtifactCache::FMonolithDdcArtifactCache(const FString& InBucketName)
 	: Impl(MakeShared<FImpl, ESPMode::ThreadSafe>())
 {
+	checkf(!InBucketName.IsEmpty(), TEXT("FMonolithDdcArtifactCache 必须显式指定非空 bucket 名"));
+	Impl->BucketName = InBucketName;
 }
 
 FMonolithDdcArtifactCache::~FMonolithDdcArtifactCache()
@@ -816,7 +826,7 @@ TOptional<FMonolithArtifact> FMonolithDdcArtifactCache::Get(
 	}
 
 	const double NowSeconds = FPlatformTime::Seconds();
-	const FCacheKey Key = MakeCacheKey(Identity);
+	const FCacheKey Key = MakeCacheKey(Identity, LocalImpl->BucketName);
 	const FArtifactCacheRequestSettings RequestSettings = BuildRequestSettings(RequestMode);
 
 	FQueuedThreadPool* IoThreadPool = nullptr;
@@ -909,7 +919,7 @@ bool FMonolithDdcArtifactCache::Put(
 		return false;
 	}
 
-	const FCacheKey Key = MakeCacheKey(Identity);
+	const FCacheKey Key = MakeCacheKey(Identity, LocalImpl->BucketName);
 	const FArtifactCacheRequestSettings RequestSettings = BuildRequestSettings(RequestMode);
 	const FEncodedArtifactRecord EncodedRecord = BuildEncodedArtifactRecord(Key, Identity, Artifact);
 	if (EncodedRecord.bOversized)

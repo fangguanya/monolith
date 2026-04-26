@@ -41,7 +41,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 bool FMonolithArtifactCacheLocalRoundTripTest::RunTest(const FString& Parameters)
 {
 	// 这里不关心远端，只验证本地 DDC 的最小闭环。
-	FMonolithDdcArtifactCache Cache;
+	const FString DefaultBucket = MonolithCacheBuckets::Default;
+	FMonolithDdcArtifactCache Cache(DefaultBucket);
 	Cache.ResetStats();
 
 	FMonolithArtifactIdentityV1 Identity;
@@ -75,7 +76,8 @@ bool FMonolithArtifactCacheChunkedRoundTripTest::RunTest(const FString& Paramete
 {
 	(void)Parameters;
 
-	FMonolithDdcArtifactCache Cache;
+	const FString DefaultBucket = MonolithCacheBuckets::Default;
+	FMonolithDdcArtifactCache Cache(DefaultBucket);
 	Cache.ResetStats();
 
 	FMonolithArtifactIdentityV1 Identity;
@@ -112,7 +114,8 @@ bool FMonolithArtifactCacheOversizedArtifactTest::RunTest(const FString& Paramet
 {
 	(void)Parameters;
 
-	FMonolithDdcArtifactCache Cache;
+	const FString DefaultBucket = MonolithCacheBuckets::Default;
+	FMonolithDdcArtifactCache Cache(DefaultBucket);
 	Cache.ResetStats();
 
 	FMonolithArtifactIdentityV1 Identity;
@@ -188,7 +191,8 @@ bool FMonolithArtifactCacheDiscardPendingRemoteWritesTest::RunTest(const FString
 {
 	(void)Parameters;
 
-	FMonolithDdcArtifactCache Cache;
+	const FString DefaultBucket = MonolithCacheBuckets::Default;
+	FMonolithDdcArtifactCache Cache(DefaultBucket);
 	Cache.ResetStats();
 
 	FMonolithArtifactIdentityV1 Identity;

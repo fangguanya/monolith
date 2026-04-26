@@ -10,7 +10,10 @@ public class MonolithCapture : ModuleRules
 		{
 			"Core",
 			"CoreUObject",
-			"Engine"
+			"Engine",
+			// MonolithCaptureUtils.h 暴露 FImage / FCanonicalRenderResult，
+			// 下游模块（MonolithIndex / MonolithMesh）include 时必须能解析 FImage 类型。
+			"ImageCore"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]
@@ -20,7 +23,6 @@ public class MonolithCapture : ModuleRules
 			"RenderCore",
 			"RHI",
 			"ImageWrapper",
-			"ImageCore",
 			"Niagara",
 			"AdvancedPreviewScene",
 			"UMG",

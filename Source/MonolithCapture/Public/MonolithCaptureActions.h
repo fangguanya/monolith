@@ -47,11 +47,13 @@ private:
 		int32 ResX, int32 ResY, const FString& OutputPath,
 		ESceneCaptureSource CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR);
 
+	/** 渲染单 mesh 的 canonical iso 视图并保存为 PNG。
+	 *  相机参数 / FOV / 光照 / 曝光 由 IAssetCanonicalRenderer 统一托管，外部不可覆盖；
+	 *  这是为了让 capture action 与 AssetVisual cohort 共享完全一致的 render recipe。 */
 	static bool CaptureStaticMeshFrame(
 		class UStaticMesh* Mesh,
-		const FVector& CameraLocation, const FRotator& CameraRotation, float FOV,
-		int32 ResX, int32 ResY, const FString& OutputPath,
-		ESceneCaptureSource CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR);
+		int32 Resolution,
+		const FString& OutputPath);
 
 	static bool CaptureSkeletalMeshFrame(
 		class USkeletalMesh* Mesh, class UAnimSequence* Anim, float Time, bool bShowBones,

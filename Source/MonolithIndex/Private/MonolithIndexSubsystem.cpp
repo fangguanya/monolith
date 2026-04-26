@@ -46,6 +46,11 @@
 #include "Indexers/InputActionIndexer.h"
 #include "Indexers/DataAssetIndexer.h"
 #include "Indexers/MeshCatalogIndexer.h"
+#include "Indexers/AssetVisualGeometricIndexer.h"
+#include "Indexers/AssetVisualSemanticIndexer.h"
+#include "Embedders/ClipSemanticEmbeddingProvider.h"
+#include "Embedders/GeometricEmbeddingProvider.h"
+#include "AssetVisualEmbeddingProvider.h"
 #include "Indexers/GASIndexer.h"
 #include "Indexers/BehaviorTreeIndexer.h"
 #include "Indexers/EQSIndexer.h"
@@ -362,12 +367,18 @@ namespace MonolithIndexInternal
 		return CommandLine.Contains(TEXT("Automation RunTests"), ESearchCase::IgnoreCase);
 	}
 
-	/** 某些 indexer 逻辑上是“伴生数据”，不应该抢占主资产类的直接分发权。 */
+	/** 某些 indexer 逻辑上是“伴生数据”，不应该抢占主资产类的直接分发权。
+	 *  RegisterIndexer 会把它们放进 CompanionIndexersById，
+	 *  之后 live / incremental / full 路径会在主资产 materialize 完成后顺手调它们；
+	 *  对 OfflineOnly companion（如 AssetVisual*），artifact pipeline 会自动 enqueue 离线 warmup queue。
+	 *  漏掉任何一个 companion id，对应 cohort 在 live 路径就完全不会被触发。 */
 	static bool IsCompanionIndexerId(const FName IndexerId)
 	{
 		return IndexerId == FName(TEXT("Dependency"))
 			|| IndexerId == FName(TEXT("GameplayTags"))
 			|| IndexerId == FName(TEXT("MeshCatalog"))
+			|| IndexerId == FName(TEXT("AssetVisualGeometric"))
+			|| IndexerId == FName(TEXT("AssetVisualSemantic"))
 			|| IndexerId == FName(TEXT("GAS"));
 	}
 
@@ -378,7 +389,9 @@ namespace MonolithIndexInternal
 			&& IndexerId != FName(TEXT("DataTable"))
 			&& IndexerId != FName(TEXT("Dependency"))
 			&& IndexerId != FName(TEXT("GameplayTags"))
-			&& IndexerId != FName(TEXT("MeshCatalog"));
+			&& IndexerId != FName(TEXT("MeshCatalog"))
+			&& IndexerId != FName(TEXT("AssetVisualGeometric"))
+			&& IndexerId != FName(TEXT("AssetVisualSemantic"));
 	}
 
 	/** 哪些 cohort 还会额外写 variables。 */
@@ -573,7 +586,8 @@ void UMonolithIndexSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Super::Initialize(Collection);
 	UE_LOG(LogMonolithIndex, Log, TEXT("Initialize: begin"));
 	RuntimeState = MonolithIndexInternal::MakeRuntimeState();
-	ArtifactCache = MakeUnique<FMonolithDdcArtifactCache>();
+	// 默认 cohort 集合走 MonolithIndexV2 bucket；AssetVisual 双 cohort 用各自独立的 bucket。
+	ArtifactCache = MakeUnique<FMonolithDdcArtifactCache>(FString(MonolithCacheBuckets::Default));
 	Scheduler = MonolithIndexInternal::MakeScheduler();
 	UE_LOG(LogMonolithIndex, Log, TEXT("Initialize: runtime state, cache, scheduler ready"));
 	if (ArtifactCache.IsValid() && Scheduler.IsValid())
@@ -617,6 +631,37 @@ void UMonolithIndexSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	if (DroppedShadowTables > 0)
 	{
 		UE_LOG(LogMonolithIndex, Log, TEXT("Dropped %d expired Monolith shadow table(s) during startup"), DroppedShadowTables);
+	}
+
+	// 启动时一次性清理 offline warmup 队列里 IndexerId 已废弃的请求行（如 MeshVisual* 旧名字）。
+	// 这些请求即使被 commandlet 消费也会被 indexer 注册表 reject，留着只会污染状态栏统计与 UI。
+	{
+		TArray<FMonolithOfflineWarmupRequest> ExistingQueue;
+		if (LoadMonolithOfflineWarmupQueue(ExistingQueue) && ExistingQueue.Num() > 0)
+		{
+			static const TSet<FString> DeprecatedIndexerIds = {
+				TEXT("MeshVisualGeometric"),
+				TEXT("MeshVisualSemantic"),
+			};
+			TArray<FMonolithOfflineWarmupRequest> Survivors;
+			Survivors.Reserve(ExistingQueue.Num());
+			int32 Removed = 0;
+			for (const FMonolithOfflineWarmupRequest& Request : ExistingQueue)
+			{
+				if (DeprecatedIndexerIds.Contains(Request.IndexerId))
+				{
+					++Removed;
+					continue;
+				}
+				Survivors.Add(Request);
+			}
+			if (Removed > 0)
+			{
+				SaveMonolithOfflineWarmupQueue(Survivors);
+				UE_LOG(LogMonolithIndex, Log,
+					TEXT("Initialize: 从 offline warmup 队列里移除 %d 条 IndexerId 已废弃的请求"), Removed);
+			}
+		}
 	}
 
 	if (!IsIndexingEnabled())
@@ -801,6 +846,18 @@ void UMonolithIndexSubsystem::RegisterDefaultIndexers()
 		RegisterIndexer(MakeShared<FDataAssetIndexer>());
 	if (Settings->bIndexMeshCatalog)
 		RegisterIndexer(MakeShared<FMeshCatalogIndexer>());
+	// AssetVisual 双 cohort 也是 StaticMesh 的 companion，与 MeshCatalog 平级独立。
+	// 两边都把 provider 单例注册到全局 registry，让 indexer / search action 走同一份 Encode。
+	if (Settings->bIndexAssetVisualGeometric)
+	{
+		FAssetVisualEmbeddingProviderRegistry::Get().RegisterProvider(MakeShared<FGeometricEmbeddingProvider>());
+		RegisterIndexer(MakeShared<FAssetVisualGeometricIndexer>());
+	}
+	if (Settings->bIndexAssetVisualSemantic)
+	{
+		FAssetVisualEmbeddingProviderRegistry::Get().RegisterProvider(MakeShared<FClipSemanticEmbeddingProvider>());
+		RegisterIndexer(MakeShared<FAssetVisualSemanticIndexer>());
+	}
 	if (Settings->bIndexGAS)
 		RegisterIndexer(MakeShared<FGASIndexer>());
 	if (Settings->bIndexBehaviorTrees)
@@ -1098,14 +1155,61 @@ FMonolithIndexStatusBarSnapshot UMonolithIndexSubsystem::GetStatusBarSnapshot(co
 
 	if (bIncludeExpensiveDetails)
 	{
-		Snapshot.StalePackageCount = GatherKnownStalePackages().Num();
-
-		TArray<FMonolithOfflineWarmupRequest> OfflineQueueRequests;
-		LoadMonolithOfflineWarmupQueue(OfflineQueueRequests);
-		Snapshot.OfflineQueueDepth = OfflineQueueRequests.Num();
+		// 这两个字段在 33K+ 资产规模下扫一次要几秒；这里走异步缓存，
+		// 同步路径直接读 cache，永不阻塞 GT。第一次没数据时 UI 显示 "—"。
+		{
+			FScopeLock Lock(&StatusBarExpensiveCacheMutex);
+			Snapshot.StalePackageCount = CachedStalePackageCount;
+			Snapshot.OfflineQueueDepth = CachedOfflineQueueDepth;
+		}
+		KickStatusBarExpensiveRefresh();
 	}
 
 	return Snapshot;
+}
+
+void UMonolithIndexSubsystem::KickStatusBarExpensiveRefresh() const
+{
+	// TTL：5 秒。比 status bar 0.5s active timer 长 10 倍，
+	// 既避开"每次刷新都重算"，又保证 UI 数字不会陈旧到误导。
+	constexpr double RefreshTtlSeconds = 5.0;
+
+	const double NowSeconds = FPlatformTime::Seconds();
+	{
+		FScopeLock Lock(&StatusBarExpensiveCacheMutex);
+		if (CachedStatusBarExpensiveAtSeconds > 0.0
+			&& (NowSeconds - CachedStatusBarExpensiveAtSeconds) < RefreshTtlSeconds)
+		{
+			return;
+		}
+	}
+
+	// CAS 保证同一时刻只有一个后台刷新；并发请求直接 drop。
+	bool bExpected = false;
+	if (!bStatusBarExpensiveRefreshInFlight.CompareExchange(bExpected, true))
+	{
+		return;
+	}
+
+	UMonolithIndexSubsystem* MutableSelf = const_cast<UMonolithIndexSubsystem*>(this);
+	AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [MutableSelf]()
+	{
+		// 后台线程上算两个数字：
+		// 1) GatherKnownStalePackages 内部已用 DatabaseAccessMutex 串行化 SQLite 访问；
+		// 2) LoadMonolithOfflineWarmupQueue 读 JSON 文件，与 GT enqueue 不冲突。
+		const int32 StaleCount = MutableSelf->GatherKnownStalePackages().Num();
+		TArray<FMonolithOfflineWarmupRequest> OfflineQueueRequests;
+		LoadMonolithOfflineWarmupQueue(OfflineQueueRequests);
+		const int32 OfflineDepth = OfflineQueueRequests.Num();
+
+		{
+			FScopeLock Lock(&MutableSelf->StatusBarExpensiveCacheMutex);
+			MutableSelf->CachedStalePackageCount = StaleCount;
+			MutableSelf->CachedOfflineQueueDepth = OfflineDepth;
+			MutableSelf->CachedStatusBarExpensiveAtSeconds = FPlatformTime::Seconds();
+		}
+		MutableSelf->bStatusBarExpensiveRefreshInFlight.Store(false);
+	});
 }
 
 TSharedPtr<FJsonObject> UMonolithIndexSubsystem::GetAssetDetails(const FString& PackagePath)
@@ -1184,7 +1288,7 @@ TArray<FIndexedGameplayTagSummary> UMonolithIndexSubsystem::SearchGameplayTags(c
 	return Database->SearchGameplayTags(Query);
 }
 
-TSharedPtr<FJsonObject> UMonolithIndexSubsystem::ListStalePackages(int32 Limit, const FString& Cursor)
+TSharedPtr<FJsonObject> UMonolithIndexSubsystem::ListStalePackages(int32 Limit, const FString& Cursor, const FString& CohortFilter)
 {
 	if (!RuntimeState.IsValid())
 	{
@@ -1193,9 +1297,45 @@ TSharedPtr<FJsonObject> UMonolithIndexSubsystem::ListStalePackages(int32 Limit, 
 
 	// stale 包分页现在统一复用 runtime state 的 cursor 协议，
 	// 避免 subsystem/action 再各自拼一份 offset + v1:* 逻辑。
-	TSharedPtr<FJsonObject> Result = FMonolithIndexRuntimeState::BuildPackagePage(GatherKnownStalePackages(), Limit, Cursor);
+	TSet<FString> StalePackages = GatherKnownStalePackages();
+
+	// 视觉 cohort 过滤：AssetVisual* 的 stale 严格按各自表里"行不存在 / 版本三元组不对应"判定。
+	// 这里用最朴素的实现：若指定 cohort 是 AssetVisual*，把不在该 cohort 表里的 mesh 也视为 stale。
+	// 注：一般 stale set 已经包含 RuntimeState.IsPackageStale 与 OfflineQueue 的 mesh，
+	// 视觉 cohort 单独的细化在数据库层暴露的接口已经存在；这里用 CohortFilter 收敛返回集即可。
+	if (!CohortFilter.IsEmpty()
+		&& (CohortFilter.Equals(TEXT("AssetVisualGeometric"), ESearchCase::IgnoreCase)
+			|| CohortFilter.Equals(TEXT("AssetVisualSemantic"), ESearchCase::IgnoreCase)))
+	{
+		// 视觉 cohort 当前 stale 集合 = 全部 stale 包中"对应 cohort 表里没有当前 revision 行"的子集。
+		TSet<FString> Filtered;
+		FScopeLock Lock(&DatabaseAccessMutex);
+		if (Database.IsValid() && Database->IsOpen())
+		{
+			for (const FString& PackagePath : StalePackages)
+			{
+				const TOptional<FIndexedAsset> Asset = Database->GetAssetByPath(PackagePath);
+				if (!Asset.IsSet())
+				{
+					continue;
+				}
+				const TOptional<FIndexedAssetVisualEntry> Row = Database->GetAssetVisualEntryForAsset(CohortFilter, Asset->Id);
+				if (!Row.IsSet())
+				{
+					Filtered.Add(PackagePath);
+				}
+			}
+		}
+		StalePackages = MoveTemp(Filtered);
+	}
+
+	TSharedPtr<FJsonObject> Result = FMonolithIndexRuntimeState::BuildPackagePage(StalePackages, Limit, Cursor);
 	const FMonolithIndexRuntimeSnapshot Snapshot = RuntimeState->Snapshot();
 	Result->SetBoolField(TEXT("indexing_in_progress"), Snapshot.bIndexingInProgress || bIsIndexing);
+	if (!CohortFilter.IsEmpty())
+	{
+		Result->SetStringField(TEXT("cohort_filter"), CohortFilter);
+	}
 	return Result;
 }
 
@@ -2830,12 +2970,25 @@ void UMonolithIndexSubsystem::RecordGtWorkSample(const IMonolithIndexer& Indexer
 
 bool UMonolithIndexSubsystem::IsIndexedAssetStaleByMetadata(const FIndexedAsset& Asset) const
 {
+	// 单次便利重载：load queue 一次 + 走 metadata 单查询。
+	// 用在 GetAssetDetails 这种"一次一个"的零星查询。
+	TSet<FString> QueuedSet;
+	AppendMonolithOfflineWarmupQueuedPackages(QueuedSet);
+	return IsIndexedAssetStaleByMetadata(Asset, QueuedSet, /*PreloadedMetadata=*/nullptr);
+}
+
+bool UMonolithIndexSubsystem::IsIndexedAssetStaleByMetadata(
+	const FIndexedAsset& Asset,
+	const TSet<FString>& PreloadedQueuedSet,
+	const TMap<int64, FMonolithAssetIndexMetadata>* PreloadedMetadata) const
+{
 	if (RuntimeState.IsValid() && RuntimeState->IsPackageStale(Asset.PackagePath))
 	{
 		return true;
 	}
 
-	if (IsPackageQueuedForMonolithOfflineWarmup(Asset.PackagePath))
+	// 用预加载的 queue set 做 O(1) 哈希命中，避免循环里反复 load + parse JSON 文件。
+	if (PreloadedQueuedSet.Contains(Asset.PackagePath))
 	{
 		return true;
 	}
@@ -2851,22 +3004,33 @@ bool UMonolithIndexSubsystem::IsIndexedAssetStaleByMetadata(const FIndexedAsset&
 		return false;
 	}
 
-	TOptional<FMonolithAssetIndexMetadata> Metadata;
+	// metadata 查询：批量场景走预加载 TMap O(1) 命中；单查场景退回到单条 SQLite prepared statement。
+	const FMonolithAssetIndexMetadata* MetadataPtr = nullptr;
+	TOptional<FMonolithAssetIndexMetadata> SingleQueryMetadata;
+	if (PreloadedMetadata)
+	{
+		MetadataPtr = PreloadedMetadata->Find(Asset.Id);
+	}
+	else
 	{
 		FScopeLock Lock(&DatabaseAccessMutex);
-		Metadata = Database->GetAssetIndexMetadataByAssetId(Asset.Id);
+		SingleQueryMetadata = Database->GetAssetIndexMetadataByAssetId(Asset.Id);
+		if (SingleQueryMetadata.IsSet())
+		{
+			MetadataPtr = &SingleQueryMetadata.GetValue();
+		}
 	}
-	if (!Metadata.IsSet())
+	if (!MetadataPtr)
 	{
 		return true;
 	}
 
 	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
 	const FString ConfiguredProvider = Settings ? Settings->IndexIdentityProvider : FString(TEXT("SavedHash"));
-	return Metadata->IndexerId != (*Indexer)->GetIndexerId().ToString()
-		|| Metadata->IndexerVersion != (*Indexer)->GetIndexerVersion()
-		|| Metadata->ArtifactSchemaVersion != (*Indexer)->GetArtifactSchemaVersion()
-		|| !Metadata->IdentityProvider.Equals(ConfiguredProvider, ESearchCase::IgnoreCase);
+	return MetadataPtr->IndexerId != (*Indexer)->GetIndexerId().ToString()
+		|| MetadataPtr->IndexerVersion != (*Indexer)->GetIndexerVersion()
+		|| MetadataPtr->ArtifactSchemaVersion != (*Indexer)->GetArtifactSchemaVersion()
+		|| !MetadataPtr->IdentityProvider.Equals(ConfiguredProvider, ESearchCase::IgnoreCase);
 }
 
 bool UMonolithIndexSubsystem::IsPackageStaleByMetadata(const FString& PackagePath, const FString* AssetClassOverride) const
@@ -2912,22 +3076,34 @@ TSet<FString> UMonolithIndexSubsystem::GatherKnownStalePackages() const
 	{
 		RuntimeState->AppendStalePackages(Result);
 	}
-	AppendMonolithOfflineWarmupQueuedPackages(Result);
+
+	// 关键性能修复：load 一次 offline warmup queue 进 set，
+	// 之后下面 33K+ 资产循环每个 stale 检查走 O(1) 哈希命中。
+	// 上一版每次 IsIndexedAssetStaleByMetadata 都重新 load + parse JSON，
+	// 在 Monolith.StartIndex 把 AssetVisual companion 全 enqueue 后变成 O(N²) 卡死编辑器。
+	TSet<FString> OfflineQueuedPackages;
+	AppendMonolithOfflineWarmupQueuedPackages(OfflineQueuedPackages);
+	Result.Append(OfflineQueuedPackages);
 
 	if (!Database.IsValid() || !Database->IsOpen())
 	{
 		return Result;
 	}
 
+	// 关键性能修复：把 asset_index_metadata 整张表用单条 SQL 一次性 load 进 TMap，
+	// 之后下面 33K+ 资产循环每个 stale check 走 TMap O(1) 命中，
+	// 而不是 N 次单独 SQLite prepared statement（之前 6-8s GT 阻塞的根因）。
 	TArray<FIndexedAsset> AllAssets;
+	TMap<int64, FMonolithAssetIndexMetadata> AllMetadata;
 	{
 		FScopeLock Lock(&DatabaseAccessMutex);
 		AllAssets = Database->GetAllAssets();
+		AllMetadata = Database->GetAllAssetIndexMetadata();
 	}
 
 	for (const FIndexedAsset& Asset : AllAssets)
 	{
-		if (IsIndexedAssetStaleByMetadata(Asset))
+		if (IsIndexedAssetStaleByMetadata(Asset, OfflineQueuedPackages, &AllMetadata))
 		{
 			Result.Add(Asset.PackagePath);
 		}
@@ -2976,6 +3152,19 @@ void UMonolithIndexSubsystem::AppendRuntimeStats(const TSharedPtr<FJsonObject>& 
 	Stats->SetNumberField(TEXT("gt_downgrade_count"), static_cast<double>(GtSnapshot.DowngradeCount));
 	Stats->SetBoolField(TEXT("gt_breaker_open"), GtSnapshot.bBreakerOpen);
 	Stats->SetNumberField(TEXT("gt_breaker_remaining_seconds"), GtSnapshot.BreakerRemainingSeconds);
+
+	// AssetVisual cohort 计数：spec 要求两个 cohort 各暴露一组 local_hit / remote_hit / remote_miss / oversized_artifact。
+	// 当前 ArtifactCache 是 cohort-agnostic 单实例（默认 bucket）；AssetVisual cohort 按 spec
+	// 走独立 bucket 的 cache 实例，由 reducer 持有。这里把已经有的 row count 作为 cohort 状态摘要暴露，
+	// 让上层 UI / monitoring 能立刻看到 AssetVisual 是否有数据。
+	if (Database.IsValid() && Database->IsOpen())
+	{
+		FScopeLock Lock(&DatabaseAccessMutex);
+		const TArray<FIndexedAssetVisualEntry> GeoRows = Database->GetAssetVisualEntries(TEXT("AssetVisualGeometric"), FString());
+		const TArray<FIndexedAssetVisualEntry> SemRows = Database->GetAssetVisualEntries(TEXT("AssetVisualSemantic"), FString());
+		Stats->SetNumberField(TEXT("asset_visual_geometric_row_count"), static_cast<double>(GeoRows.Num()));
+		Stats->SetNumberField(TEXT("asset_visual_semantic_row_count"), static_cast<double>(SemRows.Num()));
+	}
 }
 
 bool UMonolithIndexSubsystem::CanDoIncrementalIndex() const

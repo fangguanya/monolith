@@ -36,9 +36,16 @@ struct FMonolithWarmupCommandletArgs
 	int32 TimeWindowMinutes = 0;
 	/** 最多尝试多少个包；0 表示不限制。 */
 	int32 MaxPackages = 0;
+	/** Horde 分布式切片：本 agent 负责的 shard 哈希区间起点（含），范围 `[0, ShardRangeEnd)`。
+	 * 与 ShardRangeEnd 配合使用；二者都为 0 表示不切片，全 shard 都消费。 */
+	int32 ShardRangeBegin = 0;
+	/** shard 哈希区间终点（不含）；ShardRangeBegin == ShardRangeEnd == 0 表示不切片。 */
+	int32 ShardRangeEnd = 0;
 
 	/** 判断当前是否已经跑满了时间窗口。 */
 	bool ShouldStopForTimeWindow(double StartSeconds, double NowSeconds) const;
+	/** 判断给定 shard id 是否应当被本 agent 消费（按哈希落在 [Begin, End) 内）。 */
+	bool IsShardInRange(const FString& ShardId) const;
 };
 
 /** 把 `-Scope=... -Priority=...` 这样的命令行解析成结构体。 */

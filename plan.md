@@ -7,7 +7,7 @@
 - 查询永不因索引中而拒绝服务；统一返回最近一次已提交快照，并附带 `indexing_in_progress / stale / remaining_items / eta_seconds / cache stats`。
 - 默认 `bEnableIndex=true`；仅在 Project Settings 显式关闭时为 `false`，CI/自动化可用 `-nomonolithindex` 覆盖。
 - 单机开发者可先跳过跨机 Gate 0，但 **在启用 Shared DDC 之前** 必须补做两机 Gate 0 报告并签字。
-- 落地顺序固定为：`Phase -1 Gate 0` -> `Phase 0 根因取证+灰度恢复` -> `Phase 1 非阻塞调度` -> `Phase 2a 接口扩展` -> `Phase 2b cohort 迁移` -> `Phase 3 DDC 共享` -> `Phase 4 Live/状态栏/语义` -> `Phase 5 压缩/Horde/滚动升级`。
+- 落地顺序固定为：`Phase -1 Gate 0` -> `Phase 0 根因取证+灰度恢复` -> `Phase 1 非阻塞调度` -> `Phase 2a 接口扩展` -> `Phase 2b cohort 迁移` -> `Phase 2c Mesh 视觉查询扩展（单独 spec 批准后进入实施）` -> `Phase 3 DDC 共享` -> `Phase 4 Live/状态栏/语义` -> `Phase 5 压缩/Horde/滚动升级`。
 
 ## 根因分析
 - 已确认问题链路：
@@ -146,6 +146,46 @@
   - Level 1 聚合差异比例 `>0.1%`
   - GT overrun 显著增加
   - cache write 放大异常
+
+### Phase 2c：Mesh 视觉查询扩展（已完成 v1 实施 — 2026-04-25）
+
+**v1 已落地结果**：
+- `monolith-mesh-visual-query` spec 已合入 `openspec/changes/`，验证通过
+- 双 cohort：`AssetVisualGeometric`（geometric_v1，64 维 FP32，单 iso 视图 + silhouette 编码）+ `AssetVisualSemantic`（clip_vit_b32_v1，512 维 FP16，CLIP-ViT-B/32 NNE GPU 推理）
+- Sharding 落地：`/Game/<L1>/<L2>` 起步，超容量自动按下一段再拆，geometric ≤50K/shard、semantic ≤8K/shard
+- ANN：sharded brute-force cosine（无第三方库依赖），性能基准 30ms 内通过
+- DDC 双 bucket：`MonolithAssetVisualGeometricV1` + `MonolithAssetVisualSemanticV1`，与 `MonolithIndexV2` 物理隔离
+- canonical render：复用 `MonolithCapture/Public/MonolithCaptureUtils.h::IAssetCanonicalRenderer`，每 mesh 持久化 1 张 256×256 iso PNG（双 cohort 共享）
+- semantic provider：通过 NNE + ONNXRuntime 调用 `Plugins/Monolith/Resources/Models/clip_vit_b32_image_encoder_fp16.onnx`；VRAM 1.5GB 上限 + PIE 自动暂停
+- 三个 action：`mesh.get_selected_mesh_assets` / `mesh.query_mesh_under_cursor`（GT，p95 ≤5/16ms）+ `asset.search_assets_by_image`（BackgroundCpuPool，provider=auto/geometric/semantic/both，p95 ≤500ms）
+- 状态接入：`project.get_stats` 增 `asset_visual_geometric_row_count` / `asset_visual_semantic_row_count`；`project.list_stale_packages` 增 `cohort` 参数
+- Warmup commandlet：`-Scope=Cohort:AssetVisualGeometric|AssetVisualSemantic` + `-ShardRange=<begin>:<end>`（Horde 多机切片）
+
+### Phase 2c（历史规划稿，已被上面 v1 实施替代）
+- 本阶段目标不是替换 `MeshCatalog`，而是在其上方新增独立能力：
+  - 编辑器上下文直达：`mesh.get_selected_mesh_assets`
+  - 编辑器命中直达：`mesh.query_mesh_under_cursor`
+  - 图片检索：`asset.search_assets_by_image`
+- 架构约束固定为：
+  - 新增独立 companion cohort：`AssetVisual`
+  - `MeshCatalog` 继续只承载结构化范围检索字段，不追加 embedding/vector 列
+  - visual query 统一走 `visual ANN recall -> MeshCatalog rerank`
+  - canonical render 统一复用 `MonolithCapture` 的 shared preview helper，不得维护第二套 StaticMesh 预览渲染实现
+- `AssetVisual` artifact 固定至少包含：
+  - `front / side / back / top / iso` canonical views
+  - 单一 configured embedding provider/version
+  - `render_recipe_version`
+- 图片查询输入固定支持：
+  - `image_path` 或 `image_base64`
+  - 可选 `bbox` / `mask`
+  - 可选 `category_hint / size_hint`
+- 查询结果固定返回：
+  - `asset_path`
+  - `preview_view`
+  - `visual_score`
+  - `rerank_score`
+  - `total_score`
+  - `stale`
 
 ### Phase 3：DDC 共享缓存 + 上层熔断
 - 当前非兼容 artifact 编码升级后的 DDC bucket 固定为 `MonolithIndexV2`；未来若再有非兼容 schema，直接开 `MonolithIndexV3` 并行，旧 bucket 自然 TTL 淘汰。
@@ -344,6 +384,13 @@
 - **向后兼容**：`MonolithQuery` CLI 兼容承诺 / `MonolithSource` 明确出范围 / SQLite 不切 WAL / `IndexAsset()` 保留。
 - **ADR 落位**：已在 Assumptions 明确 `openspec/specs/adr/ADR-monolith-index-v2.md` 镜像路径，满足 `ccgs-coding-standards.md` 强制要求。
 
+### 2026-04-25 新增收敛结论（图片 / mesh 查询）
+
+- 当前 `MeshCatalog` 的职责保持不变：只负责尺寸、类别、LOD、碰撞等结构化字段检索，不承担图片 / 向量检索。
+- “编辑器里已经看到或选中的物体是谁”优先走上下文直达，不走图片检索。
+- 图片找 mesh 的正式方案必须新增独立 `AssetVisual` cohort，并采用 `canonical render -> single embedding provider -> ANN recall -> MeshCatalog rerank` 的唯一链路。
+- `MonolithCapture` 现有 static mesh 离屏预览能力必须被抽成共享 helper，供 action 和 indexer 共用，禁止再维护第二套预览渲染实现。
+
 ### v6 残留 tactical gap（不 block 实施，PR 时补）
 
 按实施阶段排序：
@@ -380,5 +427,9 @@
 3. **ADR 镜像**
    - `E:\fanggang_matrix\Unreal_Matrix\openspec\specs\adr\ADR-monolith-index-v2.md` 按 8 段式设计文档标准写
    - `plan.md` 作为实施稿被 ADR 引用
+
+4. **图片 / Mesh 查询 spec**
+   - `R:\city_generator_base\openspec\changes\add-monolith-mesh-visual-query\`
+   - 先走 spec / proposal / design / tasks 审核，再进入 `Phase 2c`
 
 三项无相互依赖，可并行起步。建议先做 **1 + 2**，因为它们是所有后续 Phase 的前置门禁；**3** 可在任何时候补齐。

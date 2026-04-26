@@ -93,11 +93,38 @@ public:
 	virtual void SetIoThreadPool(FQueuedThreadPool* InIoThreadPool) = 0;
 };
 
+/*
+ * Bucket 名常量约定。
+ *
+ * - `MonolithIndexV2`：默认 cohort 集合（Blueprint / Material / MeshCatalog / ...）共享 bucket，
+ *   与 ADR `monolith-index-v2` 完全一致。
+ * - `MonolithAssetVisualGeometricV1` / `MonolithAssetVisualSemanticV1`：AssetVisual 双 cohort
+ *   各自独立的 bucket，与默认 bucket 物理隔离，避免任一 cohort 的 schema 升级污染对方。
+ *
+ * 任意非兼容 schema 升级都必须开 `*V2` 并行 bucket，不允许在原 bucket 内做兼容拆解。
+ */
+namespace MonolithCacheBuckets
+{
+	/** 默认 cohort artifact 写入 bucket（与 ADR Phase 3 保持一致）。 */
+	MONOLITHINDEX_API extern const TCHAR* const Default;
+	/** AssetVisualGeometric cohort 专用 bucket。 */
+	MONOLITHINDEX_API extern const TCHAR* const AssetVisualGeometric;
+	/** AssetVisualSemantic cohort 专用 bucket。 */
+	MONOLITHINDEX_API extern const TCHAR* const AssetVisualSemantic;
+}
+
 /** 基于 Unreal DDC 的具体实现。 */
 class MONOLITHINDEX_API FMonolithDdcArtifactCache final : public IMonolithArtifactCache
 {
 public:
-	FMonolithDdcArtifactCache();
+	/**
+	 * 构造时必须显式指定 bucket name；不允许默认参数。
+	 *
+	 * 这是为了消除"全项目共用一个 bucket"的隐式假设：
+	 * 任何新 cohort（特别是 AssetVisual* 这种 schema 不兼容的）都必须显式声明自己的 bucket。
+	 * 旧 cohort 仍然走 `MonolithCacheBuckets::Default`，外观行为完全不变。
+	 */
+	explicit FMonolithDdcArtifactCache(const FString& InBucketName);
 	virtual ~FMonolithDdcArtifactCache() override;
 
 	virtual TOptional<FMonolithArtifact> Get(

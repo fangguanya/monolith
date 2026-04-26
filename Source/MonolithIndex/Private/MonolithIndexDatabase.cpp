@@ -413,6 +413,45 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT DEFAULT ''
 );
 
+-- AssetVisualGeometric cohort: 64-dim FP32 embedding 行存储
+-- 设计：双 cohort 共用 schema，按 CohortName 分别落到 asset_visual_geometric / asset_visual_semantic
+-- 物理上是两张完全独立的表，互不影响 stale / shadow / reducer
+CREATE TABLE IF NOT EXISTS asset_visual_geometric (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    revision_id INTEGER DEFAULT 0,
+    asset_path TEXT NOT NULL,
+    shard_id TEXT NOT NULL DEFAULT '',
+    shard_prefix_depth INTEGER DEFAULT 0,
+    provider_id TEXT NOT NULL DEFAULT '',
+    provider_version INTEGER DEFAULT 1,
+    render_recipe_version INTEGER DEFAULT 1,
+    embedding_dim INTEGER DEFAULT 0,
+    embedding_dtype INTEGER DEFAULT 0,
+    embedding_bytes BLOB,
+    preview_view_path TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_asset_visual_geometric_asset ON asset_visual_geometric(asset_id);
+CREATE INDEX IF NOT EXISTS idx_asset_visual_geometric_shard ON asset_visual_geometric(shard_id);
+
+CREATE TABLE IF NOT EXISTS asset_visual_semantic (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    revision_id INTEGER DEFAULT 0,
+    asset_path TEXT NOT NULL,
+    shard_id TEXT NOT NULL DEFAULT '',
+    shard_prefix_depth INTEGER DEFAULT 0,
+    provider_id TEXT NOT NULL DEFAULT '',
+    provider_version INTEGER DEFAULT 1,
+    render_recipe_version INTEGER DEFAULT 1,
+    embedding_dim INTEGER DEFAULT 0,
+    embedding_dtype INTEGER DEFAULT 0,
+    embedding_bytes BLOB,
+    preview_view_path TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_asset_visual_semantic_asset ON asset_visual_semantic(asset_id);
+CREATE INDEX IF NOT EXISTS idx_asset_visual_semantic_shard ON asset_visual_semantic(shard_id);
+
 )SQL");
 
 // ============================================================
@@ -592,6 +631,70 @@ bool FMonolithIndexDatabase::Open(const FString& InDbPath)
 			ExecuteSQL(TEXT("CREATE INDEX IF NOT EXISTS idx_mesh_catalog_size_class ON mesh_catalog(size_class);"));
 
 			WriteMeta(TEXT("schema_version"), TEXT("7"));
+		}
+
+		// v7 -> v8：AssetVisual 双 cohort 表（geometric + semantic）
+		// 与 mesh_catalog 同样属于 companion，但承担视觉检索而不是结构化检索
+		if (SchemaVersionInt < 8)
+		{
+			const TCHAR* const VisualTables[] = {
+				TEXT("asset_visual_geometric"),
+				TEXT("asset_visual_semantic"),
+			};
+			for (const TCHAR* TableName : VisualTables)
+			{
+				const FString CreateSql = FString::Printf(
+					TEXT("CREATE TABLE IF NOT EXISTS %s ("
+						"    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+						"    asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,"
+						"    revision_id INTEGER DEFAULT 0,"
+						"    asset_path TEXT NOT NULL,"
+						"    shard_id TEXT NOT NULL DEFAULT '',"
+						"    shard_prefix_depth INTEGER DEFAULT 0,"
+						"    provider_id TEXT NOT NULL DEFAULT '',"
+						"    provider_version INTEGER DEFAULT 1,"
+						"    render_recipe_version INTEGER DEFAULT 1,"
+						"    embedding_dim INTEGER DEFAULT 0,"
+						"    embedding_dtype INTEGER DEFAULT 0,"
+						"    embedding_bytes BLOB,"
+						"    preview_view_path TEXT DEFAULT ''"
+						");"),
+					TableName);
+				ExecuteSQL(*CreateSql);
+				ExecuteSQL(*FString::Printf(TEXT("CREATE INDEX IF NOT EXISTS idx_%s_asset ON %s(asset_id);"), TableName, TableName));
+				ExecuteSQL(*FString::Printf(TEXT("CREATE INDEX IF NOT EXISTS idx_%s_shard ON %s(shard_id);"), TableName, TableName));
+			}
+			WriteMeta(TEXT("schema_version"), TEXT("8"));
+		}
+
+		// v8 -> v9：MeshVisual* → AssetVisual* 重命名后清理 v8 早期写入的 idx_mesh_visual_* 索引名，
+		// 同时让 AssetVisual* cohort 行的 provider_id / 旧 indexer 标识全量 stale，
+		// 强制 4 类资产（StaticMesh / SkeletalMesh / Material / WidgetBlueprint）走一次重建。
+		if (SchemaVersionInt < 9)
+		{
+			ExecuteSQL(TEXT("DROP INDEX IF EXISTS idx_mesh_visual_geometric_asset;"));
+			ExecuteSQL(TEXT("DROP INDEX IF EXISTS idx_mesh_visual_geometric_shard;"));
+			ExecuteSQL(TEXT("DROP INDEX IF EXISTS idx_mesh_visual_semantic_asset;"));
+			ExecuteSQL(TEXT("DROP INDEX IF EXISTS idx_mesh_visual_semantic_shard;"));
+			ExecuteSQL(TEXT("CREATE INDEX IF NOT EXISTS idx_asset_visual_geometric_asset ON asset_visual_geometric(asset_id);"));
+			ExecuteSQL(TEXT("CREATE INDEX IF NOT EXISTS idx_asset_visual_geometric_shard ON asset_visual_geometric(shard_id);"));
+			ExecuteSQL(TEXT("CREATE INDEX IF NOT EXISTS idx_asset_visual_semantic_asset ON asset_visual_semantic(asset_id);"));
+			ExecuteSQL(TEXT("CREATE INDEX IF NOT EXISTS idx_asset_visual_semantic_shard ON asset_visual_semantic(shard_id);"));
+
+			// 清空两张视觉表内容：渲染 recipe v1→v2 不兼容，5 类资产支持范围扩展，
+			// 已有 StaticMesh-only 行的 embedding 与新批次空间不齐，必须整库重建。
+			ExecuteSQL(TEXT("DELETE FROM asset_visual_geometric;"));
+			ExecuteSQL(TEXT("DELETE FROM asset_visual_semantic;"));
+
+			// 让 asset_index_metadata 中两个 visual cohort 的 ArtifactId 失效，
+			// 触发 commandlet / live 路径上的 stale 判定 → 重投 OfflineOnly 队列。
+			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'AssetVisualGeometric';"));
+			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'AssetVisualSemantic';"));
+			// 把任何遗留的旧 IndexerId 行也删掉（早期 dev DB 上可能写过 MeshVisual* 名字）。
+			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'MeshVisualGeometric';"));
+			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'MeshVisualSemantic';"));
+
+			WriteMeta(TEXT("schema_version"), TEXT("9"));
 		}
 	}
 
@@ -2000,6 +2103,41 @@ TOptional<FMonolithAssetIndexMetadata> FMonolithIndexDatabase::GetAssetIndexMeta
 	}
 
 	return {};
+}
+
+TMap<int64, FMonolithAssetIndexMetadata> FMonolithIndexDatabase::GetAllAssetIndexMetadata()
+{
+	TMap<int64, FMonolithAssetIndexMetadata> Result;
+	if (!IsOpen())
+	{
+		return Result;
+	}
+
+	FSQLitePreparedStatement Stmt;
+	Stmt.Create(
+		*Database,
+		TEXT("SELECT asset_id, indexer_id, indexer_version, artifact_schema_version, identity_provider, execution_mode, identity_hash FROM asset_index_metadata;"));
+
+	// 一次 step 循环把整张表流式读出来，避免 N 次 prepared statement 创建/拆销。
+	// 33K asset 实测约 30-50ms，对比 N 次 ByAssetId 的 6-8s 是 ~150x 加速。
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FMonolithAssetIndexMetadata Metadata;
+		int64 IndexerVersion = 1;
+		int64 ArtifactSchemaVersion = 1;
+		Stmt.GetColumnValueByIndex(0, Metadata.AssetId);
+		Stmt.GetColumnValueByIndex(1, Metadata.IndexerId);
+		Stmt.GetColumnValueByIndex(2, IndexerVersion);
+		Stmt.GetColumnValueByIndex(3, ArtifactSchemaVersion);
+		Stmt.GetColumnValueByIndex(4, Metadata.IdentityProvider);
+		Stmt.GetColumnValueByIndex(5, Metadata.ExecutionMode);
+		Stmt.GetColumnValueByIndex(6, Metadata.IdentityHash);
+		Metadata.IndexerVersion = static_cast<uint32>(IndexerVersion);
+		Metadata.ArtifactSchemaVersion = static_cast<uint8>(ArtifactSchemaVersion);
+		Result.Emplace(Metadata.AssetId, MoveTemp(Metadata));
+	}
+
+	return Result;
 }
 
 // ============================================================
@@ -4040,4 +4178,355 @@ bool FMonolithIndexDatabase::ExecuteSQL(const FString& SQL, const TCHAR* Context
 		return false;
 	}
 	return true;
+}
+
+// ============================================================
+// AssetVisual CRUD（geometric / semantic 双 cohort 共用接口，按 CohortName 落到不同表）
+// ============================================================
+
+namespace AssetVisualDatabaseInternal
+{
+	/** 把 cohort 名映射到 production 表名；未识别的 cohort 返回空字符串。 */
+	static FString GetProductionTableName(const FString& CohortName)
+	{
+		if (CohortName.Equals(TEXT("AssetVisualGeometric"), ESearchCase::IgnoreCase))
+		{
+			return TEXT("asset_visual_geometric");
+		}
+		if (CohortName.Equals(TEXT("AssetVisualSemantic"), ESearchCase::IgnoreCase))
+		{
+			return TEXT("asset_visual_semantic");
+		}
+		UE_LOG(LogMonolithIndex, Error,
+			TEXT("AssetVisual production table 不识别 cohort 名：'%s'"), *CohortName);
+		return FString();
+	}
+}
+
+int64 FMonolithIndexDatabase::InsertAssetVisualEntry(const FString& CohortName, const FIndexedAssetVisualEntry& Entry)
+{
+	if (!IsOpen())
+	{
+		return -1;
+	}
+	const FString TableName = AssetVisualDatabaseInternal::GetProductionTableName(CohortName);
+	if (TableName.IsEmpty())
+	{
+		return -1;
+	}
+
+	FSQLitePreparedStatement Stmt;
+	const FString Sql = FString::Printf(
+		TEXT("INSERT INTO %s (asset_id, revision_id, asset_path, shard_id, shard_prefix_depth, provider_id, provider_version, render_recipe_version, embedding_dim, embedding_dtype, embedding_bytes, preview_view_path) ")
+		TEXT("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"),
+		*TableName);
+	Stmt.Create(*Database, *Sql);
+	const int64 Revision = Entry.RevisionId > 0 ? Entry.RevisionId : ResolveActiveRevisionId(Entry.AssetId);
+	Stmt.SetBindingValueByIndex(1, Entry.AssetId);
+	Stmt.SetBindingValueByIndex(2, Revision);
+	Stmt.SetBindingValueByIndex(3, Entry.AssetPath);
+	Stmt.SetBindingValueByIndex(4, Entry.ShardId);
+	Stmt.SetBindingValueByIndex(5, static_cast<int64>(Entry.ShardPrefixDepth));
+	Stmt.SetBindingValueByIndex(6, Entry.ProviderId);
+	Stmt.SetBindingValueByIndex(7, static_cast<int64>(Entry.ProviderVersion));
+	Stmt.SetBindingValueByIndex(8, static_cast<int64>(Entry.RenderRecipeVersion));
+	Stmt.SetBindingValueByIndex(9, static_cast<int64>(Entry.EmbeddingDim));
+	Stmt.SetBindingValueByIndex(10, static_cast<int64>(Entry.EmbeddingDtype));
+	// SQLite 的 SetBindingValueByIndex 重载 4 参数版本就是 BLOB 入口（指针 + 字节数 + bCopy）。
+	Stmt.SetBindingValueByIndex(11, static_cast<const void*>(Entry.EmbeddingBytes.GetData()), static_cast<int32>(Entry.EmbeddingBytes.Num()), false);
+	Stmt.SetBindingValueByIndex(12, Entry.PreviewViewPath);
+
+	if (!Stmt.Execute())
+	{
+		return -1;
+	}
+	return Database->GetLastInsertRowId();
+}
+
+TOptional<FIndexedAssetVisualEntry> FMonolithIndexDatabase::GetAssetVisualEntryForAsset(const FString& CohortName, const int64 AssetId)
+{
+	if (!IsOpen())
+	{
+		return {};
+	}
+	const FString TableName = AssetVisualDatabaseInternal::GetProductionTableName(CohortName);
+	if (TableName.IsEmpty())
+	{
+		return {};
+	}
+
+	const FString Sql = FString::Printf(
+		TEXT("SELECT m.id, m.asset_id, m.revision_id, m.asset_path, m.shard_id, m.shard_prefix_depth, m.provider_id, m.provider_version, m.render_recipe_version, m.embedding_dim, m.embedding_dtype, m.embedding_bytes, m.preview_view_path ")
+		TEXT("FROM %s m JOIN assets a ON a.id = m.asset_id ")
+		TEXT("WHERE m.asset_id = ? AND (m.revision_id = a.current_revision_id OR (a.current_revision_id = 0 AND m.revision_id = 0));"),
+		*TableName);
+
+	FSQLitePreparedStatement Stmt;
+	Stmt.Create(*Database, *Sql);
+	Stmt.SetBindingValueByIndex(1, AssetId);
+
+	if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row)
+	{
+		return {};
+	}
+
+	FIndexedAssetVisualEntry Entry;
+	Stmt.GetColumnValueByIndex(0, Entry.Id);
+	Stmt.GetColumnValueByIndex(1, Entry.AssetId);
+	Stmt.GetColumnValueByIndex(2, Entry.RevisionId);
+	Stmt.GetColumnValueByIndex(3, Entry.AssetPath);
+	Stmt.GetColumnValueByIndex(4, Entry.ShardId);
+	int64 PrefixDepth = 0;
+	Stmt.GetColumnValueByIndex(5, PrefixDepth);
+	Entry.ShardPrefixDepth = static_cast<int32>(PrefixDepth);
+	Stmt.GetColumnValueByIndex(6, Entry.ProviderId);
+	int64 ProviderVersion = 1;
+	int64 RenderVersion = 1;
+	Stmt.GetColumnValueByIndex(7, ProviderVersion);
+	Stmt.GetColumnValueByIndex(8, RenderVersion);
+	Entry.ProviderVersion = static_cast<uint32>(ProviderVersion);
+	Entry.RenderRecipeVersion = static_cast<uint32>(RenderVersion);
+	int64 EmbeddingDim = 0;
+	int64 EmbeddingDtype = 0;
+	Stmt.GetColumnValueByIndex(9, EmbeddingDim);
+	Stmt.GetColumnValueByIndex(10, EmbeddingDtype);
+	Entry.EmbeddingDim = static_cast<int32>(EmbeddingDim);
+	Entry.EmbeddingDtype = static_cast<uint8>(EmbeddingDtype);
+	Stmt.GetColumnValueByIndex(11, Entry.EmbeddingBytes);
+	Stmt.GetColumnValueByIndex(12, Entry.PreviewViewPath);
+	return Entry;
+}
+
+TArray<FIndexedAssetVisualEntry> FMonolithIndexDatabase::GetAssetVisualEntries(const FString& CohortName, const FString& ShardIdFilter)
+{
+	TArray<FIndexedAssetVisualEntry> Result;
+	if (!IsOpen())
+	{
+		return Result;
+	}
+	const FString TableName = AssetVisualDatabaseInternal::GetProductionTableName(CohortName);
+	if (TableName.IsEmpty())
+	{
+		return Result;
+	}
+
+	FString Sql = FString::Printf(
+		TEXT("SELECT m.id, m.asset_id, m.revision_id, m.asset_path, m.shard_id, m.shard_prefix_depth, m.provider_id, m.provider_version, m.render_recipe_version, m.embedding_dim, m.embedding_dtype, m.embedding_bytes, m.preview_view_path ")
+		TEXT("FROM %s m JOIN assets a ON a.id = m.asset_id ")
+		TEXT("WHERE (m.revision_id = a.current_revision_id OR (a.current_revision_id = 0 AND m.revision_id = 0))"),
+		*TableName);
+	if (!ShardIdFilter.IsEmpty())
+	{
+		Sql.Append(TEXT(" AND m.shard_id = ?"));
+	}
+	Sql.Append(TEXT(";"));
+
+	FSQLitePreparedStatement Stmt;
+	Stmt.Create(*Database, *Sql);
+	if (!ShardIdFilter.IsEmpty())
+	{
+		Stmt.SetBindingValueByIndex(1, ShardIdFilter);
+	}
+
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FIndexedAssetVisualEntry Entry;
+		Stmt.GetColumnValueByIndex(0, Entry.Id);
+		Stmt.GetColumnValueByIndex(1, Entry.AssetId);
+		Stmt.GetColumnValueByIndex(2, Entry.RevisionId);
+		Stmt.GetColumnValueByIndex(3, Entry.AssetPath);
+		Stmt.GetColumnValueByIndex(4, Entry.ShardId);
+		int64 PrefixDepth = 0;
+		Stmt.GetColumnValueByIndex(5, PrefixDepth);
+		Entry.ShardPrefixDepth = static_cast<int32>(PrefixDepth);
+		Stmt.GetColumnValueByIndex(6, Entry.ProviderId);
+		int64 ProviderVersion = 1;
+		int64 RenderVersion = 1;
+		Stmt.GetColumnValueByIndex(7, ProviderVersion);
+		Stmt.GetColumnValueByIndex(8, RenderVersion);
+		Entry.ProviderVersion = static_cast<uint32>(ProviderVersion);
+		Entry.RenderRecipeVersion = static_cast<uint32>(RenderVersion);
+		int64 EmbeddingDim = 0;
+		int64 EmbeddingDtype = 0;
+		Stmt.GetColumnValueByIndex(9, EmbeddingDim);
+		Stmt.GetColumnValueByIndex(10, EmbeddingDtype);
+		Entry.EmbeddingDim = static_cast<int32>(EmbeddingDim);
+		Entry.EmbeddingDtype = static_cast<uint8>(EmbeddingDtype);
+		Stmt.GetColumnValueByIndex(11, Entry.EmbeddingBytes);
+		Stmt.GetColumnValueByIndex(12, Entry.PreviewViewPath);
+		Result.Add(MoveTemp(Entry));
+	}
+	return Result;
+}
+
+bool FMonolithIndexDatabase::ReplaceShadowAssetVisualEntriesForAsset(
+	const FString& CohortName,
+	const FString& ShadowCohortName,
+	const int64 AssetId,
+	const TArray<FMonolithShadowIndexedAssetVisualEntry>& Entries)
+{
+	if (!IsOpen() || AssetId <= 0)
+	{
+		return false;
+	}
+	const FString BaseTable = AssetVisualDatabaseInternal::GetProductionTableName(CohortName);
+	if (BaseTable.IsEmpty())
+	{
+		return false;
+	}
+	// shadow 表名通过 shadow cohort 名来 namespace，避免不同实验串用同一份 shadow 数据。
+	const FString TableName = MakeShadowTableName(ShadowCohortName, BaseTable);
+
+	// 第一次写入时按需建表；schema 与生产表对齐 + 加 row_hash 列。
+	const FString CreateSql = FString::Printf(
+		TEXT("CREATE TABLE IF NOT EXISTS %s ("
+			"    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+			"    asset_id INTEGER NOT NULL,"
+			"    revision_id INTEGER DEFAULT 0,"
+			"    asset_path TEXT NOT NULL,"
+			"    shard_id TEXT NOT NULL DEFAULT '',"
+			"    shard_prefix_depth INTEGER DEFAULT 0,"
+			"    provider_id TEXT NOT NULL DEFAULT '',"
+			"    provider_version INTEGER DEFAULT 1,"
+			"    render_recipe_version INTEGER DEFAULT 1,"
+			"    embedding_dim INTEGER DEFAULT 0,"
+			"    embedding_dtype INTEGER DEFAULT 0,"
+			"    embedding_bytes BLOB,"
+			"    preview_view_path TEXT DEFAULT '',"
+			"    row_hash TEXT DEFAULT ''"
+			");"),
+		*TableName);
+	ExecuteSQL(*CreateSql);
+
+	const int64 ActiveRevisionId = ResolveActiveRevisionId(AssetId);
+
+	// 先按 (asset_id, revision_id) 清掉旧 shadow 行；保证一次替换是一致的整体快照。
+	FSQLitePreparedStatement DeleteStmt;
+	DeleteStmt.Create(*Database, *FString::Printf(TEXT("DELETE FROM %s WHERE asset_id = ? AND revision_id = ?;"), *TableName));
+	DeleteStmt.SetBindingValueByIndex(1, AssetId);
+	DeleteStmt.SetBindingValueByIndex(2, ActiveRevisionId);
+	if (!DeleteStmt.Execute())
+	{
+		return false;
+	}
+
+	for (const FMonolithShadowIndexedAssetVisualEntry& ShadowEntry : Entries)
+	{
+		const int64 RevisionId = ShadowEntry.Entry.RevisionId > 0 ? ShadowEntry.Entry.RevisionId : ActiveRevisionId;
+		FSQLitePreparedStatement InsertStmt;
+		InsertStmt.Create(
+			*Database,
+			*FString::Printf(
+				TEXT("INSERT INTO %s (asset_id, revision_id, asset_path, shard_id, shard_prefix_depth, provider_id, provider_version, render_recipe_version, embedding_dim, embedding_dtype, embedding_bytes, preview_view_path, row_hash) ")
+				TEXT("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"),
+				*TableName));
+		InsertStmt.SetBindingValueByIndex(1, AssetId);
+		InsertStmt.SetBindingValueByIndex(2, RevisionId);
+		InsertStmt.SetBindingValueByIndex(3, ShadowEntry.Entry.AssetPath);
+		InsertStmt.SetBindingValueByIndex(4, ShadowEntry.Entry.ShardId);
+		InsertStmt.SetBindingValueByIndex(5, static_cast<int64>(ShadowEntry.Entry.ShardPrefixDepth));
+		InsertStmt.SetBindingValueByIndex(6, ShadowEntry.Entry.ProviderId);
+		InsertStmt.SetBindingValueByIndex(7, static_cast<int64>(ShadowEntry.Entry.ProviderVersion));
+		InsertStmt.SetBindingValueByIndex(8, static_cast<int64>(ShadowEntry.Entry.RenderRecipeVersion));
+		InsertStmt.SetBindingValueByIndex(9, static_cast<int64>(ShadowEntry.Entry.EmbeddingDim));
+		InsertStmt.SetBindingValueByIndex(10, static_cast<int64>(ShadowEntry.Entry.EmbeddingDtype));
+		InsertStmt.SetBindingValueByIndex(11, static_cast<const void*>(ShadowEntry.Entry.EmbeddingBytes.GetData()), static_cast<int32>(ShadowEntry.Entry.EmbeddingBytes.Num()), false);
+		InsertStmt.SetBindingValueByIndex(12, ShadowEntry.Entry.PreviewViewPath);
+		InsertStmt.SetBindingValueByIndex(13, MonolithIndexDatabaseInternal::RowHashToHex(ShadowEntry.RowHash));
+		if (!InsertStmt.Execute())
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+TArray<FMonolithShadowIndexedAssetVisualEntry> FMonolithIndexDatabase::GetShadowAssetVisualEntriesForAsset(
+	const FString& CohortName,
+	const FString& ShadowCohortName,
+	const int64 AssetId)
+{
+	TArray<FMonolithShadowIndexedAssetVisualEntry> Result;
+	if (!IsOpen())
+	{
+		return Result;
+	}
+	const FString BaseTable = AssetVisualDatabaseInternal::GetProductionTableName(CohortName);
+	if (BaseTable.IsEmpty())
+	{
+		return Result;
+	}
+	const FString TableName = MakeShadowTableName(ShadowCohortName, BaseTable);
+
+	const int64 ActiveRevisionId = ResolveActiveRevisionId(AssetId);
+	FSQLitePreparedStatement Stmt;
+	Stmt.Create(
+		*Database,
+		*FString::Printf(
+			TEXT("SELECT s.asset_path, s.shard_id, s.shard_prefix_depth, s.provider_id, s.provider_version, s.render_recipe_version, s.embedding_dim, s.embedding_dtype, s.embedding_bytes, s.preview_view_path, s.row_hash ")
+			TEXT("FROM %s s WHERE s.asset_id = ? AND s.revision_id = ?;"),
+			*TableName));
+	Stmt.SetBindingValueByIndex(1, AssetId);
+	Stmt.SetBindingValueByIndex(2, ActiveRevisionId);
+
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FMonolithShadowIndexedAssetVisualEntry Row;
+		Row.Entry.AssetId = AssetId;
+		Row.Entry.RevisionId = ActiveRevisionId;
+		Stmt.GetColumnValueByIndex(0, Row.Entry.AssetPath);
+		Stmt.GetColumnValueByIndex(1, Row.Entry.ShardId);
+		int64 PrefixDepth = 0;
+		Stmt.GetColumnValueByIndex(2, PrefixDepth);
+		Row.Entry.ShardPrefixDepth = static_cast<int32>(PrefixDepth);
+		Stmt.GetColumnValueByIndex(3, Row.Entry.ProviderId);
+		int64 ProviderVersion = 1;
+		int64 RenderVersion = 1;
+		Stmt.GetColumnValueByIndex(4, ProviderVersion);
+		Stmt.GetColumnValueByIndex(5, RenderVersion);
+		Row.Entry.ProviderVersion = static_cast<uint32>(ProviderVersion);
+		Row.Entry.RenderRecipeVersion = static_cast<uint32>(RenderVersion);
+		int64 EmbeddingDim = 0;
+		int64 EmbeddingDtype = 0;
+		Stmt.GetColumnValueByIndex(6, EmbeddingDim);
+		Stmt.GetColumnValueByIndex(7, EmbeddingDtype);
+		Row.Entry.EmbeddingDim = static_cast<int32>(EmbeddingDim);
+		Row.Entry.EmbeddingDtype = static_cast<uint8>(EmbeddingDtype);
+		Stmt.GetColumnValueByIndex(8, Row.Entry.EmbeddingBytes);
+		Stmt.GetColumnValueByIndex(9, Row.Entry.PreviewViewPath);
+		FString RowHashHex;
+		Stmt.GetColumnValueByIndex(10, RowHashHex);
+		Row.RowHash = MonolithIndexDatabaseInternal::ParseRowHashHex(RowHashHex);
+		Result.Add(MoveTemp(Row));
+	}
+	return Result;
+}
+
+FMonolithShadowAssetVisualAggregate FMonolithIndexDatabase::GetProductionAssetVisualAggregateForAsset(
+	const FString& CohortName,
+	const int64 AssetId)
+{
+	FMonolithShadowAssetVisualAggregate Aggregate;
+	const TOptional<FIndexedAssetVisualEntry> Entry = GetAssetVisualEntryForAsset(CohortName, AssetId);
+	if (Entry.IsSet())
+	{
+		extern uint64 ComputeAssetVisualRowHash(const FIndexedAssetVisualEntry&);
+		++Aggregate.RowCount;
+		Aggregate.RowHashSum += ComputeAssetVisualRowHash(Entry.GetValue());
+	}
+	return Aggregate;
+}
+
+FMonolithShadowAssetVisualAggregate FMonolithIndexDatabase::GetShadowAssetVisualAggregateForAsset(
+	const FString& CohortName,
+	const FString& ShadowCohortName,
+	const int64 AssetId)
+{
+	FMonolithShadowAssetVisualAggregate Aggregate;
+	for (const FMonolithShadowIndexedAssetVisualEntry& Row : GetShadowAssetVisualEntriesForAsset(CohortName, ShadowCohortName, AssetId))
+	{
+		++Aggregate.RowCount;
+		Aggregate.RowHashSum += Row.RowHash;
+	}
+	return Aggregate;
 }
