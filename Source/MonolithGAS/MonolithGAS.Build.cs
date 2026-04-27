@@ -6,6 +6,7 @@ public class MonolithGAS : ModuleRules
 	public MonolithGAS(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		bUseUnity = false;
 
 		// Always-available engine GAS modules
 		PublicDependencyModuleNames.AddRange(new string[]

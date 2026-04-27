@@ -5,6 +5,7 @@ public class MonolithAnimation : ModuleRules
 	public MonolithAnimation(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+		bUseUnity = false;
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{

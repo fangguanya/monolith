@@ -1,4 +1,4 @@
-Binaries/
+﻿Binaries/
 Intermediate/
 Saved/
 DerivedDataCache/
@@ -10,6 +10,7 @@ Docs/plans/
 Docs/TESTING.md
 Docs/TODO_VFX_Issues.md
 Plans/
+.git/
 
 # Private project-specific modules — not part of public Monolith releases
 Source/MonolithISX/

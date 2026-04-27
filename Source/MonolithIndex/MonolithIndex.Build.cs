@@ -6,6 +6,7 @@ public class MonolithIndex : ModuleRules
 	public MonolithIndex(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+		bUseUnity = false;
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{

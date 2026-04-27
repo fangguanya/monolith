@@ -6,6 +6,7 @@ public class MonolithLogicDriver : ModuleRules
 	public MonolithLogicDriver(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		bUseUnity = false;
 
 		// Release builds: set MONOLITH_RELEASE_BUILD=1 to force all optional deps off.
 		bool bHasLogicDriver = false;

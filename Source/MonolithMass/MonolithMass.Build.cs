@@ -1,4 +1,4 @@
-using UnrealBuildTool;
+﻿using UnrealBuildTool;
 using System.IO;
 
 public class MonolithMass : ModuleRules
@@ -6,6 +6,7 @@ public class MonolithMass : ModuleRules
 	public MonolithMass(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		bUseUnity = false;
 
 		// Core Monolith infrastructure — always required.
 		PublicDependencyModuleNames.AddRange(new string[]

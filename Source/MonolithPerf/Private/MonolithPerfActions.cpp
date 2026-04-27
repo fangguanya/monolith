@@ -49,20 +49,35 @@ FPerfLogCapture* FPerfLogCapture::Get()
 
 void FPerfLogCapture::Install()
 {
-	FScopeLock L(&Lock);
-	if (bInstalled) return;
+	// Mutate state under our Lock, but call into GLog *outside* it.
+	// Why: GLog->AddOutputDevice takes GLog's internal output-device lock; another
+	// thread may be inside GLog's dispatch (holding that GLog lock) calling our
+	// Serialize() which then waits on our Lock. Holding both in opposite orders
+	// = ABBA deadlock.
+	{
+		FScopeLock L(&Lock);
+		if (bInstalled) return;
+		bInstalled = true;
+		SingletonInstance = this;
+	}
 	if (GLog) { GLog->AddOutputDevice(this); }
-	bInstalled = true;
-	SingletonInstance = this;
 }
 
 void FPerfLogCapture::Uninstall()
 {
-	FScopeLock L(&Lock);
-	if (!bInstalled) return;
-	if (GLog) { GLog->RemoveOutputDevice(this); }
-	bInstalled = false;
-	if (SingletonInstance == this) SingletonInstance = nullptr;
+	bool bWasInstalled;
+	{
+		FScopeLock L(&Lock);
+		bWasInstalled = bInstalled;
+		bInstalled = false;
+	}
+	if (bWasInstalled && GLog)
+	{
+		// Outside our Lock. RemoveOutputDevice synchronizes with in-flight
+		// Serialize() calls (which need our Lock) — must not hold it here.
+		GLog->RemoveOutputDevice(this);
+	}
+	if (SingletonInstance == this) { SingletonInstance = nullptr; }
 }
 
 void FPerfLogCapture::Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category)
@@ -116,23 +131,25 @@ FPerfLogScope::~FPerfLogScope()
 
 void FPerfLogScope::Begin()
 {
-	FScopeLock L(&Lock);
-	Entries.Reset();
-	bActive = true;
-	if (GLog)
+	// See FPerfLogCapture::Install — never call GLog->Add/RemoveOutputDevice
+	// while holding our own Lock, or we ABBA-deadlock with GLog dispatch.
 	{
-		GLog->AddOutputDevice(this);
+		FScopeLock L(&Lock);
+		Entries.Reset();
+		bActive = true;
 	}
+	if (GLog) { GLog->AddOutputDevice(this); }
 }
 
 void FPerfLogScope::End()
 {
-	FScopeLock L(&Lock);
-	if (bActive && GLog)
+	bool bWasActive;
 	{
-		GLog->RemoveOutputDevice(this);
+		FScopeLock L(&Lock);
+		bWasActive = bActive;
 		bActive = false;
 	}
+	if (bWasActive && GLog) { GLog->RemoveOutputDevice(this); }
 }
 
 void FPerfLogScope::Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category)

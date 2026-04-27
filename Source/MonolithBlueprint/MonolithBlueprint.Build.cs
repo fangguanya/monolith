@@ -5,6 +5,7 @@ public class MonolithBlueprint : ModuleRules
 	public MonolithBlueprint(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
+		bUseUnity = false;
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{

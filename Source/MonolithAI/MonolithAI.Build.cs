@@ -1,4 +1,4 @@
-using UnrealBuildTool;
+﻿using UnrealBuildTool;
 using System.IO;
 
 public class MonolithAI : ModuleRules
@@ -6,6 +6,7 @@ public class MonolithAI : ModuleRules
 	public MonolithAI(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		bUseUnity = false;
 
 		// Always-available engine AI modules
 		PublicDependencyModuleNames.AddRange(new string[]
