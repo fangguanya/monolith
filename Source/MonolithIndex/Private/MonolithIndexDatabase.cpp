@@ -696,6 +696,18 @@ bool FMonolithIndexDatabase::Open(const FString& InDbPath)
 
 			WriteMeta(TEXT("schema_version"), TEXT("9"));
 		}
+
+		// v9 -> v10：RenderRecipeVersion 由 2 升到 3（capture mode 改成 SCS_BaseColor 修
+		// commandlet 模式下整图全黑、Geometric embedding 全 0 的 bug）。所有像素值都变了，
+		// 之前 24007+24007 行 embedding 全部失效，必须清空让下一次 warmup 重建。
+		if (SchemaVersionInt < 10)
+		{
+			ExecuteSQL(TEXT("DELETE FROM asset_visual_geometric;"));
+			ExecuteSQL(TEXT("DELETE FROM asset_visual_semantic;"));
+			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'AssetVisualGeometric';"));
+			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'AssetVisualSemantic';"));
+			WriteMeta(TEXT("schema_version"), TEXT("10"));
+		}
 	}
 
 	// Ensure hash index exists (safe for both fresh and migrated DBs)
@@ -4201,6 +4213,20 @@ namespace AssetVisualDatabaseInternal
 			TEXT("AssetVisual production table 不识别 cohort 名：'%s'"), *CohortName);
 		return FString();
 	}
+}
+
+bool FMonolithIndexDatabase::ClearAssetVisualEntries(const FString& CohortName)
+{
+	if (!IsOpen())
+	{
+		return false;
+	}
+	const FString TableName = AssetVisualDatabaseInternal::GetProductionTableName(CohortName);
+	if (TableName.IsEmpty())
+	{
+		return false;
+	}
+	return ExecuteSQL(*FString::Printf(TEXT("DELETE FROM %s;"), *TableName));
 }
 
 int64 FMonolithIndexDatabase::InsertAssetVisualEntry(const FString& CohortName, const FIndexedAssetVisualEntry& Entry)

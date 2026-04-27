@@ -38,7 +38,11 @@
 #include "MonolithIndexer.h"
 #include "MonolithIndexLog.h"
 #include "MonolithOfflineWarmupQueue.h"
+#include "MonolithIndexDatabase.h"
 #include "MonolithSettings.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Paths.h"
+#include "Interfaces/IPluginManager.h"
 #include "Commandlets/MonolithWarmupHistory.h"
 
 /*
@@ -314,11 +318,36 @@ namespace MonolithWarmupCommandletInternal
 	 * - cache 里本来就有；
 	 * - cache 里没有，但这次成功构建并写入了。
 	 */
+	/** 给 -Materialize 路径用：在 SQLite 里找 / 创建 asset 行，返回 AssetId。
+	 *  无 Database 时返回 0（pipeline 会跳过 materialize，仅写 DDC）。 */
+	static int64 ResolveAssetIdForMaterialize(FMonolithIndexDatabase* Database, const FAssetData& AssetData)
+	{
+		if (!Database)
+		{
+			return 0;
+		}
+		const FString PackagePath = AssetData.PackageName.ToString();
+		const TOptional<FIndexedAsset> Existing = Database->GetAssetByPath(PackagePath);
+		if (Existing.IsSet())
+		{
+			return Existing.GetValue().Id;
+		}
+		// commandlet 模式下 assets 表可能没行（warmup 是 OfflineOnly cohort 路径，不依赖主索引）。
+		// 插入一条最小记录就能让 visual artifact 能 materialize。其它字段会在 editor live 路径上补齐。
+		FIndexedAsset Record;
+		Record.PackagePath = PackagePath;
+		Record.AssetName = AssetData.AssetName.ToString();
+		Record.AssetClass = AssetData.AssetClassPath.GetAssetName().ToString();
+		return Database->InsertAsset(Record);
+	}
+
 	static bool TryWarmAsset(
 		const FAssetData& AssetData,
 		const TSharedPtr<IMonolithIndexer>& Indexer,
 		IAssetRegistry& AssetRegistry,
-		IMonolithArtifactCache& ArtifactCache)
+		IMonolithArtifactCache& ArtifactCache,
+		FMonolithIndexDatabase* Database,
+		const int64 AssetId)
 	{
 		if (!Indexer.IsValid())
 		{
@@ -330,7 +359,10 @@ namespace MonolithWarmupCommandletInternal
 		MonolithAssetArtifactPipeline::FExecuteAssetOptions ExecuteOptions;
 		ExecuteOptions.RequestMode = EMonolithArtifactCacheRequestMode::Warmup;
 		ExecuteOptions.bAllowLocalArtifactBuild = true;
-		ExecuteOptions.bMaterializeProduction = false;
+		// Database != nullptr 说明 commandlet 是带 -Materialize 跑的：
+		// 把 build 完的 artifact 顺带写一行进 SQLite，免得用户事后还要起编辑器跑 console。
+		ExecuteOptions.bMaterializeProduction = (Database != nullptr && AssetId > 0);
+		ExecuteOptions.AssetId = AssetId;
 
 		MonolithAssetArtifactPipeline::FExecuteAssetResult ExecuteResult;
 		return MonolithAssetArtifactPipeline::ExecuteAssetIndexerArtifact(
@@ -343,7 +375,7 @@ namespace MonolithWarmupCommandletInternal
 			},
 			*Indexer,
 			&ArtifactCache,
-			nullptr,
+			Database,
 			ExecuteOptions,
 			ExecuteResult) == MonolithAssetArtifactPipeline::EExecuteAssetOutcome::Succeeded;
 	}
@@ -430,6 +462,49 @@ int32 UMonolithIndexWarmupCommandlet::Main(const FString& Params)
 
 	TUniquePtr<IMonolithArtifactCache> ArtifactCache = MakeUnique<FMonolithDdcArtifactCache>(FString(MonolithCacheBuckets::Default));
 	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
+
+	// -Materialize：commandlet 直接打开 SQLite 写表，免得用户重启编辑器跑 console。
+	// subsystem 仍按 bypass 跳过 DB；这里独立开一份连接（commandlet 单线程，不会和 subsystem 抢锁）。
+	TUniquePtr<FMonolithIndexDatabase> MaterializeDb;
+	const bool bMaterialize = FParse::Param(FCommandLine::Get(), TEXT("Materialize"));
+	if (bMaterialize)
+	{
+		// 直接复制 subsystem 的路径解析逻辑（GetDatabasePath() 是 private 不能调）。
+		FString DbPath;
+		if (Settings && !Settings->DatabasePathOverride.Path.IsEmpty())
+		{
+			FString OverridePath = Settings->DatabasePathOverride.Path;
+			OverridePath = FPaths::ConvertRelativePathToFull(OverridePath);
+			if (FPaths::GetExtension(OverridePath).Equals(TEXT("db"), ESearchCase::IgnoreCase))
+			{
+				DbPath = OverridePath;
+			}
+			else
+			{
+				DbPath = OverridePath / TEXT("ProjectIndex.db");
+			}
+		}
+		else
+		{
+			TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("Monolith"));
+			DbPath = Plugin.IsValid()
+				? Plugin->GetBaseDir() / TEXT("Saved") / TEXT("ProjectIndex.db")
+				: FPaths::ProjectPluginsDir() / TEXT("Monolith") / TEXT("Saved") / TEXT("ProjectIndex.db");
+		}
+
+		MaterializeDb = MakeUnique<FMonolithIndexDatabase>();
+		if (!MaterializeDb->Open(DbPath))
+		{
+			UE_LOG(LogMonolithIndex, Error,
+				TEXT("Materialize: 打开 SQLite 失败 (%s)，本次 warmup 退化为只写 DDC"), *DbPath);
+			MaterializeDb.Reset();
+		}
+		else
+		{
+			UE_LOG(LogMonolithIndex, Log,
+				TEXT("Materialize: SQLite 已打开 (%s)，build artifact 后会顺手写本地表"), *DbPath);
+		}
+	}
 	const double StartSeconds = FPlatformTime::Seconds();
 	int32 WarmedCount = 0;
 	int32 AttemptedCount = 0;
@@ -473,11 +548,14 @@ int32 UMonolithIndexWarmupCommandlet::Main(const FString& Params)
 			}
 
 			++AttemptedCount;
+			const int64 AssetId = MonolithWarmupCommandletInternal::ResolveAssetIdForMaterialize(MaterializeDb.Get(), AssetData);
 			if (MonolithWarmupCommandletInternal::TryWarmAsset(
 				AssetData,
 				*FoundIndexer,
 				*AssetRegistry,
-				*ArtifactCache))
+				*ArtifactCache,
+				MaterializeDb.Get(),
+				AssetId))
 			{
 				++WarmedCount;
 				CompletedRequests.Add(Request);
@@ -586,11 +664,14 @@ int32 UMonolithIndexWarmupCommandlet::Main(const FString& Params)
 				}
 
 				++AttemptedCount;
+				const int64 AssetId = MonolithWarmupCommandletInternal::ResolveAssetIdForMaterialize(MaterializeDb.Get(), AssetData);
 				if (MonolithWarmupCommandletInternal::TryWarmAsset(
 					AssetData,
 					Indexer,
 					*AssetRegistry,
-					*ArtifactCache))
+					*ArtifactCache,
+					MaterializeDb.Get(),
+					AssetId))
 				{
 					++WarmedCount;
 				}

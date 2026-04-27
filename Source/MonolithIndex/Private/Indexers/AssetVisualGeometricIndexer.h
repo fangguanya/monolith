@@ -37,7 +37,13 @@ public:
 
 	virtual FString GetName() const override { return TEXT("AssetVisualGeometricIndexer"); }
 	virtual FName GetIndexerId() const override { return FName(TEXT("AssetVisualGeometric")); }
-	virtual uint32 GetIndexerVersion() const override { return 1; }
+	// v2: SCS_BaseColor（黑）；v3: unlit show flag（仍黑）；v4: magenta diag —— 验证 scene_proxy=nil
+	// + ClearColor 都没生效，根因是 EditorWorld 在 commandlet 下不能挂 SCC2D。
+	// v5: FPreviewScene（pixel 仍 0，scene_proxy 仍 nil，因为 SendRenderState 没 flush）；
+	// v13: 放弃 commandlet 渲染——已确认 UE 5.7 commandlet 模式无法渲染 mesh/material（无论 SCC2D /
+	// PreviewScene / UThumbnailManager 哪条路）。warmup 必须在编辑器进程里跑（Slate + GUnrealEd 全到位）。
+	// MaterializeAssetVisual console command 同时承担 build + materialize（bAllowLocalArtifactBuild=true）。
+	virtual uint32 GetIndexerVersion() const override { return 13; }
 	virtual uint8 GetArtifactSchemaVersion() const override { return 1; }
 	/** 视觉索引必须由离线 warmup 触发，不参与 live / incremental 同步路径。 */
 	virtual EMonolithExecutionMode GetExecutionMode() const override { return EMonolithExecutionMode::OfflineOnly; }

@@ -11,6 +11,7 @@
 #include "AssetRegistry/AssetData.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
+#include "HAL/ThreadSafeBool.h"
 #include "Materials/MaterialInterface.h"
 #include "WidgetBlueprint.h"
 
@@ -52,10 +53,24 @@ bool FAssetVisualSemanticIndexer::BuildArtifact(
 		FAssetVisualEmbeddingProviderRegistry::Get().FindProvider(ProviderId);
 	if (!Provider.IsValid() || !Provider->IsAvailable())
 	{
-		// Provider 不可用是 spec 一等支持状态：调用方按需把 asset 标 stale，不重试。
-		UE_LOG(LogMonolithIndex, Verbose,
-			TEXT("AssetVisualSemanticIndexer: provider 不可用 (asset=%s)，跳过 artifact 构建"),
-			*AssetData.PackageName.ToString());
+		// Provider 不可用是 spec 一等支持状态（ONNX 缺失 / NNE 不可用），不阻塞 geometric。
+		// 但 24233 个资产全部静默 false 调试不友好——首次命中时打 Warning 让人立刻看到根因。
+		// 之后单 process 内重复命中只在 Verbose 打日志，避免刷屏。
+		static FThreadSafeBool bUnavailableWarned = false;
+		if (!bUnavailableWarned.AtomicSet(true))
+		{
+			UE_LOG(LogMonolithIndex, Warning,
+				TEXT("AssetVisualSemanticIndexer: clip_vit_b32_v1 provider 不可用，整 cohort 跳过；"
+				     "请检查 Plugins/Monolith/Resources/Models/clip_vit_b32_image_encoder_fp16.onnx 是否就位 + NNERuntimeORT 是否启用。"
+				     "首个命中资产: %s"),
+				*AssetData.PackageName.ToString());
+		}
+		else
+		{
+			UE_LOG(LogMonolithIndex, Verbose,
+				TEXT("AssetVisualSemanticIndexer: provider 不可用 (asset=%s)，跳过"),
+				*AssetData.PackageName.ToString());
+		}
 		return false;
 	}
 

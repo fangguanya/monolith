@@ -137,7 +137,13 @@ bool FClipSemanticEmbeddingProvider::IsAvailable() const
 	{
 		return false;
 	}
-	// 模型未加载成功就不可用；调用 Encode 时会触发 LoadModelIfNeeded 一次。
+
+	// 主动触发一次 LoadModelIfNeeded：原本它只在 Encode 第一次调时才 lazy load，
+	// 但 indexer 流程是 IsAvailable 为 true 才进 Encode → 形成 chicken-and-egg：
+	// 永远不 Encode → 永远不 load → IsAvailable 永远 false → 整 cohort 静默 stale。
+	// 这里 const_cast 是因为接口 const 但 LoadModelIfNeeded 走 mutex 内部修改私有状态。
+	const_cast<FClipSemanticEmbeddingProvider*>(this)->LoadModelIfNeeded();
+
 	FScopeLock Lock(&LoadMutex);
 	return bLoadAttempted && bLoadSucceeded;
 }

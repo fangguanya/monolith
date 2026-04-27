@@ -672,6 +672,8 @@ public:
 	// --- Mesh visual CRUD（双 cohort 共享同套接口，按 CohortName 落到不同物理表）---
 	/** 把一行视觉 cohort 数据写入 production 表。CohortName 必须是 `AssetVisualGeometric` 或 `AssetVisualSemantic`。 */
 	int64 InsertAssetVisualEntry(const FString& CohortName, const FIndexedAssetVisualEntry& Entry);
+	/** 清空整张视觉 cohort production 表（不删 shadow）。Materialize 重跑前先清，避免 INSERT 累加。 */
+	bool ClearAssetVisualEntries(const FString& CohortName);
 	/** 读取某资产当前可见 revision 下的视觉行；不存在时返回空。 */
 	TOptional<FIndexedAssetVisualEntry> GetAssetVisualEntryForAsset(const FString& CohortName, int64 AssetId);
 	/** 读取整张视觉 cohort 表，可选按 ShardId 过滤；用于 shard reducer 重建 ANN 快照。 */

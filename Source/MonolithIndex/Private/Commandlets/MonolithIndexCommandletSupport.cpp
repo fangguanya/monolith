@@ -154,6 +154,8 @@ bool ShouldMonolithCommandletBypassLocalSqlite(const FString& CommandletName)
 {
 	// 这里集中列出需要“绕过本地 SQLite 常规路径”的 commandlet 名单。
 	// 这样以后新增命令时，只改这一处就够了。
+	// 注：warmup commandlet 自己在收到 -Materialize 时会直接开一份 DB 连接写表，
+	// 不依赖这里的 bypass 决策；subsystem 永远跳过 DB 即可。
 	return CommandletName.Equals(TEXT("MonolithIndexWarmup"), ESearchCase::IgnoreCase)
 		|| CommandletName.Equals(TEXT("MonolithIdentityPoc"), ESearchCase::IgnoreCase)
 		|| CommandletName.EndsWith(TEXT("MonolithIndexWarmup"), ESearchCase::IgnoreCase)

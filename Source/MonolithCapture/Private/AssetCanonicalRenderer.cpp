@@ -16,8 +16,14 @@
 #include "Math/Box.h"
 #include "Math/Vector.h"
 #include "Modules/ModuleManager.h"
+#include "AssetCompilingManager.h"
+#include "CanvasTypes.h"
+#include "PreviewScene.h"
 #include "RenderingThread.h"
+#include "ThumbnailRendering/ThumbnailManager.h"
+#include "ThumbnailRendering/ThumbnailRenderer.h"
 #include "ShaderCompiler.h"
+#include "Framework/Application/SlateApplication.h"
 #include "Slate/WidgetRenderer.h"
 #include "WidgetBlueprint.h"
 
@@ -58,8 +64,12 @@ namespace MonolithCaptureRendererInternal
 	 * - 任一资产类型的渲染管线细节（material 球体 / widget 背景色 / skel 默认 pose）
 	 *
 	 * v2 = mesh + skel + material + widget 全部接通；与 v1 单 mesh 不兼容，整库 stale。
+	 * v3 = capture mode 由 SCS_FinalToneCurveHDR 切到 SCS_BaseColor，避免 commandlet 模式下
+	 *      没光照导致整图全黑、Geometric embedding 全 0 的 bug。所有像素值都会变，整库必须 stale。
+	 * v4 = SCS_BaseColor 在 commandlet world 下也是黑（GBuffer 没 prime）。改用
+	 *      SCS_FinalColorLDR + ShowFlags.SetLighting(false) 走 unlit 路径直出 base color。
 	 */
-	static constexpr uint32 RenderRecipeVersion = 2;
+	static constexpr uint32 RenderRecipeVersion = 4;
 
 	/** canonical 相机 FOV 固定为 35 度，给资产留足 framing 余量。 */
 	static constexpr float CanonicalFovDegrees = 35.0f;
@@ -145,7 +155,13 @@ namespace MonolithCaptureRendererInternal
 	}
 
 	/** 把任意 UPrimitiveComponent（实际只用于 Static / Skel / Material）通过 SCC2D 渲染到内存图像。
-	 *  这是 mesh / skel / material 三条管线共用的"最后一公里"。 */
+	 *  这是 mesh / skel / material 三条管线共用的"最后一公里"。
+	 *
+	 *  历史踩坑：原本 register component 到 GEditor->GetEditorWorldContext().World()，
+	 *  在 commandlet 模式下 component->GetSceneProxy() 永远是 nil（已通过诊断证实），
+	 *  捕获结果是全黑 RT（连 ClearColor 都没生效）。
+	 *  正解：用 FPreviewScene —— 这是 UE 自己的 thumbnail / asset preview 用的 minimal scene，
+	 *  自带 directional + sky light 和真正可工作的 FScene，commandlet 也支持。 */
 	static bool RenderPrimitiveComponentToImage(
 		UPrimitiveComponent* PrimitiveComp,
 		const FVector& CameraLocation,
@@ -153,11 +169,50 @@ namespace MonolithCaptureRendererInternal
 		const int32 Resolution,
 		FImage& OutImage)
 	{
-		UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+		FPreviewScene::ConstructionValues PSCV;
+		PSCV.bAllowAudioPlayback = false;
+		PSCV.bForceMipsResident = true;
+		FPreviewScene PreviewScene(PSCV);
+		UWorld* World = PreviewScene.GetWorld();
 		if (!World)
 		{
-			UE_LOG(LogMonolithCapture, Error, TEXT("RenderPrimitiveComponentToImage: 编辑器世界不可用"));
+			UE_LOG(LogMonolithCapture, Error, TEXT("RenderPrimitiveComponentToImage: PreviewScene world 创建失败"));
 			return false;
+		}
+
+		// 关键：先等所有 asset compile（StaticMesh / Shader / Texture）完成。
+		// UStaticMeshComponent::ShouldCreateRenderState() 在 StaticMesh->IsCompiling() 时返回 false，
+		// 不等编译完直接 register 出来的 component 不会创建 scene proxy。
+		FAssetCompilingManager::Get().FinishAllCompilation();
+
+		// 显式 RegisterComponentWithWorld(PreviewScene 的 World)。FPreviewScene::AddComponent
+		// 调的是 Comp->RegisterComponent()（无 World 参），靠 Comp->GetWorld() 推断；
+		// 但我们的 Comp 创建于 TransientPackage 没 World，会注册失败。
+		PrimitiveComp->RegisterComponentWithWorld(World);
+		PreviewScene.AddComponent(PrimitiveComp, FTransform::Identity);
+
+		// 关键：register 后 scene proxy 是 enqueue 给 render thread 创建的。
+		// 不 flush 直接调 GetSceneProxy() 永远是 nullptr。
+		// 先 MarkRenderStateDirty 触发 SendRenderState，然后 flush 让 render thread 完成 CreateSceneProxy。
+		PrimitiveComp->MarkRenderStateDirty();
+		World->SendAllEndOfFrameUpdates();
+		FlushRenderingCommands();
+
+		// 一次诊断：commandlet 下到底允不允许 render，以及 component 状态。
+		static FThreadSafeCounter PreFlushDiagCounter;
+		const int32 PreDiagIdx = PreFlushDiagCounter.Increment();
+		if (PreDiagIdx <= 5)
+		{
+			UE_LOG(LogMonolithCapture, Log,
+				TEXT("RenderPrimitiveComponentToImage pre-capture #%d: CanEverRender=%s IsAllowCommandletRendering=%s "
+				     "Comp registered=%s ShouldRender=%s scene_proxy=%s World->Scene=%s"),
+				PreDiagIdx,
+				FApp::CanEverRender() ? TEXT("yes") : TEXT("NO"),
+				IsAllowCommandletRendering() ? TEXT("yes") : TEXT("NO"),
+				PrimitiveComp->IsRegistered() ? TEXT("yes") : TEXT("NO"),
+				PrimitiveComp->ShouldRender() ? TEXT("yes") : TEXT("NO"),
+				PrimitiveComp->GetSceneProxy() ? TEXT("yes") : TEXT("nil"),
+				World->Scene ? TEXT("yes") : TEXT("NIL"));
 		}
 
 		UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
@@ -173,13 +228,15 @@ namespace MonolithCaptureRendererInternal
 		SCC->bCaptureEveryFrame = false;
 		SCC->bCaptureOnMovement = false;
 		SCC->TextureTarget = RT;
-		SCC->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
+		// FPreviewScene 自带 light，可以走完整 lit 路径。SCS_FinalColorLDR + 默认 lighting 即可。
+		SCC->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
 		SCC->ProjectionType = ECameraProjectionMode::Perspective;
 		SCC->FOVAngle = CanonicalFovDegrees;
 
 		SCC->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
 		SCC->ShowOnlyComponents.Add(PrimitiveComp);
 
+		// 关掉外部光环境，避免不同项目的天气 / 大气贡献污染 cohort hash。
 		SCC->ShowFlags.SetAtmosphere(false);
 		SCC->ShowFlags.SetFog(false);
 		SCC->ShowFlags.SetVolumetricFog(false);
@@ -191,8 +248,7 @@ namespace MonolithCaptureRendererInternal
 		SCC->PostProcessSettings.AutoExposureBias = 0.0f;
 		SCC->PostProcessBlendWeight = 1.0f;
 
-		SCC->RegisterComponentWithWorld(World);
-		SCC->SetWorldLocationAndRotation(CameraLocation, CameraRotation);
+		PreviewScene.AddComponent(SCC, FTransform(CameraRotation, CameraLocation));
 
 		// 双次 CaptureScene + FinishAllCompilation 保证 shader 编译完成，避免拿到 fallback 材质。
 		if (GShaderCompilingManager)
@@ -214,8 +270,6 @@ namespace MonolithCaptureRendererInternal
 		if (!RTResource)
 		{
 			UE_LOG(LogMonolithCapture, Error, TEXT("RenderPrimitiveComponentToImage: RenderTarget 资源为空"));
-			SCC->TextureTarget = nullptr;
-			SCC->UnregisterComponent();
 			return false;
 		}
 
@@ -223,13 +277,29 @@ namespace MonolithCaptureRendererInternal
 		if (!RTResource->ReadPixels(Pixels) || Pixels.Num() != Resolution * Resolution)
 		{
 			UE_LOG(LogMonolithCapture, Error, TEXT("RenderPrimitiveComponentToImage: ReadPixels 失败"));
-			SCC->TextureTarget = nullptr;
-			SCC->UnregisterComponent();
 			return false;
 		}
 
 		OutImage.Init(Resolution, Resolution, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
 		FMemory::Memcpy(OutImage.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+
+		// 诊断日志：dump 中心 pixel 值 + 非零 pixel 数量。仅前 20 次 capture 打日志。
+		static FThreadSafeCounter DiagCounter;
+		const int32 DiagIdx = DiagCounter.Increment();
+		if (DiagIdx <= 20)
+		{
+			const int32 Center = (Resolution / 2) * Resolution + (Resolution / 2);
+			const FColor C = Pixels[Center];
+			int32 NonZeroCount = 0;
+			for (const FColor& P : Pixels)
+			{
+				if (P.R != 0 || P.G != 0 || P.B != 0) ++NonZeroCount;
+			}
+			UE_LOG(LogMonolithCapture, Log,
+				TEXT("RenderPrimitiveComponentToImage diag #%d: center BGRA=(%u,%u,%u,%u) non_zero_pixels=%d / %d  scene_proxy=%s"),
+				DiagIdx, C.B, C.G, C.R, C.A, NonZeroCount, Pixels.Num(),
+				PrimitiveComp->GetSceneProxy() ? TEXT("yes") : TEXT("nil"));
+		}
 
 		SCC->TextureTarget = nullptr;
 		SCC->UnregisterComponent();
@@ -319,15 +389,15 @@ namespace MonolithCaptureRendererInternal
 
 		return RenderMeshLikePipeline<UStaticMeshComponent>(
 			World,
-			[World, PreviewMesh, Material]() -> UStaticMeshComponent*
+			[PreviewMesh, Material]() -> UStaticMeshComponent*
 			{
+				// 不预 register；让 Render 内部 PreviewScene.AddComponent 唯一注册。
 				UStaticMeshComponent* Comp = NewObject<UStaticMeshComponent>(GetTransientPackage(), NAME_None, RF_Transient);
 				Comp->SetStaticMesh(PreviewMesh);
 				Comp->SetMaterial(0, Material);
 				Comp->CastShadow = false;
 				Comp->bCastDynamicShadow = false;
 				Comp->SetMobility(EComponentMobility::Movable);
-				Comp->RegisterComponentWithWorld(World);
 				return Comp;
 			},
 			[](UStaticMeshComponent* Comp) -> FBoxSphereBounds
@@ -441,81 +511,104 @@ namespace MonolithCaptureRendererInternal
 				return false;
 			}
 
-			UWorld* World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
-			if (!World)
+			// v11 实现策略：放弃 4 类 SCC2D pipeline，直接用 UE 自己的 UThumbnailManager。
+			// SCC2D 在 commandlet 模式下注册的 component 永远拿不到 scene proxy（确认过 v6..v10 各种 fix 都不奏效）。
+			// UThumbnailManager + UThumbnailRenderer 是 UE 自己 cook / project browser 用的标准 thumbnail 路径，
+			// 已知在 commandlet（含 ResavePackages cook 阶段）正常工作，并对每种 asset 类自动选合适的 renderer
+			// （UStaticMeshThumbnailRenderer / UMaterialThumbnailRenderer / USkeletalMeshThumbnailRenderer / UWidgetBlueprintThumbnailRenderer）。
+			//
+			// 这等于让 UE 替我们处理"4 类资产分发 + scene proxy 创建 + lighting + framing"。
+			// 代价：framing 是 thumbnail manager 默认的（不是我们之前自定义的 35° FOV / 2.6× 距离），
+			// 跨 cohort 一致性靠它本身的稳定性即可。
+
+			if (!GIsRHIInitialized)
 			{
-				UE_LOG(LogMonolithCapture, Error, TEXT("RenderCanonical: 编辑器世界不可用"));
+				UE_LOG(LogMonolithCapture, Error, TEXT("RenderCanonical: RHI 未初始化"));
 				return false;
 			}
 
-			// 视图集合空时退化为只渲染 Iso 一张，配合 semantic provider 默认行为。
-			FCanonicalRenderRequest EffectiveRequest = Request;
-			if (EffectiveRequest.Views.Num() == 0)
+			// 用 UThumbnailManager::Get() 静态访问，绕开 GUnrealEd（commandlet 模式 GUnrealEd 是 nil）。
+			UThumbnailManager* TM = UThumbnailManager::TryGet();
+			if (!TM)
 			{
-				EffectiveRequest.Views.Add(ECanonicalView::Iso);
+				UE_LOG(LogMonolithCapture, Error, TEXT("RenderCanonical: UThumbnailManager 未就绪"));
+				return false;
 			}
 
-			// 按运行时类型分发到对应管线。
-			// 顺序：从最具体到最通用，避免父类 Cast 误命中。
-			if (UStaticMesh* StaticMesh = Cast<UStaticMesh>(EffectiveRequest.Asset))
+			FThumbnailRenderingInfo* RenderInfo = TM->GetRenderingInfo(Request.Asset);
+			if (!RenderInfo || !RenderInfo->Renderer)
 			{
-				return RenderMeshLikePipeline<UStaticMeshComponent>(
-					World,
-					[World, StaticMesh]() -> UStaticMeshComponent*
-					{
-						UStaticMeshComponent* Comp = NewObject<UStaticMeshComponent>(GetTransientPackage(), NAME_None, RF_Transient);
-						Comp->SetStaticMesh(StaticMesh);
-						Comp->CastShadow = false;
-						Comp->bCastDynamicShadow = false;
-						Comp->SetMobility(EComponentMobility::Movable);
-						Comp->RegisterComponentWithWorld(World);
-						return Comp;
-					},
-					[StaticMesh](UStaticMeshComponent*) -> FBoxSphereBounds
-					{
-						return StaticMesh->GetBounds();
-					},
-					EffectiveRequest,
-					OutResults);
+				UE_LOG(LogMonolithCapture, Verbose,
+					TEXT("RenderCanonical: 资产 %s 无注册 thumbnail renderer，跳过"),
+					*Request.Asset->GetPathName());
+				return false;
 			}
 
-			if (USkeletalMesh* SkelMesh = Cast<USkeletalMesh>(EffectiveRequest.Asset))
+			// 等所有 asset 编译完成（mesh / shader / texture）。这是 ThumbnailManager 自己也用的 prep 路径。
+			FAssetCompilingManager::Get().FinishAllCompilation();
+
+			// 创建临时 RT；用 manager 自己 RTPool 也行但每次新建更隔离。
+			UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(GetTransientPackage(), NAME_None, RF_Transient);
+			RT->InitCustomFormat(Request.Resolution, Request.Resolution, PF_B8G8R8A8, /*bForceLinearGamma=*/false);
+			RT->ClearColor = FLinearColor::Black;
+			RT->TargetGamma = 2.2f;
+			RT->UpdateResourceImmediate(true);
+
+			FTextureRenderTargetResource* RTResource = RT->GameThread_GetRenderTargetResource();
+			if (!RTResource)
 			{
-				return RenderMeshLikePipeline<USkeletalMeshComponent>(
-					World,
-					[World, SkelMesh]() -> USkeletalMeshComponent*
-					{
-						USkeletalMeshComponent* Comp = NewObject<USkeletalMeshComponent>(GetTransientPackage(), NAME_None, RF_Transient);
-						Comp->SetSkeletalMeshAsset(SkelMesh);
-						Comp->CastShadow = false;
-						Comp->bCastDynamicShadow = false;
-						Comp->SetMobility(EComponentMobility::Movable);
-						// 用 ref pose；不播任何动画，保证 cohort 内同资产跨次渲染 bit-identical。
-						Comp->RegisterComponentWithWorld(World);
-						return Comp;
-					},
-					[SkelMesh](USkeletalMeshComponent*) -> FBoxSphereBounds
-					{
-						return SkelMesh->GetBounds();
-					},
-					EffectiveRequest,
-					OutResults);
+				UE_LOG(LogMonolithCapture, Error, TEXT("RenderCanonical: RT 资源为空"));
+				return false;
 			}
 
-			if (UMaterialInterface* Material = Cast<UMaterialInterface>(EffectiveRequest.Asset))
+			// 与 ObjectTools::RenderThumbnail（UE 自己的 thumbnail save 路径）行为完全一致：
+			FCanvas Canvas(RTResource, nullptr, FGameTime::GetTimeSinceAppStart(), GMaxRHIFeatureLevel);
+			Canvas.Clear(FLinearColor::Black);
+
+			// 抑制 thumbnail renderer 内部可能弹出的 message dialog（commandlet 模式致命）。
+			TGuardValue<bool> Unattended(GIsRunningUnattendedScript, true);
+			RenderInfo->Renderer->Draw(
+				Request.Asset, 0, 0, Request.Resolution, Request.Resolution,
+				RTResource, &Canvas, /*bAdditionalViewFamily=*/false);
+			Canvas.Flush_GameThread();
+			FlushRenderingCommands();
+
+			TArray<FColor> Pixels;
+			if (!RTResource->ReadPixels(Pixels) || Pixels.Num() != Request.Resolution * Request.Resolution)
 			{
-				return RenderMaterialPipeline(World, Material, EffectiveRequest, OutResults);
+				UE_LOG(LogMonolithCapture, Error, TEXT("RenderCanonical: ReadPixels 失败"));
+				return false;
 			}
 
-			if (UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(EffectiveRequest.Asset))
+			// 诊断日志：前 5 次打中心 pixel 和非零数。
+			static FThreadSafeCounter ThumbnailDiagCounter;
+			const int32 DiagIdx = ThumbnailDiagCounter.Increment();
+			if (DiagIdx <= 5)
 			{
-				return RenderWidgetPipeline(World, WidgetBP, EffectiveRequest, OutResults);
+				const int32 Center = (Request.Resolution / 2) * Request.Resolution + (Request.Resolution / 2);
+				const FColor C = Pixels[Center];
+				int32 NonZero = 0;
+				for (const FColor& P : Pixels)
+				{
+					if (P.R != 0 || P.G != 0 || P.B != 0) ++NonZero;
+				}
+				UE_LOG(LogMonolithCapture, Log,
+					TEXT("RenderCanonical thumbnail diag #%d: asset=%s class=%s center BGRA=(%u,%u,%u,%u) non_zero=%d / %d"),
+					DiagIdx, *Request.Asset->GetName(), *Request.Asset->GetClass()->GetName(),
+					C.B, C.G, C.R, C.A, NonZero, Pixels.Num());
 			}
 
-			UE_LOG(LogMonolithCapture, Error,
-				TEXT("RenderCanonical: 不支持的资产类型 %s（仅支持 StaticMesh / SkeletalMesh / MaterialInterface / WidgetBlueprint）"),
-				*EffectiveRequest.Asset->GetClass()->GetName());
-			return false;
+			// 装配 OutResult；只产 Iso 一张视图（thumbnail manager 不支持 5 视图，warmup 流程 spec 也只要 Iso）。
+			FCanonicalRenderResult Result;
+			Result.View = ECanonicalView::Iso;
+			Result.ColorImage.Init(Request.Resolution, Request.Resolution, ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+			FMemory::Memcpy(Result.ColorImage.RawData.GetData(), Pixels.GetData(), Pixels.Num() * sizeof(FColor));
+			if (Request.bComputeSilhouette)
+			{
+				BuildSilhouette(Result.ColorImage, Result.SilhouetteImage);
+			}
+			OutResults.Add(MoveTemp(Result));
+			return true;
 		}
 
 		virtual bool SaveImageAsPng(const FImage& Image, const FString& OutputPath) override

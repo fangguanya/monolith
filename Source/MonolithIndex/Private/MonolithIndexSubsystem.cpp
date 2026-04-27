@@ -557,6 +557,18 @@ struct FMonolithIndexConsoleCommands
 
 		UE_LOG(LogMonolithIndex, Warning, TEXT("Monolith.StartIndex received unknown mode '%s'; supported modes are auto, full, incremental"), *Mode);
 	}
+
+	static void MaterializeAssetVisual(const TArray<FString>& /*Args*/, UWorld* /*World*/)
+	{
+		UMonolithIndexSubsystem* const Subsystem = GetSubsystem();
+		if (!Subsystem)
+		{
+			UE_LOG(LogMonolithIndex, Error,
+				TEXT("Monolith.MaterializeAssetVisual: subsystem unavailable"));
+			return;
+		}
+		Subsystem->MaterializeAssetVisualFromCache();
+	}
 };
 
 namespace
@@ -565,6 +577,11 @@ namespace
 		TEXT("Monolith.StartIndex"),
 		TEXT("Manually start Monolith indexing. Usage: Monolith.StartIndex [auto|full|incremental]. Full indexing only runs from this manual command."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FMonolithIndexConsoleCommands::StartIndex));
+
+	static FAutoConsoleCommandWithWorldAndArgs GMonolithMaterializeAssetVisualCommand(
+		TEXT("Monolith.MaterializeAssetVisual"),
+		TEXT("Materialize AssetVisual* artifacts from DDC into local SQLite tables (warmup commandlet pre-fills DDC; this writes to DB)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FMonolithIndexConsoleCommands::MaterializeAssetVisual));
 }
 
 UMonolithIndexSubsystem::UMonolithIndexSubsystem() = default;
@@ -2784,6 +2801,251 @@ TSharedPtr<IMonolithIndexer> UMonolithIndexSubsystem::FindIndexerById(const FNam
 	}
 
 	return nullptr;
+}
+
+void UMonolithIndexSubsystem::MaterializeAssetVisualFromCache()
+{
+	check(IsInGameThread());
+
+	if (!Database.IsValid() || !Database->IsOpen() || !ArtifactCache.IsValid())
+	{
+		UE_LOG(LogMonolithIndex, Warning,
+			TEXT("MaterializeAssetVisualFromCache: DB / ArtifactCache 未就绪"));
+		return;
+	}
+
+	const TArray<FName> CohortIds = {
+		FName(TEXT("AssetVisualGeometric")),
+		FName(TEXT("AssetVisualSemantic")),
+	};
+
+	IAssetRegistry& AssetRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+
+	for (const FName CohortId : CohortIds)
+	{
+		const TSharedPtr<IMonolithIndexer> Indexer = FindIndexerById(CohortId);
+		if (!Indexer.IsValid())
+		{
+			UE_LOG(LogMonolithIndex, Warning,
+				TEXT("MaterializeAssetVisualFromCache: indexer %s 未注册（settings 关了？），跳过"),
+				*CohortId.ToString());
+			continue;
+		}
+
+		// 不再无脑清表。改为 resume 模式：跳过已经在 SQLite 里有非零 embedding 的资产。
+		// 上一轮跑了部分（比如 sem 卡在 15736）就接着跑剩下的，不重做。
+		// 哪些算"已完成"：cohort 表里有该 asset_id 的行，且 embedding_bytes 非全零。
+		const FString CohortName = CohortId.ToString();
+		TSet<int64> AlreadyDoneAssetIds;
+		{
+			FScopeLock Lock(&DatabaseAccessMutex);
+			const TArray<FIndexedAssetVisualEntry> Existing = Database->GetAssetVisualEntries(CohortName, FString());
+			for (const FIndexedAssetVisualEntry& E : Existing)
+			{
+				bool bAllZero = true;
+				for (const uint8 B : E.EmbeddingBytes)
+				{
+					if (B != 0) { bAllZero = false; break; }
+				}
+				if (!bAllZero && E.AssetId > 0)
+				{
+					AlreadyDoneAssetIds.Add(E.AssetId);
+				}
+			}
+		}
+
+		// 加载崩溃跳过名单。某资产 thumbnail render 在 render thread 直接 crash 整个进程，
+		// 重跑时直接跳过名单里的资产，避免每次都崩在同一个上。
+		const FString SkipListPath = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MonolithIndex"), TEXT("visual_render_skip.txt"));
+		TSet<FString> SkipPackagePaths;
+		{
+			TArray<FString> Lines;
+			FFileHelper::LoadFileToStringArray(Lines, *SkipListPath);
+			for (FString& L : Lines)
+			{
+				L.TrimStartAndEndInline();
+				if (!L.IsEmpty())
+				{
+					SkipPackagePaths.Add(MoveTemp(L));
+				}
+			}
+		}
+
+		// 收集 indexer 支持的所有 AssetData。
+		TArray<FAssetData> Candidates;
+		for (const FString& ClassName : Indexer->GetSupportedClasses())
+		{
+			TArray<FAssetData> ClassAssets;
+			AssetRegistry.GetAssetsByClass(FTopLevelAssetPath(TEXT("/Script/Engine"), FName(*ClassName)), ClassAssets, true);
+			Candidates.Append(MoveTemp(ClassAssets));
+			TArray<FAssetData> UmgClassAssets;
+			AssetRegistry.GetAssetsByClass(FTopLevelAssetPath(TEXT("/Script/UMGEditor"), FName(*ClassName)), UmgClassAssets, true);
+			Candidates.Append(MoveTemp(UmgClassAssets));
+		}
+
+		// 去重。同一资产在不同 class lookup 下可能重复。
+		TSet<FName> Seen;
+		Candidates.RemoveAll([&Seen](const FAssetData& A)
+		{
+			bool bAlready = false;
+			Seen.Add(A.PackageName, &bAlready);
+			return bAlready;
+		});
+
+		int32 Materialized = 0;
+		int32 CacheMiss = 0;
+		int32 Failed = 0;
+		int32 Resumed = 0;
+		int32 Skipped = 0;
+		int32 Processed = 0;
+		const int32 Total = Candidates.Num();
+		const double StartSec = FPlatformTime::Seconds();
+
+		UE_LOG(LogMonolithIndex, Log,
+			TEXT("MaterializeAssetVisualFromCache: %s 准备扫 %d 个支持类资产 (already_done=%d skip_list=%d)..."),
+			*CohortName, Total, AlreadyDoneAssetIds.Num(), SkipPackagePaths.Num());
+
+		// 把当前正在处理的 asset path 写到 marker 文件，崩溃后下次启动可以读取并加入 skip list。
+		const FString InFlightMarkerPath = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MonolithIndex"),
+			FString::Printf(TEXT("visual_render_inflight_%s.txt"), *CohortName));
+
+		// 启动时如果有上次崩溃的 marker，把那个 asset 加到 skip list。
+		{
+			FString CrashedAtPath;
+			if (FFileHelper::LoadFileToString(CrashedAtPath, *InFlightMarkerPath))
+			{
+				CrashedAtPath.TrimStartAndEndInline();
+				if (!CrashedAtPath.IsEmpty())
+				{
+					UE_LOG(LogMonolithIndex, Warning,
+						TEXT("MaterializeAssetVisualFromCache: %s 上次卡在 %s 后崩溃，加入跳过名单"),
+						*CohortName, *CrashedAtPath);
+					SkipPackagePaths.Add(CrashedAtPath);
+					// 立刻 append 到 skip 文件。
+					FString CurrentSkipBlob;
+					FFileHelper::LoadFileToString(CurrentSkipBlob, *SkipListPath);
+					if (!CurrentSkipBlob.EndsWith(TEXT("\n")))
+					{
+						CurrentSkipBlob += TEXT("\n");
+					}
+					CurrentSkipBlob += CrashedAtPath + TEXT("\n");
+					FFileHelper::SaveStringToFile(CurrentSkipBlob, *SkipListPath);
+				}
+			}
+		}
+
+		for (const FAssetData& AssetData : Candidates)
+		{
+			// 解析 / 创建 AssetId（main assets 表里没行就插一条最小记录）。
+			const FString PackagePath = AssetData.PackageName.ToString();
+
+			if (SkipPackagePaths.Contains(PackagePath))
+			{
+				++Skipped;
+				continue;
+			}
+
+			int64 AssetId = 0;
+			{
+				FScopeLock Lock(&DatabaseAccessMutex);
+				const TOptional<FIndexedAsset> Existing = Database->GetAssetByPath(PackagePath);
+				if (Existing.IsSet())
+				{
+					AssetId = Existing.GetValue().Id;
+				}
+				else
+				{
+					FIndexedAsset Record = MonolithIndexInternal::BuildIndexedAssetRecord(AssetData, IndexedPlugins, /*PackageHashes=*/nullptr);
+					AssetId = Database->InsertAsset(Record);
+				}
+			}
+			if (AssetId <= 0)
+			{
+				++Failed;
+				continue;
+			}
+
+			// resume：跳过已经有非零 embedding 的资产。
+			if (AlreadyDoneAssetIds.Contains(AssetId))
+			{
+				++Resumed;
+				continue;
+			}
+
+			++Processed;
+
+			// 写 in-flight marker，崩溃后下次启动从这里恢复。
+			FFileHelper::SaveStringToFile(PackagePath, *InFlightMarkerPath);
+
+			// 进度日志（每 200 个）+ 中途 GC 防 transient 累积爆内存。
+			if (Processed % 200 == 0)
+			{
+				const double Elapsed = FPlatformTime::Seconds() - StartSec;
+				const float Speed = static_cast<float>(Processed) / FMath::Max(1.0, Elapsed);
+				UE_LOG(LogMonolithIndex, Log,
+					TEXT("MaterializeAssetVisualFromCache: %s 进度 %d/%d (%.1fs, %.1f/s) materialized=%d failed=%d resumed=%d skipped=%d, GC..."),
+					*CohortName, Processed, Total, Elapsed, Speed, Materialized, Failed, Resumed, Skipped);
+				CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS, /*bPerformFullPurge=*/false);
+			}
+
+			MonolithAssetArtifactPipeline::FExecuteAssetOptions Options;
+			Options.RequestMode = EMonolithArtifactCacheRequestMode::Background;
+			// 编辑器模式下允许本地 build：commandlet 模式 UE 渲染管线全断（SCC2D / PreviewScene /
+			// UThumbnailManager 各种路都返回全黑帧），实测唯一可工作的是 editor process 全 boot 起来
+			// 走完整 Slate + RHI + GUnrealEd 路径。
+			Options.bAllowLocalArtifactBuild = true;
+			Options.bMaterializeProduction = true;
+			Options.AssetId = AssetId;
+
+			MonolithAssetArtifactPipeline::FExecuteAssetResult Result;
+			const MonolithAssetArtifactPipeline::EExecuteAssetOutcome Outcome =
+				MonolithAssetArtifactPipeline::ExecuteAssetIndexerArtifact(
+					AssetData,
+					/*LoadedAsset=*/nullptr,
+					[AssetData]() -> UObject*
+					{
+						// cache miss 时才真加载（贵）；命中直接走 metadata。
+						return AssetData.GetAsset();
+					},
+					*Indexer,
+					ArtifactCache.Get(),
+					Database.Get(),
+					Options,
+					Result);
+
+			switch (Outcome)
+			{
+			case MonolithAssetArtifactPipeline::EExecuteAssetOutcome::Succeeded:
+				if (Result.bMaterializedProduction)
+				{
+					++Materialized;
+				}
+				else
+				{
+					++Failed;
+				}
+				break;
+			case MonolithAssetArtifactPipeline::EExecuteAssetOutcome::NeedsLocalBuild:
+				++CacheMiss;
+				break;
+			case MonolithAssetArtifactPipeline::EExecuteAssetOutcome::Failed:
+			default:
+				++Failed;
+				break;
+			}
+
+			// 这一帧成功了，清掉 in-flight marker，下次重启不算崩溃。
+			IFileManager::Get().Delete(*InFlightMarkerPath, /*bRequireExists=*/false, /*bEvenIfReadOnly=*/false, /*bQuiet=*/true);
+		}
+
+		// 全 cohort 跑完，清 in-flight marker。
+		IFileManager::Get().Delete(*InFlightMarkerPath, /*bRequireExists=*/false, /*bEvenIfReadOnly=*/false, /*bQuiet=*/true);
+
+		UE_LOG(LogMonolithIndex, Log,
+			TEXT("MaterializeAssetVisualFromCache: %s 完成: total=%d processed=%d materialized=%d resumed=%d skipped=%d cache_miss=%d failed=%d"),
+			*CohortName, Total, Processed, Materialized, Resumed, Skipped, CacheMiss, Failed);
+	}
 }
 
 void UMonolithIndexSubsystem::RecordSuccessfulAssetIndex(

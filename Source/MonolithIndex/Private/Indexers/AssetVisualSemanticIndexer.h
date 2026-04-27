@@ -34,7 +34,8 @@ public:
 
 	virtual FString GetName() const override { return TEXT("AssetVisualSemanticIndexer"); }
 	virtual FName GetIndexerId() const override { return FName(TEXT("AssetVisualSemantic")); }
-	virtual uint32 GetIndexerVersion() const override { return 1; }
+	// v13: 与 Geometric 同步，editor 进程 build + materialize。
+	virtual uint32 GetIndexerVersion() const override { return 13; }
 	virtual uint8 GetArtifactSchemaVersion() const override { return 1; }
 	virtual EMonolithExecutionMode GetExecutionMode() const override { return EMonolithExecutionMode::OfflineOnly; }
 

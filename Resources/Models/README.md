@@ -26,7 +26,24 @@ Material / WidgetBlueprint 4 类资产），用于 `asset.search_assets_by_image
 1. 把新 ONNX 文件覆写到 `clip_vit_b32_image_encoder_fp16.onnx`
 2. 重启编辑器（或 `MonolithSettings` 触发 reload）
 3. 验证 `Monolith.Index.AssetVisual.Semantic.ProviderHashBoundToOnnx` 自动化测试通过
-4. 跑一次 `MonolithIndexWarmupCommandlet -Scope=Cohort:AssetVisualSemantic` 重建索引
+4. 在编辑器 console 跑 `Monolith.MaterializeAssetVisual` 重建（**不要**跑 commandlet）
+
+## ⚠️ AssetVisual 渲染必须在编辑器进程内跑（不能用 commandlet）
+
+实测 UE 5.7 commandlet 模式下 `SCC2D` / `FPreviewScene` / `UThumbnailManager` 任何路径都拿不到
+scene proxy（即使加了 `-AllowCommandletRendering`），渲染产出全黑帧 → embedding 全 0。
+
+**正确流程**：
+1. 启动 editor（不要用 `warmup_assetvisual.bat`，那是 commandlet 路径）
+2. console 输入 `Monolith.MaterializeAssetVisual`
+3. 等到 console 输出 `MaterializeAssetVisualFromCache: ... 完成: ...`
+
+**`MaterializeAssetVisualFromCache` 内置自我保护**：
+- **resume**：已经有非零 embedding 的 asset 直接跳过（中途崩了重跑不会重做）
+- **崩溃 skip list**：写 `Saved/MonolithIndex/visual_render_inflight_*.txt`，崩溃后下次启动自动加入
+  `Saved/MonolithIndex/visual_render_skip.txt` 永久跳过那个 asset
+- **每 200 个 GC**：防 transient package 累积爆内存
+- **进度日志**：每 200 个打 `进度 N/Total ... materialized=M`
 
 ## 模型加载策略
 

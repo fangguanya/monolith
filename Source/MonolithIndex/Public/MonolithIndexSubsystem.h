@@ -207,6 +207,17 @@ public:
 	 * 某些贵查询只会在明确要求时才补进去。 */
 	FMonolithIndexStatusBarSnapshot GetStatusBarSnapshot(bool bIncludeExpensiveDetails = false) const;
 
+	/** 把已经在 DDC 里的 AssetVisualGeometric / AssetVisualSemantic artifact 全量 materialize 到本地 SQLite。
+	 *
+	 * 用法：commandlet `MonolithIndexWarmup` 跑完后，DDC 里有 artifact 但 editor 端
+	 * `asset_visual_geometric / asset_visual_semantic` 表是 0 行（设计上 commandlet 不写 SQLite）。
+	 * 这条入口扫 AssetRegistry 里所有支持 AssetVisual 的资产，每个走 companion path 但
+	 * `bAllowLocalArtifactBuild=false`：cache 命中就 materialize 到 SQLite，cache miss 就跳过（让用户重跑 warmup）。
+	 *
+	 * 成本：N 次 cache lookup + 命中数次 SQLite 行写入；不会重新渲染、不会推理 CLIP。
+	 * 必须在游戏线程调用。 */
+	void MaterializeAssetVisualFromCache();
+
 	// --- 查询接口（给 MCP action 和 UI 调用） ---
 	/** 全文搜索。 */
 	TArray<FSearchResult> Search(const FString& Query, int32 Limit = 50);
