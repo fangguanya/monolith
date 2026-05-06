@@ -1,6 +1,7 @@
 #include "Indexers/AssetVisualGeometricIndexer.h"
 
 #include "Embedders/GeometricEmbeddingProvider.h"
+#include "Indexers/AssetVisualPhase.h"
 #include "AssetVisualArtifact.h"
 #include "AssetVisualEmbeddingProvider.h"
 #include "AssetVisualSharding.h"
@@ -62,11 +63,15 @@ namespace AssetVisualGeometricIndexerInternal
 	}
 
 	/** 把 PNG 字节流写到本地磁盘；返回最终绝对路径。
-	 *  落位规则：Saved/MonolithAssetVisual/{ShardId}/{资产短名}.png */
+	 *  单 phase 资产落位：Saved/MonolithAssetVisual/{ShardId}/{资产短名}.png
+	 *  多 phase 资产落位：Saved/MonolithAssetVisual/{ShardId}/{资产短名}_p{PhaseId}.png
+	 *  PhaseId=0 + 单 phase 默认（PhaseLabel 空 + 单元素）走无后缀路径，与历史行为兼容。 */
 	static FString WritePreviewPngToDisk(
 		const FString& AssetPath,
 		const FString& ShardId,
-		const TArray<uint8>& PngBytes)
+		const TArray<uint8>& PngBytes,
+		const uint8 PhaseId = 0,
+		const bool bMultiPhase = false)
 	{
 		const FString AssetName = FPaths::GetBaseFilename(AssetPath);
 		const FString Dir = FPaths::Combine(
@@ -74,7 +79,10 @@ namespace AssetVisualGeometricIndexerInternal
 			TEXT("MonolithAssetVisual"),
 			ShardId);
 		IFileManager::Get().MakeDirectory(*Dir, true);
-		const FString FilePath = FPaths::Combine(Dir, AssetName + TEXT(".png"));
+		const FString FileBase = bMultiPhase
+			? FString::Printf(TEXT("%s_p%u"), *AssetName, static_cast<uint32>(PhaseId))
+			: AssetName;
+		const FString FilePath = FPaths::Combine(Dir, FileBase + TEXT(".png"));
 		if (PngBytes.Num() > 0)
 		{
 			FFileHelper::SaveArrayToFile(PngBytes, *FilePath);
@@ -104,17 +112,9 @@ bool FAssetVisualGeometricIndexer::BuildArtifact(
 		return false;
 	}
 
-	// 4 类资产共用同一份 canonical iso 渲染：StaticMesh / SkeletalMesh / Material / WidgetBlueprint。
-	// 真正的类型分发在 IAssetCanonicalRenderer 内部完成，这里只是先 reject 不支持的类。
-	const bool bSupportedClass =
-		LoadedAsset->IsA(UStaticMesh::StaticClass()) ||
-		LoadedAsset->IsA(USkeletalMesh::StaticClass()) ||
-		LoadedAsset->IsA(UMaterialInterface::StaticClass()) ||
-		LoadedAsset->IsA(UWidgetBlueprint::StaticClass());
-	if (!bSupportedClass)
-	{
-		return false;
-	}
+	// 不再做硬编码 IsA 检查；canonical renderer 内部用 UThumbnailManager 自动分发，
+	// 它支持任何注册了 ThumbnailRenderer 的资产类（StaticMesh/SkelMesh/Material/Widget/Niagara/Anim 都自带）。
+	// 没注册 renderer 的资产类 renderer 会返 false。
 
 	using namespace MonolithCapture;
 	using namespace AssetVisualGeometricIndexerInternal;
@@ -130,50 +130,78 @@ bool FAssetVisualGeometricIndexer::BuildArtifact(
 		return false;
 	}
 
-	// 1) 渲染 iso 单视图 + silhouette。
+	// Multi-phase 索引：用 GetPhasesForAsset 决定该资产分几行 + 每行用什么时间点采样。
+	// AnimSequence / NiagaraSystem 走 3 phase，其他走单 phase。
+	const TArray<FAssetVisualPhaseDef> Phases = AssetVisualPhase::GetPhasesForAsset(LoadedAsset);
+	if (Phases.Num() == 0)
+	{
+		// GetPhasesForAsset 至少返回 1；为 0 是逻辑 bug。
+		return false;
+	}
+	const FName ClassHint = AssetVisualPhase::GetRendererAssetClassHint(LoadedAsset);
+
 	IAssetCanonicalRenderer& Renderer = GetAssetCanonicalRenderer();
-	FCanonicalRenderRequest Request;
-	Request.Asset = LoadedAsset;
-	Request.Resolution = 256;
-	Request.Views = { ECanonicalView::Iso };
-	Request.bComputeSilhouette = true;
 
-	TArray<FCanonicalRenderResult> Results;
-	if (!Renderer.RenderCanonical(Request, Results) || Results.Num() != 1)
-	{
-		UE_LOG(LogMonolithIndex, Warning,
-			TEXT("AssetVisualGeometricIndexer: 渲染 iso 视图失败 (%s)"), *AssetData.PackageName.ToString());
-		return false;
-	}
-
-	// 2) 算 64 维 embedding（与查询路径走同一份 Encode）。
-	TArray<float> Embedding;
-	if (!Provider->Encode(Results[0].ColorImage, Results[0].SilhouetteImage, Embedding))
-	{
-		return false;
-	}
-
-	// 3) 把 iso color 编码成 PNG 字节，artifact payload 携带这一份字节。
-	TArray<uint8> PreviewPng;
-	EncodeImageToPng(Results[0].ColorImage, PreviewPng);
-
-	// 4) 计算 ShardKey（geometric 默认 InitialPrefixDepth=2；reducer 阶段再做容量再拆）。
+	// ShardKey 与资产路径绑定，所有 phase 共享同一 ShardId。
 	const FAssetVisualShardCapacityPolicy Policy = FAssetVisualShardCapacityPolicy::Geometric();
 	const FString AssetPath = AssetData.GetObjectPathString();
 	const FAssetVisualShardKey ShardKey = ComputeAssetVisualShardKey(AssetPath, Policy.InitialPrefixDepth);
-
-	// 5) 装配视觉行 + 序列化 payload。
 	const FAssetVisualProviderInfo ProviderInfo = Provider->GetProviderInfo();
-	FIndexedAssetVisualEntry Entry;
-	Entry.AssetPath = AssetPath;
-	Entry.ShardId = ShardKey.ShardId;
-	Entry.ShardPrefixDepth = ShardKey.PrefixDepth;
-	Entry.ProviderId = ProviderInfo.ProviderId.ToString();
-	Entry.ProviderVersion = ProviderInfo.ProviderVersion;
-	Entry.RenderRecipeVersion = Renderer.GetRenderRecipeVersion();
-	Entry.EmbeddingDim = Embedding.Num();
-	Entry.EmbeddingDtype = 0; // FP32
-	EncodeEmbeddingToBytes(Embedding, Entry.EmbeddingBytes);
+
+	TArray<FIndexedAssetVisualEntry> Entries;
+	TArray<TArray<uint8>> PerPhasePngs;
+	Entries.Reserve(Phases.Num());
+	PerPhasePngs.Reserve(Phases.Num());
+
+	for (const FAssetVisualPhaseDef& Phase : Phases)
+	{
+		FCanonicalRenderRequest Request;
+		Request.Asset = LoadedAsset;
+		Request.Resolution = 256;
+		Request.Views = { ECanonicalView::Iso };
+		Request.bComputeSilhouette = true;
+		Request.PhaseT = Phase.PhaseT;
+		Request.PhaseId = Phase.PhaseId;
+		Request.AssetClassHint = ClassHint;
+
+		TArray<FCanonicalRenderResult> Results;
+		if (!Renderer.RenderCanonical(Request, Results) || Results.Num() != 1)
+		{
+			UE_LOG(LogMonolithIndex, Warning,
+				TEXT("AssetVisualGeometricIndexer: 渲染 phase %u (t=%.3f) 失败 (%s)"),
+				static_cast<uint32>(Phase.PhaseId), Phase.PhaseT, *AssetData.PackageName.ToString());
+			return false;
+		}
+
+		TArray<float> Embedding;
+		if (!Provider->Encode(Results[0].ColorImage, Results[0].SilhouetteImage, Embedding))
+		{
+			UE_LOG(LogMonolithIndex, Warning,
+				TEXT("AssetVisualGeometricIndexer: phase %u Encode 失败 (%s)"),
+				static_cast<uint32>(Phase.PhaseId), *AssetData.PackageName.ToString());
+			return false;
+		}
+
+		FIndexedAssetVisualEntry Entry;
+		Entry.AssetPath = AssetPath;
+		Entry.ShardId = ShardKey.ShardId;
+		Entry.ShardPrefixDepth = ShardKey.PrefixDepth;
+		Entry.ProviderId = ProviderInfo.ProviderId.ToString();
+		Entry.ProviderVersion = ProviderInfo.ProviderVersion;
+		Entry.RenderRecipeVersion = Renderer.GetRenderRecipeVersion();
+		Entry.EmbeddingDim = Embedding.Num();
+		Entry.EmbeddingDtype = 0; // FP32
+		Entry.PhaseId = Phase.PhaseId;
+		Entry.PhaseT = Phase.PhaseT;
+		Entry.PhaseLabel = Phase.Label;
+		EncodeEmbeddingToBytes(Embedding, Entry.EmbeddingBytes);
+
+		TArray<uint8> PhasePng;
+		EncodeImageToPng(Results[0].ColorImage, PhasePng);
+
+		Entries.Add(MoveTemp(Entry));
+		PerPhasePngs.Add(MoveTemp(PhasePng));
+	}
 
 	OutArtifact = FMonolithArtifact();
 	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
@@ -181,7 +209,7 @@ bool FAssetVisualGeometricIndexer::BuildArtifact(
 	OutArtifact.IndexerVersion = GetIndexerVersion();
 	OutArtifact.ExecutionMode = GetExecutionMode();
 	OutArtifact.PackageName = AssetData.PackageName.ToString();
-	AssetVisualArtifactSerializer::SerializePayload(Entry, PreviewPng, OutArtifact.Payload);
+	AssetVisualArtifactSerializer::SerializePayload(Entries, PerPhasePngs, OutArtifact.Payload);
 	return OutArtifact.Payload.Num() > 0;
 }
 
@@ -190,16 +218,33 @@ bool FAssetVisualGeometricIndexer::MaterializeArtifact(
 	FMonolithIndexDatabase& DB,
 	const int64 AssetId)
 {
-	FIndexedAssetVisualEntry Entry;
-	TArray<uint8> PreviewPng;
-	if (!AssetVisualArtifactSerializer::DeserializePayload(Artifact.Payload, Entry, PreviewPng))
+	TArray<FIndexedAssetVisualEntry> Entries;
+	TArray<TArray<uint8>> PerPhasePngs;
+	if (!AssetVisualArtifactSerializer::DeserializePayload(Artifact.Payload, Entries, PerPhasePngs))
+	{
+		return false;
+	}
+	if (Entries.Num() == 0 || PerPhasePngs.Num() != Entries.Num())
 	{
 		return false;
 	}
 
-	Entry.AssetId = AssetId;
-	Entry.PreviewViewPath = AssetVisualGeometricIndexerInternal::WritePreviewPngToDisk(Entry.AssetPath, Entry.ShardId, PreviewPng);
-	return DB.InsertAssetVisualEntry(TEXT("AssetVisualGeometric"), Entry) > 0;
+	// Multi-phase 资产 N>1 时每 phase 一张 PNG（文件名带 _pN 后缀）；单 phase 资产 N=1 走无后缀路径。
+	const bool bMultiPhase = Entries.Num() > 1;
+
+	bool bAllOk = true;
+	for (int32 Index = 0; Index < Entries.Num(); ++Index)
+	{
+		FIndexedAssetVisualEntry& Entry = Entries[Index];
+		Entry.AssetId = AssetId;
+		Entry.PreviewViewPath = AssetVisualGeometricIndexerInternal::WritePreviewPngToDisk(
+			Entry.AssetPath, Entry.ShardId, PerPhasePngs[Index], Entry.PhaseId, bMultiPhase);
+		if (DB.InsertAssetVisualEntry(TEXT("AssetVisualGeometric"), Entry) <= 0)
+		{
+			bAllOk = false;
+		}
+	}
+	return bAllOk;
 }
 
 bool FAssetVisualGeometricIndexer::MaterializeArtifactToShadow(
@@ -208,22 +253,34 @@ bool FAssetVisualGeometricIndexer::MaterializeArtifactToShadow(
 	const int64 AssetId,
 	const FString& CohortName)
 {
-	FIndexedAssetVisualEntry Entry;
-	TArray<uint8> PreviewPng;
-	if (!AssetVisualArtifactSerializer::DeserializePayload(Artifact.Payload, Entry, PreviewPng))
+	TArray<FIndexedAssetVisualEntry> Entries;
+	TArray<TArray<uint8>> PerPhasePngs;
+	if (!AssetVisualArtifactSerializer::DeserializePayload(Artifact.Payload, Entries, PerPhasePngs))
+	{
+		return false;
+	}
+	if (Entries.Num() == 0 || PerPhasePngs.Num() != Entries.Num())
 	{
 		return false;
 	}
 
-	Entry.AssetId = AssetId;
-	Entry.PreviewViewPath = AssetVisualGeometricIndexerInternal::WritePreviewPngToDisk(Entry.AssetPath, Entry.ShardId, PreviewPng);
-
-	FMonolithShadowIndexedAssetVisualEntry ShadowEntry;
-	ShadowEntry.Entry = Entry;
-	ShadowEntry.RowHash = ComputeAssetVisualRowHash(Entry);
+	const bool bMultiPhase = Entries.Num() > 1;
 
 	TArray<FMonolithShadowIndexedAssetVisualEntry> ShadowEntries;
-	ShadowEntries.Add(MoveTemp(ShadowEntry));
+	ShadowEntries.Reserve(Entries.Num());
+	for (int32 Index = 0; Index < Entries.Num(); ++Index)
+	{
+		FIndexedAssetVisualEntry& Entry = Entries[Index];
+		Entry.AssetId = AssetId;
+		Entry.PreviewViewPath = AssetVisualGeometricIndexerInternal::WritePreviewPngToDisk(
+			Entry.AssetPath, Entry.ShardId, PerPhasePngs[Index], Entry.PhaseId, bMultiPhase);
+
+		FMonolithShadowIndexedAssetVisualEntry ShadowEntry;
+		ShadowEntry.Entry = Entry;
+		ShadowEntry.RowHash = ComputeAssetVisualRowHash(Entry);
+		ShadowEntries.Add(MoveTemp(ShadowEntry));
+	}
+
 	return DB.ReplaceShadowAssetVisualEntriesForAsset(
 		TEXT("AssetVisualGeometric"),
 		CohortName,

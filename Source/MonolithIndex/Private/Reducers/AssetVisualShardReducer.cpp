@@ -8,7 +8,7 @@
 /*
  * Shard 快照的 artifact 序列化协议（与 mesh 行 artifact 是不同的结构）：
  *
- *   uint8  PayloadSchema = 1
+ *   uint8  PayloadSchema = 2
  *   string ShardId
  *   string ProviderId
  *   uint32 ProviderVersion
@@ -19,13 +19,17 @@
  *   uint32 EntryCount
  *   for each entry:
  *     string AssetPath
+ *     uint8  PhaseId                   // v2 新增：让 retriever 把命中映射回相位
  *     bytes  EmbeddingBytes (length = EmbeddingDim * sizeof(EmbeddingDtype))
  *
  * 该 schema 与单 mesh artifact 互不影响——shard 快照只承载 ANN 检索需要的最小信息。
  */
 namespace AssetVisualShardArtifactInternal
 {
-	static constexpr uint8 ShardPayloadSchema = 1;
+	// v1: 单 phase shard 快照（每行 string AssetPath + blob EmbeddingBytes）
+	// v2: 多 phase 快照，每行追加 uint8 PhaseId；retriever 用 PhaseId 把命中映射回真实相位。
+	//     与 v1 不兼容（字节多了 N 字节）；旧 DDC shard artifact 必须重新 reduce。
+	static constexpr uint8 ShardPayloadSchema = 2;
 
 	static void WriteUInt8(TArray<uint8>& Bytes, uint8 V) { Bytes.Add(V); }
 	static void WriteUInt32(TArray<uint8>& Bytes, uint32 V)
@@ -101,6 +105,7 @@ namespace AssetVisualShardArtifactInternal
 		for (const FIndexedAssetVisualEntry& Entry : Entries)
 		{
 			WriteString(OutBytes, Entry.AssetPath);
+			WriteUInt8(OutBytes, Entry.PhaseId);
 			WriteBlob(OutBytes, Entry.EmbeddingBytes.GetData(), Entry.EmbeddingBytes.Num());
 		}
 	}
@@ -137,7 +142,9 @@ namespace AssetVisualShardArtifactInternal
 		OutEmbeddings.bL2Normalized = (NormalizedFlag != 0);
 		OutEmbeddings.AssetPaths.Reset();
 		OutEmbeddings.Vectors.Reset();
+		OutEmbeddings.RowPhaseIds.Reset();
 		OutEmbeddings.AssetPaths.Reserve(EntryCount);
+		OutEmbeddings.RowPhaseIds.Reserve(EntryCount);
 
 		// 只支持 FP32 与 FP16；FP16 在这里立刻 widen 成 FP32 给 retriever 用，
 		// retriever 内部不必再判 dtype。
@@ -148,8 +155,11 @@ namespace AssetVisualShardArtifactInternal
 		for (uint32 Index = 0; Index < EntryCount; ++Index)
 		{
 			FString AssetPath;
+			uint8 PhaseId = 0;
 			uint32 BlobLen = 0;
-			if (!ReadString(Bytes, Off, AssetPath) || !ReadUInt32(Bytes, Off, BlobLen))
+			if (!ReadString(Bytes, Off, AssetPath)
+				|| !ReadUInt8(Bytes, Off, PhaseId)
+				|| !ReadUInt32(Bytes, Off, BlobLen))
 			{
 				return false;
 			}
@@ -163,6 +173,7 @@ namespace AssetVisualShardArtifactInternal
 			}
 
 			OutEmbeddings.AssetPaths.Add(MoveTemp(AssetPath));
+			OutEmbeddings.RowPhaseIds.Add(PhaseId);
 			if (EmbeddingDtype == 0)
 			{
 				const float* SrcF32 = reinterpret_cast<const float*>(Bytes.GetData() + Off);

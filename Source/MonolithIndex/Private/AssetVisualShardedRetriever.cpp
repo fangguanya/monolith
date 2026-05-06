@@ -115,6 +115,8 @@ namespace AssetVisualShardedRetrieverInternal
 		// 按分数从大到小输出 shard-local top-K。
 		Heap.Sort([](const FHeapEntry& A, const FHeapEntry& B) { return A.Score > B.Score; });
 
+		// 多 phase shard 必须能携带 PhaseId 回到调用方；缺位时退化到 0（单 phase 兼容路径）。
+		const bool bHasPhaseIds = (Shard.RowPhaseIds.Num() == Shard.AssetPaths.Num());
 		OutShardHits.Reserve(Heap.Num());
 		for (const FHeapEntry& Entry : Heap)
 		{
@@ -122,6 +124,7 @@ namespace AssetVisualShardedRetrieverInternal
 			Hit.AssetPath = Shard.AssetPaths[Entry.Index];
 			Hit.Score = Entry.Score;
 			Hit.ShardId = Shard.ShardId;
+			Hit.PhaseId = bHasPhaseIds ? Shard.RowPhaseIds[Entry.Index] : 0;
 			OutShardHits.Add(MoveTemp(Hit));
 		}
 	}

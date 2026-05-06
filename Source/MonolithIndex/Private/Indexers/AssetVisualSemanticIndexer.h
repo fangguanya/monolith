@@ -29,13 +29,21 @@ public:
 			TEXT("Material"),
 			TEXT("MaterialInstanceConstant"),
 			TEXT("WidgetBlueprint"),
+			TEXT("NiagaraSystem"),
+			TEXT("NiagaraEmitter"),
+			TEXT("AnimSequence"),
+			TEXT("AnimMontage"),
+			TEXT("AnimBlueprint"),
 		};
 	}
 
 	virtual FString GetName() const override { return TEXT("AssetVisualSemanticIndexer"); }
 	virtual FName GetIndexerId() const override { return FName(TEXT("AssetVisualSemantic")); }
-	// v13: 与 Geometric 同步，editor 进程 build + materialize。
-	virtual uint32 GetIndexerVersion() const override { return 13; }
+	// v14: 加 Niagara / Anim 系列 supported classes（与 Geometric 同步）。
+	// v15: AssetVisualArtifact payload schema v1→v2（多 phase 数组化）；DDC 旧 v1 字节流必须失效，否则
+	// 同 identity 命中后 MaterializeArtifact deserialize 拒绝、永远不重 build。
+	// v16: BuildArtifact 接入 GetPhasesForAsset 循环 + payload v2→v3（per-phase PNG），与 geometric 同步。
+	virtual uint32 GetIndexerVersion() const override { return 16; }
 	virtual uint8 GetArtifactSchemaVersion() const override { return 1; }
 	virtual EMonolithExecutionMode GetExecutionMode() const override { return EMonolithExecutionMode::OfflineOnly; }
 

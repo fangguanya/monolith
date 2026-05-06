@@ -1,5 +1,11 @@
 #include "MonolithCaptureUtils.h"
 
+#include "Animation/AnimMontage.h"
+#include "Animation/AnimSequence.h"
+#include "Animation/AnimSequenceBase.h"
+#include "Animation/AnimSingleNodeInstance.h"
+#include "Animation/AnimationAsset.h"
+#include "Animation/Skeleton.h"
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetBlueprintGeneratedClass.h"
 #include "Components/SceneCaptureComponent2D.h"
@@ -16,6 +22,8 @@
 #include "Math/Box.h"
 #include "Math/Vector.h"
 #include "Modules/ModuleManager.h"
+#include "NiagaraComponent.h"
+#include "NiagaraSystem.h"
 #include "AssetCompilingManager.h"
 #include "CanvasTypes.h"
 #include "PreviewScene.h"
@@ -68,8 +76,15 @@ namespace MonolithCaptureRendererInternal
 	 *      没光照导致整图全黑、Geometric embedding 全 0 的 bug。所有像素值都会变，整库必须 stale。
 	 * v4 = SCS_BaseColor 在 commandlet world 下也是黑（GBuffer 没 prime）。改用
 	 *      SCS_FinalColorLDR + ShowFlags.SetLighting(false) 走 unlit 路径直出 base color。
+	 * v5 = 加 multi-phase 资产旁路：AnimSequence 走 SkelMeshComponent + SetPosition(PhaseT * Length),
+	 *      NiagaraSystem 走 NiagaraComponent + AdvanceSimulationByTime(PhaseT)，绕开 thumbnail manager
+	 *      只渲一帧的限制。Mesh / Material / Widget 仍走 thumbnail manager；像素值不变但 anim/niagara
+	 *      cohort 行的 embedding 会从单 phase 重算成 3 phase，触发整库 stale。
+	 * v6 = anim/niagara 旁路加 fallthrough：旁路失败回退 thumbnail manager 单帧（之前直接 false 整资产被标 stale）。
+	 *      Niagara 加固定 RandomSeedOffset=0 + 200 单位本地 bounds 让粒子 simulation 跨次可重现。
+	 *      Anim/StaticMesh/Material/Widget 像素值不变；niagara 同 system embedding 数学结果会变（确定性），整库 stale。
 	 */
-	static constexpr uint32 RenderRecipeVersion = 4;
+	static constexpr uint32 RenderRecipeVersion = 6;
 
 	/** canonical 相机 FOV 固定为 35 度，给资产留足 framing 余量。 */
 	static constexpr float CanonicalFovDegrees = 35.0f;
@@ -167,7 +182,9 @@ namespace MonolithCaptureRendererInternal
 		const FVector& CameraLocation,
 		const FRotator& CameraRotation,
 		const int32 Resolution,
-		FImage& OutImage)
+		FImage& OutImage,
+		TFunctionRef<void(UPrimitiveComponent*, UWorld*)> PreCaptureSetup
+			= [](UPrimitiveComponent*, UWorld*){})
 	{
 		FPreviewScene::ConstructionValues PSCV;
 		PSCV.bAllowAudioPlayback = false;
@@ -195,6 +212,13 @@ namespace MonolithCaptureRendererInternal
 		// 不 flush 直接调 GetSceneProxy() 永远是 nullptr。
 		// 先 MarkRenderStateDirty 触发 SendRenderState，然后 flush 让 render thread 完成 CreateSceneProxy。
 		PrimitiveComp->MarkRenderStateDirty();
+		World->SendAllEndOfFrameUpdates();
+		FlushRenderingCommands();
+
+		// Multi-phase 资产在这里把 anim / niagara 时间 drive 到目标 phase；mesh / skel / material 路径
+		// 走默认空 lambda。Setup 必须在 component 已注册、scene proxy 已建好之后做，否则 SetPosition /
+		// AdvanceSimulationByTime 拿到的是无 scene 的中间态，对不上后面的 capture。
+		PreCaptureSetup(PrimitiveComp, World);
 		World->SendAllEndOfFrameUpdates();
 		FlushRenderingCommands();
 
@@ -485,6 +509,218 @@ namespace MonolithCaptureRendererInternal
 		return true;
 	}
 
+	/** 给 AnimSequence/Montage 找一个可用的 preview SkeletalMesh：
+	 *  Skeleton::PreviewMesh → Skeleton::FindCompatibleMesh → 都失败返回 nullptr。 */
+	static USkeletalMesh* ResolveAnimPreviewMesh(UAnimSequenceBase* Anim)
+	{
+		if (!Anim)
+		{
+			return nullptr;
+		}
+		USkeleton* Skeleton = Anim->GetSkeleton();
+		if (!Skeleton)
+		{
+			return nullptr;
+		}
+		USkeletalMesh* Mesh = Skeleton->GetPreviewMesh();
+		if (Mesh)
+		{
+			return Mesh;
+		}
+		// PreviewMesh 不存在（很多 Skeleton 没设）：让 UE 自己挑一个 compatible mesh。
+		// LoadAssetsIfNeeded=true 让它从 AssetRegistry 拉一份回来。
+		Mesh = Skeleton->FindCompatibleMesh();
+		return Mesh;
+	}
+
+	/** AnimSequence 多 phase 旁路。
+	 *
+	 *  PhaseT 是归一化 0..1，乘以 anim 总时长得到秒。在 PreviewScene 里建 SkelMeshComp
+	 *  + UAnimSingleNodeInstance 驱动到目标时间，然后走 RenderPrimitiveComponentToImage 截图。
+	 *
+	 *  没找到 preview mesh 时走 fallback：直接渲 Skeleton 自身（thumbnail manager 路径在 RenderCanonical
+	 *  入口那段；这里只负责尝试有 mesh 的最佳路径）。 */
+	static bool RenderAnimSequencePhasePipeline(
+		UAnimSequenceBase* Anim,
+		const FCanonicalRenderRequest& Request,
+		TArray<FCanonicalRenderResult>& OutResults)
+	{
+		USkeletalMesh* PreviewMesh = ResolveAnimPreviewMesh(Anim);
+		if (!PreviewMesh)
+		{
+			UE_LOG(LogMonolithCapture, Verbose,
+				TEXT("RenderAnimSequencePhasePipeline: anim %s 找不到可用 preview mesh，跳过 anim 旁路"),
+				*Anim->GetPathName());
+			return false;
+		}
+
+		// 用 SkelMesh 的 imported bounds 当 framing。Anim 时间不同，bounds 通常不会跨 phase 大变，
+		// 用 ref pose bounds 既稳定又跨 phase 一致。
+		const FBoxSphereBounds Bounds = PreviewMesh->GetImportedBounds();
+		const float ClampedT = FMath::Clamp(Request.PhaseT, 0.0f, 1.0f);
+		const float TargetSeconds = ClampedT * Anim->GetPlayLength();
+
+		USkeletalMeshComponent* SkelComp = NewObject<USkeletalMeshComponent>(
+			GetTransientPackage(), NAME_None, RF_Transient);
+		SkelComp->SetSkeletalMesh(PreviewMesh);
+		SkelComp->CastShadow = false;
+		SkelComp->bCastDynamicShadow = false;
+		SkelComp->SetMobility(EComponentMobility::Movable);
+		// SingleNode 模式让我们能直接 SetPosition；Default 模式会等 AnimBP graph 驱动，不可控。
+		SkelComp->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+
+		bool bAnyFailure = false;
+		const TArray<ECanonicalView>& Views = Request.Views.Num() > 0 ? Request.Views : TArray<ECanonicalView>{ ECanonicalView::Iso };
+		OutResults.Reserve(Views.Num());
+
+		for (const ECanonicalView View : Views)
+		{
+			FVector CameraLocation;
+			FRotator CameraRotation;
+			ComputeCameraTransform(Bounds, View, CameraLocation, CameraRotation);
+
+			FCanonicalRenderResult Result;
+			Result.View = View;
+
+			auto AnimSetup = [Anim, TargetSeconds](UPrimitiveComponent* Comp, UWorld* World)
+			{
+				USkeletalMeshComponent* AsSkel = Cast<USkeletalMeshComponent>(Comp);
+				if (!AsSkel)
+				{
+					return;
+				}
+				// PlayAnimation 内部会 SetAnimation + Play；bLooping=false 让 SingleNodeInstance 不绕回起始。
+				AsSkel->PlayAnimation(Anim, /*bLooping=*/false);
+				if (UAnimSingleNodeInstance* SingleNode = AsSkel->GetSingleNodeInstance())
+				{
+					SingleNode->SetPlaying(false);
+					SingleNode->SetPosition(TargetSeconds, /*bFireNotifies=*/false);
+				}
+				else
+				{
+					// 老路径：直接 SetPosition；可能仍能驱动 ref skeleton 上的 pose。
+					AsSkel->SetPosition(TargetSeconds, /*bFireNotifies=*/false);
+				}
+				// SetPosition 不直接 evaluate pose，TickAnimation + RefreshBoneTransforms 才让骨骼真正动起来。
+				AsSkel->TickAnimation(0.0f, /*bNeedsValidRootMotion=*/false);
+				AsSkel->RefreshBoneTransforms();
+				AsSkel->UpdateComponentToWorld();
+				if (World)
+				{
+					World->SendAllEndOfFrameUpdates();
+				}
+			};
+
+			if (!RenderPrimitiveComponentToImage(SkelComp, CameraLocation, CameraRotation, Request.Resolution, Result.ColorImage, AnimSetup))
+			{
+				bAnyFailure = true;
+				break;
+			}
+			if (Request.bComputeSilhouette)
+			{
+				BuildSilhouette(Result.ColorImage, Result.SilhouetteImage);
+			}
+			OutResults.Add(MoveTemp(Result));
+		}
+
+		if (SkelComp->IsRegistered())
+		{
+			SkelComp->UnregisterComponent();
+		}
+		return !bAnyFailure;
+	}
+
+	/** NiagaraSystem 多 phase 旁路。
+	 *
+	 *  PhaseT 是仿真秒数；在 PreviewScene 里建 NiagaraComponent，Activate + AdvanceSimulationByTime 推到
+	 *  目标时间后截图。Niagara simulation 在 editor world 里不一定 deterministic，
+	 *  跨次重建 embedding 可能有微漂；接受为 phase 阈值容差。 */
+	static bool RenderNiagaraSystemPhasePipeline(
+		UNiagaraSystem* NiagaraSys,
+		const FCanonicalRenderRequest& Request,
+		TArray<FCanonicalRenderResult>& OutResults)
+	{
+		if (!NiagaraSys)
+		{
+			return false;
+		}
+
+		// Niagara 系统没有自己的 bounds 概念（粒子 bounds 是 dynamic）；framing 走固定 100 单位球。
+		// 不同 niagara 的 cohort 一致性靠相对 visual feature，不靠精确 framing。
+		const FBoxSphereBounds Bounds(FVector::ZeroVector, FVector(100.f), 100.f);
+		const float ClampedT = FMath::Max(0.0f, Request.PhaseT);
+
+		UNiagaraComponent* Comp = NewObject<UNiagaraComponent>(
+			GetTransientPackage(), NAME_None, RF_Transient);
+		Comp->SetAsset(NiagaraSys);
+		Comp->SetMobility(EComponentMobility::Movable);
+		// Solo 模式让 niagara 不依赖 system manager 全局 tick；适合 PreviewScene 里手动 advance。
+		Comp->SetForceSolo(true);
+		Comp->bAutoActivate = false;
+		// 固定 seed offset：让粒子系统每次 build 都从同一种子起步，
+		// 跨 Materialize / 跨子进程产出的 embedding 可重现，避免每次重 build 微漂导致 search 排名不稳。
+		// handoff 风险清单第 1 条专门提到此项。0 是 default seed offset，但显式调一次 setter
+		// 让 component 内部状态走 SetRandomSeedOffset 的 reset 路径，比依赖默认值更明确。
+		Comp->SetRandomSeedOffset(0);
+		// 给一个固定本地 bounds 防止某些 system 不预设 bounds 时被剔除（CullProxyAt = 0）。
+		// 半径 200 单位覆盖大多数 cohort 内的视觉粒子；过大无害，过小可能让粒子被剔除。
+		Comp->SetSystemFixedBounds(FBox(FVector(-200.0), FVector(200.0)));
+
+		bool bAnyFailure = false;
+		const TArray<ECanonicalView>& Views = Request.Views.Num() > 0 ? Request.Views : TArray<ECanonicalView>{ ECanonicalView::Iso };
+		OutResults.Reserve(Views.Num());
+
+		for (const ECanonicalView View : Views)
+		{
+			FVector CameraLocation;
+			FRotator CameraRotation;
+			ComputeCameraTransform(Bounds, View, CameraLocation, CameraRotation);
+
+			FCanonicalRenderResult Result;
+			Result.View = View;
+
+			auto NiagaraSetup = [ClampedT](UPrimitiveComponent* InComp, UWorld* World)
+			{
+				UNiagaraComponent* AsNiagara = Cast<UNiagaraComponent>(InComp);
+				if (!AsNiagara)
+				{
+					return;
+				}
+				AsNiagara->ResetSystem();
+				AsNiagara->Activate(/*bReset=*/true);
+				if (ClampedT > 0.0f)
+				{
+					// AdvanceSimulationByTime 接受秒数，按 fixed delta（默认 1/30）跑足以仿真到 ClampedT。
+					// AdvanceSimulation(int32 NumTicks, float DeltaSeconds) 也可以，下面这条更直接。
+					constexpr float FixedDelta = 1.0f / 30.0f;
+					const int32 TickCount = FMath::CeilToInt(ClampedT / FixedDelta);
+					AsNiagara->AdvanceSimulation(TickCount, FixedDelta);
+				}
+				if (World)
+				{
+					World->SendAllEndOfFrameUpdates();
+				}
+			};
+
+			if (!RenderPrimitiveComponentToImage(Comp, CameraLocation, CameraRotation, Request.Resolution, Result.ColorImage, NiagaraSetup))
+			{
+				bAnyFailure = true;
+				break;
+			}
+			if (Request.bComputeSilhouette)
+			{
+				BuildSilhouette(Result.ColorImage, Result.SilhouetteImage);
+			}
+			OutResults.Add(MoveTemp(Result));
+		}
+
+		if (Comp->IsRegistered())
+		{
+			Comp->UnregisterComponent();
+		}
+		return !bAnyFailure;
+	}
+
 	/*
 	 * 默认 helper 实现：实现接口的全部 3 个方法。
 	 *
@@ -509,6 +745,54 @@ namespace MonolithCaptureRendererInternal
 			{
 				UE_LOG(LogMonolithCapture, Error, TEXT("RenderCanonical: Resolution=%d 越界"), Request.Resolution);
 				return false;
+			}
+
+			// Multi-phase 旁路：anim / niagara 必须按 PhaseT 渲不同时间点的形态，
+			// thumbnail manager 不接受时间参数（UNiagaraThumbnailRenderer 固定 sim duration，
+			// UAnimSequenceThumbnailRenderer::GetTime 是静态的）。改走 PreviewScene + SCC2D 旁路。
+			//
+			// 显式 hint 优先；未提供 hint 时按 Cast 链探测（AnimSequenceBase 涵盖 AnimSequence/Montage/Composite）。
+			const bool bHintAnim =
+				Request.AssetClassHint == FName(TEXT("AnimSequence"))
+				|| Request.AssetClassHint == FName(TEXT("AnimMontage"))
+				|| Request.AssetClassHint == FName(TEXT("AnimComposite"));
+			const bool bHintNiagara =
+				Request.AssetClassHint == FName(TEXT("NiagaraSystem"))
+				|| Request.AssetClassHint == FName(TEXT("NiagaraEmitter"));
+
+			if (bHintAnim || (Request.AssetClassHint.IsNone() && Cast<UAnimSequenceBase>(Request.Asset)))
+			{
+				if (UAnimSequenceBase* AnimAsset = Cast<UAnimSequenceBase>(Request.Asset))
+				{
+					if (RenderAnimSequencePhasePipeline(AnimAsset, Request, OutResults))
+					{
+						return true;
+					}
+					// 旁路失败（preview mesh 找不到 / SkelComp 注册失败 / SetPosition 没驱起来）：
+					// 不直接 false，让 thumbnail manager 兜底渲一帧。多 phase 资产此时 N 帧会拿到相同图，
+					// search 端 dedup 后只剩一行，仍可被搜到。
+					UE_LOG(LogMonolithCapture, Verbose,
+						TEXT("RenderCanonical: anim 旁路失败 (%s)，回退 thumbnail manager 单帧"),
+						*Request.Asset->GetPathName());
+					OutResults.Reset();
+				}
+				// hint 是 anim 但 cast 失败：fallthrough 让 thumbnail manager 兜底。
+			}
+			if (bHintNiagara || (Request.AssetClassHint.IsNone() && Cast<UNiagaraSystem>(Request.Asset)))
+			{
+				if (UNiagaraSystem* NiagaraAsset = Cast<UNiagaraSystem>(Request.Asset))
+				{
+					if (RenderNiagaraSystemPhasePipeline(NiagaraAsset, Request, OutResults))
+					{
+						return true;
+					}
+					// 同 anim：旁路失败回退 thumbnail manager 单帧。
+					UE_LOG(LogMonolithCapture, Verbose,
+						TEXT("RenderCanonical: niagara 旁路失败 (%s)，回退 thumbnail manager 单帧"),
+						*Request.Asset->GetPathName());
+					OutResults.Reset();
+				}
+				// 同上：hint 是 niagara 但 cast 失败 → fallthrough。
 			}
 
 			// v11 实现策略：放弃 4 类 SCC2D pipeline，直接用 UE 自己的 UThumbnailManager。

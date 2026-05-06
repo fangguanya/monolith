@@ -35,10 +35,13 @@ struct MONOLITHINDEX_API FAssetVisualShardEmbeddings
 {
 	/** shard 标识符；输出结果会带上以便追溯。 */
 	FString ShardId;
-	/** shard 内 mesh asset path 列表；与 Vectors 一一对应，长度必须相等。 */
+	/** shard 内 mesh asset path 列表；与 Vectors 一一对应，长度必须相等。
+	 *  Multi-phase 资产同 AssetPath 重复出现 N 次（每 phase 一行）。 */
 	TArray<FString> AssetPaths;
 	/** 平铺向量数组：每 EmbeddingDim 个 float 表示一个 mesh 的 embedding。 */
 	TArray<float> Vectors;
+	/** 与 AssetPaths 一一对应的 phase 序号（0..N-1）。 */
+	TArray<uint8> RowPhaseIds;
 	/** 单个 embedding 的维度。 */
 	int32 EmbeddingDim = 0;
 	/** Vectors 是否已经被 L2 标准化；标准化后 retriever 不再除模长。 */
@@ -54,6 +57,8 @@ struct MONOLITHINDEX_API FAssetVisualRetrieverHit
 	float Score = 0.0f;
 	/** 该候选所在的 shard id。 */
 	FString ShardId;
+	/** 命中行的 phase 序号；单 phase 资产恒为 0，多 phase 资产 = 该次命中对应的相位。 */
+	uint8 PhaseId = 0;
 };
 
 /*

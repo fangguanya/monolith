@@ -569,6 +569,39 @@ struct FMonolithIndexConsoleCommands
 		}
 		Subsystem->MaterializeAssetVisualFromCache();
 	}
+
+	/** 子进程入口：`Monolith.MaterializeAssetVisualShard <ShardIdx>:<ShardCount>` 跑自己 shard 写 DDC。 */
+	static void MaterializeAssetVisualShard(const TArray<FString>& Args, UWorld* /*World*/)
+	{
+		UMonolithIndexSubsystem* const Subsystem = GetSubsystem();
+		if (!Subsystem || Args.Num() == 0)
+		{
+			UE_LOG(LogMonolithIndex, Error,
+				TEXT("Monolith.MaterializeAssetVisualShard: 用法 'Monolith.MaterializeAssetVisualShard <ShardIdx>:<ShardCount>'"));
+			return;
+		}
+		FString Idx, Cnt;
+		if (!Args[0].Split(TEXT(":"), &Idx, &Cnt))
+		{
+			UE_LOG(LogMonolithIndex, Error,
+				TEXT("Monolith.MaterializeAssetVisualShard: 参数 '%s' 格式不对，期望 <ShardIdx>:<ShardCount>"),
+				*Args[0]);
+			return;
+		}
+		Subsystem->MaterializeAssetVisualBuildShard(FCString::Atoi(*Idx), FCString::Atoi(*Cnt));
+	}
+
+	/** 父进程入口：`Monolith.MaterializeAssetVisualParallel <NumWorkers>` spawn N 个 child 并行 build 然后 merge。 */
+	static void MaterializeAssetVisualParallel(const TArray<FString>& Args, UWorld* /*World*/)
+	{
+		UMonolithIndexSubsystem* const Subsystem = GetSubsystem();
+		if (!Subsystem)
+		{
+			return;
+		}
+		const int32 N = Args.Num() > 0 ? FCString::Atoi(*Args[0]) : 4;
+		Subsystem->MaterializeAssetVisualParallel(N);
+	}
 };
 
 namespace
@@ -582,6 +615,16 @@ namespace
 		TEXT("Monolith.MaterializeAssetVisual"),
 		TEXT("Materialize AssetVisual* artifacts from DDC into local SQLite tables (warmup commandlet pre-fills DDC; this writes to DB)."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FMonolithIndexConsoleCommands::MaterializeAssetVisual));
+
+	static FAutoConsoleCommandWithWorldAndArgs GMonolithMaterializeAssetVisualShardCommand(
+		TEXT("Monolith.MaterializeAssetVisualShard"),
+		TEXT("Child-process entry: Monolith.MaterializeAssetVisualShard <ShardIdx>:<ShardCount>。仅 build 写 DDC，不写 SQLite。"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FMonolithIndexConsoleCommands::MaterializeAssetVisualShard));
+
+	static FAutoConsoleCommandWithWorldAndArgs GMonolithMaterializeAssetVisualParallelCommand(
+		TEXT("Monolith.MaterializeAssetVisualParallel"),
+		TEXT("Parent orchestrator: Monolith.MaterializeAssetVisualParallel <NumWorkers>。spawn N 个 child editor 跱 shard，等全部退出后 merge 到 SQLite。"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&FMonolithIndexConsoleCommands::MaterializeAssetVisualParallel));
 }
 
 UMonolithIndexSubsystem::UMonolithIndexSubsystem() = default;
@@ -2803,7 +2846,191 @@ TSharedPtr<IMonolithIndexer> UMonolithIndexSubsystem::FindIndexerById(const FNam
 	return nullptr;
 }
 
+bool UMonolithIndexSubsystem::ClearAssetVisualCohort(FName CohortId)
+{
+	check(IsInGameThread());
+	if (!Database.IsValid() || !Database->IsOpen())
+	{
+		return false;
+	}
+	FScopeLock Lock(&DatabaseAccessMutex);
+	return Database->ClearAssetVisualEntries(CohortId.ToString());
+}
+
+namespace
+{
+	/** AssetVisual 支持的资产 class 名集合。和 AssetVisualGeometricIndexer.h 的 GetSupportedClasses 对齐。
+	 *  做成 hardcoded set 是为了 live callback 能 O(1) 判定，不依赖运行时 indexer 实例。 */
+	static const TSet<FName>& GetAssetVisualSupportedClasses()
+	{
+		static const TSet<FName> Classes = {
+			FName(TEXT("StaticMesh")),
+			FName(TEXT("SkeletalMesh")),
+			FName(TEXT("Material")),
+			FName(TEXT("MaterialInstanceConstant")),
+			FName(TEXT("WidgetBlueprint")),
+			FName(TEXT("NiagaraSystem")),
+			FName(TEXT("NiagaraEmitter")),
+			FName(TEXT("AnimSequence")),
+			FName(TEXT("AnimMontage")),
+			FName(TEXT("AnimBlueprint")),
+		};
+		return Classes;
+	}
+
+	static FString GetVisualPendingFilePath()
+	{
+		return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("MonolithIndex"), TEXT("visual_pending.txt"));
+	}
+
+	static FCriticalSection GVisualPendingFileMutex;
+
+	/** 把一个 package path 追加到 pending 文件（去重）。AR live callback 调用，所以要线程安全。 */
+	static void AppendVisualPendingPath(const FString& PackagePath)
+	{
+		if (PackagePath.IsEmpty())
+		{
+			return;
+		}
+		FScopeLock Lock(&GVisualPendingFileMutex);
+		const FString PendingPath = GetVisualPendingFilePath();
+		IFileManager::Get().MakeDirectory(*FPaths::GetPath(PendingPath), /*bTree=*/true);
+
+		// 简单 append；运行期不去重（Materialize 入口会一并 dedupe）。
+		FString Existing;
+		FFileHelper::LoadFileToString(Existing, *PendingPath);
+		if (Existing.Contains(PackagePath + TEXT("\n")))
+		{
+			return; // 已经在了，跳过
+		}
+		Existing += PackagePath + TEXT("\n");
+		FFileHelper::SaveStringToFile(Existing, *PendingPath);
+	}
+}
+
+int32 UMonolithIndexSubsystem::GetVisualPendingCount() const
+{
+	FScopeLock Lock(&GVisualPendingFileMutex);
+	TArray<FString> Lines;
+	if (!FFileHelper::LoadFileToStringArray(Lines, *GetVisualPendingFilePath()))
+	{
+		return 0;
+	}
+	int32 Count = 0;
+	for (FString& L : Lines)
+	{
+		L.TrimStartAndEndInline();
+		if (!L.IsEmpty()) ++Count;
+	}
+	return Count;
+}
+
+void UMonolithIndexSubsystem::RequestFullIndexFromUI()
+{
+	RequestManualFullIndex();
+}
+
+void UMonolithIndexSubsystem::StartIncrementalIndexFromUI()
+{
+	StartIncrementalIndex();
+}
+
+bool UMonolithIndexSubsystem::CanDoIncrementalIndexFromUI() const
+{
+	return CanDoIncrementalIndex();
+}
+
+void UMonolithIndexSubsystem::MaterializeAssetVisualBuildShard(int32 ShardIndex, int32 ShardCount)
+{
+	if (ShardCount < 1) ShardCount = 1;
+	if (ShardIndex < 0) ShardIndex = 0;
+	if (ShardIndex >= ShardCount) ShardIndex = ShardIndex % ShardCount;
+	UMonolithIndexSubsystem::FMaterializeAssetVisualOpts Opts;
+	Opts.bMaterialize = false; // child 进程只写 DDC，避免多进程 SQLite 写冲突
+	Opts.ShardIndex = ShardIndex;
+	Opts.ShardCount = ShardCount;
+	MaterializeAssetVisualImpl(Opts);
+}
+
 void UMonolithIndexSubsystem::MaterializeAssetVisualFromCache()
+{
+	UMonolithIndexSubsystem::FMaterializeAssetVisualOpts Opts;
+	MaterializeAssetVisualImpl(Opts);
+}
+
+void UMonolithIndexSubsystem::MaterializeAssetVisualParallel(int32 NumWorkers)
+{
+	check(IsInGameThread());
+
+	if (NumWorkers <= 1)
+	{
+		// 退化为单进程
+		MaterializeAssetVisualFromCache();
+		return;
+	}
+
+	// 父进程：spawn N 个 child UnrealEditor.exe，每个跑自己 shard 写 DDC，全部退出后父进程从 DDC merge 到 SQLite。
+	// 子进程通过 -ExecCmds="Monolith.MaterializeAssetVisualShard <k>:<N>;quit" 自启动。
+
+	const FString EditorExe = FPlatformProcess::ExecutablePath();  // 当前 UnrealEditor[-Cmd].exe
+	FString ProjectPath = FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath());
+	if (!ProjectPath.EndsWith(TEXT(".uproject")))
+	{
+		// editor 进程的 ProjectFilePath 有时是空，回落到 GIsEditor 的 cmdline 解析。
+		FString CmdLineProject;
+		FParse::Value(FCommandLine::Get(), TEXT("Project="), CmdLineProject);
+		if (!CmdLineProject.IsEmpty())
+		{
+			ProjectPath = CmdLineProject;
+		}
+	}
+
+	UE_LOG(LogMonolithIndex, Log,
+		TEXT("MaterializeAssetVisualParallel: 父进程 spawn %d 个 child editor (project=%s)"),
+		NumWorkers, *ProjectPath);
+
+	TArray<FProcHandle> Children;
+	Children.Reserve(NumWorkers);
+	for (int32 K = 0; K < NumWorkers; ++K)
+	{
+		const FString Args = FString::Printf(
+			TEXT("\"%s\" -ExecCmds=\"Monolith.MaterializeAssetVisualShard %d:%d;quit\" -unattended -nopause -nosplash -nosound -log -stdout -ABSLOG=\"%s\""),
+			*ProjectPath,
+			K, NumWorkers,
+			*FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Logs"),
+				FString::Printf(TEXT("MonolithVisualShard_%d.log"), K)));
+		uint32 PID = 0;
+		FProcHandle Handle = FPlatformProcess::CreateProc(
+			*EditorExe, *Args, /*bLaunchDetached=*/false, /*bLaunchHidden=*/true,
+			/*bLaunchReallyHidden=*/true, &PID, /*PriorityModifier=*/0,
+			/*OptionalWorkingDirectory=*/nullptr, /*PipeWriteChild=*/nullptr, /*PipeReadChild=*/nullptr);
+		if (!Handle.IsValid())
+		{
+			UE_LOG(LogMonolithIndex, Error,
+				TEXT("MaterializeAssetVisualParallel: spawn child %d 失败"), K);
+			continue;
+		}
+		UE_LOG(LogMonolithIndex, Log,
+			TEXT("MaterializeAssetVisualParallel: child shard=%d/%d PID=%u"), K, NumWorkers, PID);
+		Children.Add(MoveTemp(Handle));
+	}
+
+	// 等所有 child 退出。这是 GT 同步等待，会冻结父进程编辑器；可接受（用户自己点的"并行 build"按钮，知道要等）。
+	for (FProcHandle& Handle : Children)
+	{
+		FPlatformProcess::WaitForProc(Handle);
+		FPlatformProcess::CloseProc(Handle);
+	}
+
+	UE_LOG(LogMonolithIndex, Log,
+		TEXT("MaterializeAssetVisualParallel: 所有 child 退出，开始 merge 到 SQLite..."));
+
+	// merge：直接复用 MaterializeAssetVisualFromCache（bAllowLocalArtifactBuild=true 兜底，
+	// 但理论上 children 已经把 DDC 写满，绝大多数走 cache hit 路径，比首次 build 快得多）。
+	MaterializeAssetVisualFromCache();
+}
+
+void UMonolithIndexSubsystem::MaterializeAssetVisualImpl(const UMonolithIndexSubsystem::FMaterializeAssetVisualOpts& Opts)
 {
 	check(IsInGameThread());
 
@@ -2893,6 +3120,26 @@ void UMonolithIndexSubsystem::MaterializeAssetVisualFromCache()
 			return bAlready;
 		});
 
+		// Live pending 队列：之前 editor 期间被改过的 asset path。
+		// 这些资产即使在 AlreadyDone 集合里也强制重做（resume 跳过逻辑要让步给 pending）。
+		TSet<FName> ForceRebuildPackages;
+		{
+			FScopeLock PendingLock(&GVisualPendingFileMutex);
+			TArray<FString> PendingLines;
+			const FString PendingPath = GetVisualPendingFilePath();
+			if (FFileHelper::LoadFileToStringArray(PendingLines, *PendingPath))
+			{
+				for (FString& L : PendingLines)
+				{
+					L.TrimStartAndEndInline();
+					if (!L.IsEmpty())
+					{
+						ForceRebuildPackages.Add(FName(*L));
+					}
+				}
+			}
+		}
+
 		int32 Materialized = 0;
 		int32 CacheMiss = 0;
 		int32 Failed = 0;
@@ -2940,6 +3187,16 @@ void UMonolithIndexSubsystem::MaterializeAssetVisualFromCache()
 			// 解析 / 创建 AssetId（main assets 表里没行就插一条最小记录）。
 			const FString PackagePath = AssetData.PackageName.ToString();
 
+			// shard 过滤：父进程跑 Opts.ShardCount=1 时全收，子进程跑 N>1 只处理 hash%N==idx 的资产。
+			if (Opts.ShardCount > 1)
+			{
+				const uint32 H = GetTypeHash(PackagePath);
+				if (static_cast<int32>(H % static_cast<uint32>(Opts.ShardCount)) != Opts.ShardIndex)
+				{
+					continue;
+				}
+			}
+
 			if (SkipPackagePaths.Contains(PackagePath))
 			{
 				++Skipped;
@@ -2967,7 +3224,9 @@ void UMonolithIndexSubsystem::MaterializeAssetVisualFromCache()
 			}
 
 			// resume：跳过已经有非零 embedding 的资产。
-			if (AlreadyDoneAssetIds.Contains(AssetId))
+			// 例外：live pending 队列里的强制重做（之前 editor 期间改过的 asset，DDC artifact 已 stale）。
+			const bool bForceRebuild = ForceRebuildPackages.Contains(AssetData.PackageName);
+			if (AlreadyDoneAssetIds.Contains(AssetId) && !bForceRebuild)
 			{
 				++Resumed;
 				continue;
@@ -2995,7 +3254,8 @@ void UMonolithIndexSubsystem::MaterializeAssetVisualFromCache()
 			// UThumbnailManager 各种路都返回全黑帧），实测唯一可工作的是 editor process 全 boot 起来
 			// 走完整 Slate + RHI + GUnrealEd 路径。
 			Options.bAllowLocalArtifactBuild = true;
-			Options.bMaterializeProduction = true;
+			// 子进程模式 Opts.bMaterialize=false 只写 DDC；父进程 merge 阶段写 SQLite。
+			Options.bMaterializeProduction = Opts.bMaterialize;
 			Options.AssetId = AssetId;
 
 			MonolithAssetArtifactPipeline::FExecuteAssetResult Result;
@@ -3045,6 +3305,12 @@ void UMonolithIndexSubsystem::MaterializeAssetVisualFromCache()
 		UE_LOG(LogMonolithIndex, Log,
 			TEXT("MaterializeAssetVisualFromCache: %s 完成: total=%d processed=%d materialized=%d resumed=%d skipped=%d cache_miss=%d failed=%d"),
 			*CohortName, Total, Processed, Materialized, Resumed, Skipped, CacheMiss, Failed);
+	}
+
+	// 两个 cohort 都跑完，清空 pending 文件（live 队列已被消化）。
+	{
+		FScopeLock PendingLock(&GVisualPendingFileMutex);
+		IFileManager::Get().Delete(*GetVisualPendingFilePath(), /*bRequireExists=*/false, /*bEvenIfReadOnly=*/false, /*bQuiet=*/true);
 	}
 }
 
@@ -4048,11 +4314,19 @@ void UMonolithIndexSubsystem::OnAssetRenamedCallback(const FAssetData& AssetData
 void UMonolithIndexSubsystem::OnAssetsUpdatedOnDiskCallback(TConstArrayView<FAssetData> Assets)
 {
 	if (bIsIndexing) return;
+	const TSet<FName>& VisualClasses = GetAssetVisualSupportedClasses();
 	for (const FAssetData& AssetData : Assets)
 	{
-		if (IsPackagePathIndexed(AssetData.PackageName.ToString()))
+		const FString PackagePath = AssetData.PackageName.ToString();
+		if (IsPackagePathIndexed(PackagePath))
 		{
 			PendingChanges.Add({EIndexChangeType::Updated, AssetData, {}});
+		}
+		// 同时如果是 AssetVisual 支持的类，记到持久化 pending 文件。
+		// MaterializeAssetVisual 下次跑会优先处理（也会跨进程重启幸存）。
+		if (VisualClasses.Contains(AssetData.AssetClassPath.GetAssetName()))
+		{
+			AppendVisualPendingPath(PackagePath);
 		}
 	}
 }

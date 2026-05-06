@@ -429,7 +429,10 @@ CREATE TABLE IF NOT EXISTS asset_visual_geometric (
     embedding_dim INTEGER DEFAULT 0,
     embedding_dtype INTEGER DEFAULT 0,
     embedding_bytes BLOB,
-    preview_view_path TEXT DEFAULT ''
+    preview_view_path TEXT DEFAULT '',
+    phase_id INTEGER DEFAULT 0,
+    phase_t REAL DEFAULT 0.0,
+    phase_label TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_asset_visual_geometric_asset ON asset_visual_geometric(asset_id);
 CREATE INDEX IF NOT EXISTS idx_asset_visual_geometric_shard ON asset_visual_geometric(shard_id);
@@ -447,7 +450,10 @@ CREATE TABLE IF NOT EXISTS asset_visual_semantic (
     embedding_dim INTEGER DEFAULT 0,
     embedding_dtype INTEGER DEFAULT 0,
     embedding_bytes BLOB,
-    preview_view_path TEXT DEFAULT ''
+    preview_view_path TEXT DEFAULT '',
+    phase_id INTEGER DEFAULT 0,
+    phase_t REAL DEFAULT 0.0,
+    phase_label TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_asset_visual_semantic_asset ON asset_visual_semantic(asset_id);
 CREATE INDEX IF NOT EXISTS idx_asset_visual_semantic_shard ON asset_visual_semantic(shard_id);
@@ -707,6 +713,48 @@ bool FMonolithIndexDatabase::Open(const FString& InDbPath)
 			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'AssetVisualGeometric';"));
 			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'AssetVisualSemantic';"));
 			WriteMeta(TEXT("schema_version"), TEXT("10"));
+			SchemaVersionInt = 10;
+		}
+
+		// v10 -> v11：AssetVisual 双 cohort 表升级到 multi-phase 索引。
+		//
+		// 增加 3 列：
+		//   phase_id    INTEGER DEFAULT 0     稳定相位序号（同 asset 多 phase 时 0..N-1）
+		//   phase_t     REAL    DEFAULT 0.0   该相位采样时间（anim=归一化 0..1，niagara=秒）
+		//   phase_label TEXT    DEFAULT ''    给搜索结果用的可读名（"early"/"peak"/"tail"...）
+		//
+		// 同时 payload schema v1 → v2，旧 artifact 不可再解析；
+		// 直接清空两张视觉表 + 失效对应 asset_index_metadata，让下一次 Materialize 全量重建。
+		if (SchemaVersionInt < 11)
+		{
+			const TCHAR* const VisualTables[] = {
+				TEXT("asset_visual_geometric"),
+				TEXT("asset_visual_semantic"),
+			};
+			for (const TCHAR* TableName : VisualTables)
+			{
+				if (!MonolithIndexDatabaseInternal::TableHasColumn(*Database, TableName, TEXT("phase_id")))
+				{
+					ExecuteSQL(*FString::Printf(TEXT("ALTER TABLE %s ADD COLUMN phase_id INTEGER DEFAULT 0;"), TableName));
+				}
+				if (!MonolithIndexDatabaseInternal::TableHasColumn(*Database, TableName, TEXT("phase_t")))
+				{
+					ExecuteSQL(*FString::Printf(TEXT("ALTER TABLE %s ADD COLUMN phase_t REAL DEFAULT 0.0;"), TableName));
+				}
+				if (!MonolithIndexDatabaseInternal::TableHasColumn(*Database, TableName, TEXT("phase_label")))
+				{
+					ExecuteSQL(*FString::Printf(TEXT("ALTER TABLE %s ADD COLUMN phase_label TEXT DEFAULT '';"), TableName));
+				}
+			}
+
+			// payload schema 1→2 不兼容（embedding 在 phase 数组里），残留 artifact 必须重建。
+			ExecuteSQL(TEXT("DELETE FROM asset_visual_geometric;"));
+			ExecuteSQL(TEXT("DELETE FROM asset_visual_semantic;"));
+			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'AssetVisualGeometric';"));
+			ExecuteSQL(TEXT("DELETE FROM asset_index_metadata WHERE indexer_id = 'AssetVisualSemantic';"));
+
+			WriteMeta(TEXT("schema_version"), TEXT("11"));
+			SchemaVersionInt = 11;
 		}
 	}
 
@@ -4243,8 +4291,8 @@ int64 FMonolithIndexDatabase::InsertAssetVisualEntry(const FString& CohortName, 
 
 	FSQLitePreparedStatement Stmt;
 	const FString Sql = FString::Printf(
-		TEXT("INSERT INTO %s (asset_id, revision_id, asset_path, shard_id, shard_prefix_depth, provider_id, provider_version, render_recipe_version, embedding_dim, embedding_dtype, embedding_bytes, preview_view_path) ")
-		TEXT("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"),
+		TEXT("INSERT INTO %s (asset_id, revision_id, asset_path, shard_id, shard_prefix_depth, provider_id, provider_version, render_recipe_version, embedding_dim, embedding_dtype, embedding_bytes, preview_view_path, phase_id, phase_t, phase_label) ")
+		TEXT("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"),
 		*TableName);
 	Stmt.Create(*Database, *Sql);
 	const int64 Revision = Entry.RevisionId > 0 ? Entry.RevisionId : ResolveActiveRevisionId(Entry.AssetId);
@@ -4261,6 +4309,10 @@ int64 FMonolithIndexDatabase::InsertAssetVisualEntry(const FString& CohortName, 
 	// SQLite 的 SetBindingValueByIndex 重载 4 参数版本就是 BLOB 入口（指针 + 字节数 + bCopy）。
 	Stmt.SetBindingValueByIndex(11, static_cast<const void*>(Entry.EmbeddingBytes.GetData()), static_cast<int32>(Entry.EmbeddingBytes.Num()), false);
 	Stmt.SetBindingValueByIndex(12, Entry.PreviewViewPath);
+	Stmt.SetBindingValueByIndex(13, static_cast<int64>(Entry.PhaseId));
+	// SQLite 没有 float-only 列；REAL 是 double，绑定走 double 通道避免精度漂移。
+	Stmt.SetBindingValueByIndex(14, static_cast<double>(Entry.PhaseT));
+	Stmt.SetBindingValueByIndex(15, Entry.PhaseLabel);
 
 	if (!Stmt.Execute())
 	{
@@ -4281,10 +4333,14 @@ TOptional<FIndexedAssetVisualEntry> FMonolithIndexDatabase::GetAssetVisualEntryF
 		return {};
 	}
 
+	// 多 phase 后同 asset 在同 cohort 内可能有多行；这里返回 phase_id 最小（即 phase 0 / 主 phase）
+	// 那一行，保证单行 API 在多 phase schema 下仍然确定性返回。需要遍历所有 phase 时改用
+	// GetAssetVisualEntriesForAsset。
 	const FString Sql = FString::Printf(
-		TEXT("SELECT m.id, m.asset_id, m.revision_id, m.asset_path, m.shard_id, m.shard_prefix_depth, m.provider_id, m.provider_version, m.render_recipe_version, m.embedding_dim, m.embedding_dtype, m.embedding_bytes, m.preview_view_path ")
+		TEXT("SELECT m.id, m.asset_id, m.revision_id, m.asset_path, m.shard_id, m.shard_prefix_depth, m.provider_id, m.provider_version, m.render_recipe_version, m.embedding_dim, m.embedding_dtype, m.embedding_bytes, m.preview_view_path, m.phase_id, m.phase_t, m.phase_label ")
 		TEXT("FROM %s m JOIN assets a ON a.id = m.asset_id ")
-		TEXT("WHERE m.asset_id = ? AND (m.revision_id = a.current_revision_id OR (a.current_revision_id = 0 AND m.revision_id = 0));"),
+		TEXT("WHERE m.asset_id = ? AND (m.revision_id = a.current_revision_id OR (a.current_revision_id = 0 AND m.revision_id = 0)) ")
+		TEXT("ORDER BY m.phase_id ASC LIMIT 1;"),
 		*TableName);
 
 	FSQLitePreparedStatement Stmt;
@@ -4320,6 +4376,13 @@ TOptional<FIndexedAssetVisualEntry> FMonolithIndexDatabase::GetAssetVisualEntryF
 	Entry.EmbeddingDtype = static_cast<uint8>(EmbeddingDtype);
 	Stmt.GetColumnValueByIndex(11, Entry.EmbeddingBytes);
 	Stmt.GetColumnValueByIndex(12, Entry.PreviewViewPath);
+	int64 PhaseId = 0;
+	double PhaseT = 0.0;
+	Stmt.GetColumnValueByIndex(13, PhaseId);
+	Stmt.GetColumnValueByIndex(14, PhaseT);
+	Entry.PhaseId = static_cast<uint8>(PhaseId);
+	Entry.PhaseT = static_cast<float>(PhaseT);
+	Stmt.GetColumnValueByIndex(15, Entry.PhaseLabel);
 	return Entry;
 }
 
@@ -4337,7 +4400,7 @@ TArray<FIndexedAssetVisualEntry> FMonolithIndexDatabase::GetAssetVisualEntries(c
 	}
 
 	FString Sql = FString::Printf(
-		TEXT("SELECT m.id, m.asset_id, m.revision_id, m.asset_path, m.shard_id, m.shard_prefix_depth, m.provider_id, m.provider_version, m.render_recipe_version, m.embedding_dim, m.embedding_dtype, m.embedding_bytes, m.preview_view_path ")
+		TEXT("SELECT m.id, m.asset_id, m.revision_id, m.asset_path, m.shard_id, m.shard_prefix_depth, m.provider_id, m.provider_version, m.render_recipe_version, m.embedding_dim, m.embedding_dtype, m.embedding_bytes, m.preview_view_path, m.phase_id, m.phase_t, m.phase_label ")
 		TEXT("FROM %s m JOIN assets a ON a.id = m.asset_id ")
 		TEXT("WHERE (m.revision_id = a.current_revision_id OR (a.current_revision_id = 0 AND m.revision_id = 0))"),
 		*TableName);
@@ -4380,6 +4443,75 @@ TArray<FIndexedAssetVisualEntry> FMonolithIndexDatabase::GetAssetVisualEntries(c
 		Entry.EmbeddingDtype = static_cast<uint8>(EmbeddingDtype);
 		Stmt.GetColumnValueByIndex(11, Entry.EmbeddingBytes);
 		Stmt.GetColumnValueByIndex(12, Entry.PreviewViewPath);
+		int64 PhaseId = 0;
+		double PhaseT = 0.0;
+		Stmt.GetColumnValueByIndex(13, PhaseId);
+		Stmt.GetColumnValueByIndex(14, PhaseT);
+		Entry.PhaseId = static_cast<uint8>(PhaseId);
+		Entry.PhaseT = static_cast<float>(PhaseT);
+		Stmt.GetColumnValueByIndex(15, Entry.PhaseLabel);
+		Result.Add(MoveTemp(Entry));
+	}
+	return Result;
+}
+
+TArray<FIndexedAssetVisualEntry> FMonolithIndexDatabase::GetAssetVisualEntriesForAsset(const FString& CohortName, const int64 AssetId)
+{
+	TArray<FIndexedAssetVisualEntry> Result;
+	if (!IsOpen())
+	{
+		return Result;
+	}
+	const FString TableName = AssetVisualDatabaseInternal::GetProductionTableName(CohortName);
+	if (TableName.IsEmpty())
+	{
+		return Result;
+	}
+
+	const FString Sql = FString::Printf(
+		TEXT("SELECT m.id, m.asset_id, m.revision_id, m.asset_path, m.shard_id, m.shard_prefix_depth, m.provider_id, m.provider_version, m.render_recipe_version, m.embedding_dim, m.embedding_dtype, m.embedding_bytes, m.preview_view_path, m.phase_id, m.phase_t, m.phase_label ")
+		TEXT("FROM %s m JOIN assets a ON a.id = m.asset_id ")
+		TEXT("WHERE m.asset_id = ? AND (m.revision_id = a.current_revision_id OR (a.current_revision_id = 0 AND m.revision_id = 0)) ")
+		TEXT("ORDER BY m.phase_id ASC;"),
+		*TableName);
+
+	FSQLitePreparedStatement Stmt;
+	Stmt.Create(*Database, *Sql);
+	Stmt.SetBindingValueByIndex(1, AssetId);
+
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FIndexedAssetVisualEntry Entry;
+		Stmt.GetColumnValueByIndex(0, Entry.Id);
+		Stmt.GetColumnValueByIndex(1, Entry.AssetId);
+		Stmt.GetColumnValueByIndex(2, Entry.RevisionId);
+		Stmt.GetColumnValueByIndex(3, Entry.AssetPath);
+		Stmt.GetColumnValueByIndex(4, Entry.ShardId);
+		int64 PrefixDepth = 0;
+		Stmt.GetColumnValueByIndex(5, PrefixDepth);
+		Entry.ShardPrefixDepth = static_cast<int32>(PrefixDepth);
+		Stmt.GetColumnValueByIndex(6, Entry.ProviderId);
+		int64 ProviderVersion = 1;
+		int64 RenderVersion = 1;
+		Stmt.GetColumnValueByIndex(7, ProviderVersion);
+		Stmt.GetColumnValueByIndex(8, RenderVersion);
+		Entry.ProviderVersion = static_cast<uint32>(ProviderVersion);
+		Entry.RenderRecipeVersion = static_cast<uint32>(RenderVersion);
+		int64 EmbeddingDim = 0;
+		int64 EmbeddingDtype = 0;
+		Stmt.GetColumnValueByIndex(9, EmbeddingDim);
+		Stmt.GetColumnValueByIndex(10, EmbeddingDtype);
+		Entry.EmbeddingDim = static_cast<int32>(EmbeddingDim);
+		Entry.EmbeddingDtype = static_cast<uint8>(EmbeddingDtype);
+		Stmt.GetColumnValueByIndex(11, Entry.EmbeddingBytes);
+		Stmt.GetColumnValueByIndex(12, Entry.PreviewViewPath);
+		int64 PhaseId = 0;
+		double PhaseT = 0.0;
+		Stmt.GetColumnValueByIndex(13, PhaseId);
+		Stmt.GetColumnValueByIndex(14, PhaseT);
+		Entry.PhaseId = static_cast<uint8>(PhaseId);
+		Entry.PhaseT = static_cast<float>(PhaseT);
+		Stmt.GetColumnValueByIndex(15, Entry.PhaseLabel);
 		Result.Add(MoveTemp(Entry));
 	}
 	return Result;
@@ -4419,10 +4551,26 @@ bool FMonolithIndexDatabase::ReplaceShadowAssetVisualEntriesForAsset(
 			"    embedding_dtype INTEGER DEFAULT 0,"
 			"    embedding_bytes BLOB,"
 			"    preview_view_path TEXT DEFAULT '',"
+			"    phase_id INTEGER DEFAULT 0,"
+			"    phase_t REAL DEFAULT 0.0,"
+			"    phase_label TEXT DEFAULT '',"
 			"    row_hash TEXT DEFAULT ''"
 			");"),
 		*TableName);
 	ExecuteSQL(*CreateSql);
+	// 兼容历史 shadow 表已经存在但没有 phase_* 列的情况：按需 ALTER。
+	if (!MonolithIndexDatabaseInternal::TableHasColumn(*Database, *TableName, TEXT("phase_id")))
+	{
+		ExecuteSQL(*FString::Printf(TEXT("ALTER TABLE %s ADD COLUMN phase_id INTEGER DEFAULT 0;"), *TableName));
+	}
+	if (!MonolithIndexDatabaseInternal::TableHasColumn(*Database, *TableName, TEXT("phase_t")))
+	{
+		ExecuteSQL(*FString::Printf(TEXT("ALTER TABLE %s ADD COLUMN phase_t REAL DEFAULT 0.0;"), *TableName));
+	}
+	if (!MonolithIndexDatabaseInternal::TableHasColumn(*Database, *TableName, TEXT("phase_label")))
+	{
+		ExecuteSQL(*FString::Printf(TEXT("ALTER TABLE %s ADD COLUMN phase_label TEXT DEFAULT '';"), *TableName));
+	}
 
 	const int64 ActiveRevisionId = ResolveActiveRevisionId(AssetId);
 
@@ -4443,8 +4591,8 @@ bool FMonolithIndexDatabase::ReplaceShadowAssetVisualEntriesForAsset(
 		InsertStmt.Create(
 			*Database,
 			*FString::Printf(
-				TEXT("INSERT INTO %s (asset_id, revision_id, asset_path, shard_id, shard_prefix_depth, provider_id, provider_version, render_recipe_version, embedding_dim, embedding_dtype, embedding_bytes, preview_view_path, row_hash) ")
-				TEXT("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"),
+				TEXT("INSERT INTO %s (asset_id, revision_id, asset_path, shard_id, shard_prefix_depth, provider_id, provider_version, render_recipe_version, embedding_dim, embedding_dtype, embedding_bytes, preview_view_path, phase_id, phase_t, phase_label, row_hash) ")
+				TEXT("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"),
 				*TableName));
 		InsertStmt.SetBindingValueByIndex(1, AssetId);
 		InsertStmt.SetBindingValueByIndex(2, RevisionId);
@@ -4458,7 +4606,10 @@ bool FMonolithIndexDatabase::ReplaceShadowAssetVisualEntriesForAsset(
 		InsertStmt.SetBindingValueByIndex(10, static_cast<int64>(ShadowEntry.Entry.EmbeddingDtype));
 		InsertStmt.SetBindingValueByIndex(11, static_cast<const void*>(ShadowEntry.Entry.EmbeddingBytes.GetData()), static_cast<int32>(ShadowEntry.Entry.EmbeddingBytes.Num()), false);
 		InsertStmt.SetBindingValueByIndex(12, ShadowEntry.Entry.PreviewViewPath);
-		InsertStmt.SetBindingValueByIndex(13, MonolithIndexDatabaseInternal::RowHashToHex(ShadowEntry.RowHash));
+		InsertStmt.SetBindingValueByIndex(13, static_cast<int64>(ShadowEntry.Entry.PhaseId));
+		InsertStmt.SetBindingValueByIndex(14, static_cast<double>(ShadowEntry.Entry.PhaseT));
+		InsertStmt.SetBindingValueByIndex(15, ShadowEntry.Entry.PhaseLabel);
+		InsertStmt.SetBindingValueByIndex(16, MonolithIndexDatabaseInternal::RowHashToHex(ShadowEntry.RowHash));
 		if (!InsertStmt.Execute())
 		{
 			return false;
@@ -4489,8 +4640,8 @@ TArray<FMonolithShadowIndexedAssetVisualEntry> FMonolithIndexDatabase::GetShadow
 	Stmt.Create(
 		*Database,
 		*FString::Printf(
-			TEXT("SELECT s.asset_path, s.shard_id, s.shard_prefix_depth, s.provider_id, s.provider_version, s.render_recipe_version, s.embedding_dim, s.embedding_dtype, s.embedding_bytes, s.preview_view_path, s.row_hash ")
-			TEXT("FROM %s s WHERE s.asset_id = ? AND s.revision_id = ?;"),
+			TEXT("SELECT s.asset_path, s.shard_id, s.shard_prefix_depth, s.provider_id, s.provider_version, s.render_recipe_version, s.embedding_dim, s.embedding_dtype, s.embedding_bytes, s.preview_view_path, s.phase_id, s.phase_t, s.phase_label, s.row_hash ")
+			TEXT("FROM %s s WHERE s.asset_id = ? AND s.revision_id = ? ORDER BY s.phase_id ASC;"),
 			*TableName));
 	Stmt.SetBindingValueByIndex(1, AssetId);
 	Stmt.SetBindingValueByIndex(2, ActiveRevisionId);
@@ -4520,8 +4671,15 @@ TArray<FMonolithShadowIndexedAssetVisualEntry> FMonolithIndexDatabase::GetShadow
 		Row.Entry.EmbeddingDtype = static_cast<uint8>(EmbeddingDtype);
 		Stmt.GetColumnValueByIndex(8, Row.Entry.EmbeddingBytes);
 		Stmt.GetColumnValueByIndex(9, Row.Entry.PreviewViewPath);
+		int64 PhaseId = 0;
+		double PhaseT = 0.0;
+		Stmt.GetColumnValueByIndex(10, PhaseId);
+		Stmt.GetColumnValueByIndex(11, PhaseT);
+		Row.Entry.PhaseId = static_cast<uint8>(PhaseId);
+		Row.Entry.PhaseT = static_cast<float>(PhaseT);
+		Stmt.GetColumnValueByIndex(12, Row.Entry.PhaseLabel);
 		FString RowHashHex;
-		Stmt.GetColumnValueByIndex(10, RowHashHex);
+		Stmt.GetColumnValueByIndex(13, RowHashHex);
 		Row.RowHash = MonolithIndexDatabaseInternal::ParseRowHashHex(RowHashHex);
 		Result.Add(MoveTemp(Row));
 	}
@@ -4533,12 +4691,13 @@ FMonolithShadowAssetVisualAggregate FMonolithIndexDatabase::GetProductionAssetVi
 	const int64 AssetId)
 {
 	FMonolithShadowAssetVisualAggregate Aggregate;
-	const TOptional<FIndexedAssetVisualEntry> Entry = GetAssetVisualEntryForAsset(CohortName, AssetId);
-	if (Entry.IsSet())
+	// Multi-phase 后同 asset 多行：必须聚合所有 phase 行的哈希，否则 shadow Level 1 diff 漏掉
+	// 局部 phase 变化（例如 anim 仅 PhaseId=1 那一行 embedding 变了）。
+	extern uint64 ComputeAssetVisualRowHash(const FIndexedAssetVisualEntry&);
+	for (const FIndexedAssetVisualEntry& Entry : GetAssetVisualEntriesForAsset(CohortName, AssetId))
 	{
-		extern uint64 ComputeAssetVisualRowHash(const FIndexedAssetVisualEntry&);
 		++Aggregate.RowCount;
-		Aggregate.RowHashSum += ComputeAssetVisualRowHash(Entry.GetValue());
+		Aggregate.RowHashSum += ComputeAssetVisualRowHash(Entry);
 	}
 	return Aggregate;
 }

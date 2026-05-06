@@ -20,6 +20,13 @@ namespace AssetVisualArtifactSerializerInternal
 		Bytes.Add(static_cast<uint8>((Value >> 24) & 0xff));
 	}
 
+	static void WriteFloatBits(TArray<uint8>& Bytes, const float Value)
+	{
+		uint32 Bits = 0;
+		FMemory::Memcpy(&Bits, &Value, sizeof(uint32));
+		WriteUInt32(Bytes, Bits);
+	}
+
 	static void WriteString(TArray<uint8>& Bytes, const FString& Value)
 	{
 		FTCHARToUTF8 Convert(*Value);
@@ -64,6 +71,17 @@ namespace AssetVisualArtifactSerializerInternal
 		return true;
 	}
 
+	static bool ReadFloatBits(const TArray<uint8>& Bytes, int32& Offset, float& OutValue)
+	{
+		uint32 Bits = 0;
+		if (!ReadUInt32(Bytes, Offset, Bits))
+		{
+			return false;
+		}
+		FMemory::Memcpy(&OutValue, &Bits, sizeof(uint32));
+		return true;
+	}
+
 	static bool ReadString(const TArray<uint8>& Bytes, int32& Offset, FString& OutValue)
 	{
 		uint32 Length = 0;
@@ -101,43 +119,61 @@ namespace AssetVisualArtifactSerializerInternal
 		return true;
 	}
 
-	static constexpr uint8 PayloadSchemaVersion = 1;
+	static constexpr uint8 PayloadSchemaVersion = 3;
 }
 
 namespace AssetVisualArtifactSerializer
 {
 	void SerializePayload(
-		const FIndexedAssetVisualEntry& Entry,
-		const TArray<uint8>& PreviewPng,
+		const TArray<FIndexedAssetVisualEntry>& Entries,
+		const TArray<TArray<uint8>>& PerPhasePreviewPngs,
 		TArray<uint8>& OutBytes)
 	{
 		using namespace AssetVisualArtifactSerializerInternal;
 
+		// Caller 必须保证至少一份 entry；空数组 payload 没有共享字段可写。
+		// 走到这里前 BuildArtifact 已经判断过 entry 非空。
+		check(Entries.Num() > 0);
+		// PNG 数组长度必须严格匹配 entry 数；不匹配是上游契约违反，立刻 check 出来。
+		check(PerPhasePreviewPngs.Num() == Entries.Num());
+
+		// 共享字段从第一份 entry 取；调用方契约要求所有 entry 在共享字段上必须一致。
+		const FIndexedAssetVisualEntry& Head = Entries[0];
+
 		WriteUInt8(OutBytes, PayloadSchemaVersion);
-		WriteString(OutBytes, Entry.AssetPath);
-		WriteString(OutBytes, Entry.ShardId);
-		WriteUInt32(OutBytes, static_cast<uint32>(Entry.ShardPrefixDepth));
-		WriteString(OutBytes, Entry.ProviderId);
-		WriteUInt32(OutBytes, Entry.ProviderVersion);
-		WriteUInt32(OutBytes, Entry.RenderRecipeVersion);
-		WriteUInt32(OutBytes, static_cast<uint32>(Entry.EmbeddingDim));
-		WriteUInt8(OutBytes, Entry.EmbeddingDtype);
-		WriteBlob(OutBytes, Entry.EmbeddingBytes);
-		WriteBlob(OutBytes, PreviewPng);
+		WriteString(OutBytes, Head.AssetPath);
+		WriteString(OutBytes, Head.ShardId);
+		WriteUInt32(OutBytes, static_cast<uint32>(Head.ShardPrefixDepth));
+		WriteString(OutBytes, Head.ProviderId);
+		WriteUInt32(OutBytes, Head.ProviderVersion);
+		WriteUInt32(OutBytes, Head.RenderRecipeVersion);
+		WriteUInt32(OutBytes, static_cast<uint32>(Head.EmbeddingDim));
+		WriteUInt8(OutBytes, Head.EmbeddingDtype);
+
+		WriteUInt32(OutBytes, static_cast<uint32>(Entries.Num()));
+		for (int32 PhaseIndex = 0; PhaseIndex < Entries.Num(); ++PhaseIndex)
+		{
+			const FIndexedAssetVisualEntry& Entry = Entries[PhaseIndex];
+			WriteUInt8(OutBytes, Entry.PhaseId);
+			WriteFloatBits(OutBytes, Entry.PhaseT);
+			WriteString(OutBytes, Entry.PhaseLabel);
+			WriteBlob(OutBytes, Entry.EmbeddingBytes);
+			WriteBlob(OutBytes, PerPhasePreviewPngs[PhaseIndex]);
+		}
 	}
 
 	bool DeserializePayload(
 		const TArray<uint8>& Bytes,
-		FIndexedAssetVisualEntry& OutEntry,
-		TArray<uint8>& OutPreviewPng)
+		TArray<FIndexedAssetVisualEntry>& OutEntries,
+		TArray<TArray<uint8>>& OutPerPhasePreviewPngs)
 	{
 		using namespace AssetVisualArtifactSerializerInternal;
 
+		OutEntries.Reset();
+		OutPerPhasePreviewPngs.Reset();
+
 		int32 Offset = 0;
 		uint8 SchemaVersion = 0;
-		uint32 ShardPrefixDepth = 0;
-		uint32 EmbeddingDim = 0;
-
 		if (!ReadUInt8(Bytes, Offset, SchemaVersion))
 		{
 			return false;
@@ -146,22 +182,74 @@ namespace AssetVisualArtifactSerializer
 		{
 			return false;
 		}
-		if (!ReadString(Bytes, Offset, OutEntry.AssetPath)
-			|| !ReadString(Bytes, Offset, OutEntry.ShardId)
+
+		FString AssetPath;
+		FString ShardId;
+		uint32 ShardPrefixDepth = 0;
+		FString ProviderId;
+		uint32 ProviderVersion = 1;
+		uint32 RenderRecipeVersion = 1;
+		uint32 EmbeddingDim = 0;
+		uint8 EmbeddingDtype = 0;
+
+		if (!ReadString(Bytes, Offset, AssetPath)
+			|| !ReadString(Bytes, Offset, ShardId)
 			|| !ReadUInt32(Bytes, Offset, ShardPrefixDepth)
-			|| !ReadString(Bytes, Offset, OutEntry.ProviderId)
-			|| !ReadUInt32(Bytes, Offset, OutEntry.ProviderVersion)
-			|| !ReadUInt32(Bytes, Offset, OutEntry.RenderRecipeVersion)
+			|| !ReadString(Bytes, Offset, ProviderId)
+			|| !ReadUInt32(Bytes, Offset, ProviderVersion)
+			|| !ReadUInt32(Bytes, Offset, RenderRecipeVersion)
 			|| !ReadUInt32(Bytes, Offset, EmbeddingDim)
-			|| !ReadUInt8(Bytes, Offset, OutEntry.EmbeddingDtype)
-			|| !ReadBlob(Bytes, Offset, OutEntry.EmbeddingBytes)
-			|| !ReadBlob(Bytes, Offset, OutPreviewPng))
+			|| !ReadUInt8(Bytes, Offset, EmbeddingDtype))
 		{
 			return false;
 		}
 
-		OutEntry.ShardPrefixDepth = static_cast<int32>(ShardPrefixDepth);
-		OutEntry.EmbeddingDim = static_cast<int32>(EmbeddingDim);
+		uint32 NumPhases = 0;
+		if (!ReadUInt32(Bytes, Offset, NumPhases))
+		{
+			return false;
+		}
+		// 防御：至少 1 份 phase；NumPhases=0 说明 payload 损坏。
+		if (NumPhases == 0)
+		{
+			return false;
+		}
+		// 防御：NumPhases 上限保护（VFX/Anim 实际只有 3 phase；放宽到 256 给未来扩展空间）。
+		if (NumPhases > 256)
+		{
+			return false;
+		}
+
+		OutEntries.Reserve(static_cast<int32>(NumPhases));
+		OutPerPhasePreviewPngs.Reserve(static_cast<int32>(NumPhases));
+		for (uint32 PhaseIndex = 0; PhaseIndex < NumPhases; ++PhaseIndex)
+		{
+			FIndexedAssetVisualEntry Entry;
+			Entry.AssetPath = AssetPath;
+			Entry.ShardId = ShardId;
+			Entry.ShardPrefixDepth = static_cast<int32>(ShardPrefixDepth);
+			Entry.ProviderId = ProviderId;
+			Entry.ProviderVersion = ProviderVersion;
+			Entry.RenderRecipeVersion = RenderRecipeVersion;
+			Entry.EmbeddingDim = static_cast<int32>(EmbeddingDim);
+			Entry.EmbeddingDtype = EmbeddingDtype;
+
+			uint8 PhaseId = 0;
+			float PhaseT = 0.0f;
+			TArray<uint8> PhasePng;
+			if (!ReadUInt8(Bytes, Offset, PhaseId)
+				|| !ReadFloatBits(Bytes, Offset, PhaseT)
+				|| !ReadString(Bytes, Offset, Entry.PhaseLabel)
+				|| !ReadBlob(Bytes, Offset, Entry.EmbeddingBytes)
+				|| !ReadBlob(Bytes, Offset, PhasePng))
+			{
+				return false;
+			}
+			Entry.PhaseId = PhaseId;
+			Entry.PhaseT = PhaseT;
+			OutEntries.Add(MoveTemp(Entry));
+			OutPerPhasePreviewPngs.Add(MoveTemp(PhasePng));
+		}
 		return true;
 	}
 }

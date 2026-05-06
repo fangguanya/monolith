@@ -1,6 +1,7 @@
 #include "Indexers/AssetVisualSemanticIndexer.h"
 
 #include "Embedders/ClipSemanticEmbeddingProvider.h"
+#include "Indexers/AssetVisualPhase.h"
 #include "AssetVisualArtifact.h"
 #include "AssetVisualEmbeddingProvider.h"
 #include "AssetVisualSharding.h"
@@ -37,15 +38,7 @@ bool FAssetVisualSemanticIndexer::BuildArtifact(
 		return false;
 	}
 
-	const bool bSupportedClass =
-		LoadedAsset->IsA(UStaticMesh::StaticClass()) ||
-		LoadedAsset->IsA(USkeletalMesh::StaticClass()) ||
-		LoadedAsset->IsA(UMaterialInterface::StaticClass()) ||
-		LoadedAsset->IsA(UWidgetBlueprint::StaticClass());
-	if (!bSupportedClass)
-	{
-		return false;
-	}
+	// 不再做硬编码 IsA 检查；canonical renderer 内部用 UThumbnailManager 自动分发。
 
 	// Provider 通过 registry 取（启动时由 subsystem 注册一份单例）。
 	const FName ProviderId = FName(TEXT("clip_vit_b32_v1"));
@@ -76,48 +69,69 @@ bool FAssetVisualSemanticIndexer::BuildArtifact(
 
 	using namespace MonolithCapture;
 
-	// 1) 渲染 iso 单视图（不要 silhouette）。
+	// Multi-phase 索引：与 geometric indexer 同步用 GetPhasesForAsset 决定 phase 列表。
+	// 必须共享同一份 phase 定义，否则 geometric / semantic 在同 PhaseId 下对应的不是同一时间点。
+	const TArray<FAssetVisualPhaseDef> Phases = AssetVisualPhase::GetPhasesForAsset(LoadedAsset);
+	if (Phases.Num() == 0)
+	{
+		return false;
+	}
+	const FName ClassHint = AssetVisualPhase::GetRendererAssetClassHint(LoadedAsset);
+
 	IAssetCanonicalRenderer& Renderer = GetAssetCanonicalRenderer();
-	FCanonicalRenderRequest Request;
-	Request.Asset = LoadedAsset;
-	Request.Resolution = 224; // CLIP-ViT-B/32 输入分辨率
-	Request.Views = { ECanonicalView::Iso };
-	Request.bComputeSilhouette = false;
 
-	TArray<FCanonicalRenderResult> Results;
-	if (!Renderer.RenderCanonical(Request, Results) || Results.Num() != 1)
-	{
-		return false;
-	}
-
-	// 2) 推理 512 维向量。
-	TArray<float> Embedding;
-	if (!Provider->Encode(Results[0].ColorImage, Results[0].SilhouetteImage, Embedding))
-	{
-		// Encode 失败：commandlet 会把 mesh 重投 OfflineOnly 队列，等下次跑或下次模型就位。
-		return false;
-	}
-
-	// 3) ShardKey（semantic 容量上限 8K mesh / shard）。
+	// ShardKey 跨 phase 一致（semantic 容量上限 8K mesh / shard）。
 	const FAssetVisualShardCapacityPolicy Policy = FAssetVisualShardCapacityPolicy::Semantic();
 	const FString AssetPath = AssetData.GetObjectPathString();
 	const FAssetVisualShardKey ShardKey = ComputeAssetVisualShardKey(AssetPath, Policy.InitialPrefixDepth);
-
-	// 4) 装配视觉行 + 序列化 payload。
 	const FAssetVisualProviderInfo ProviderInfo = Provider->GetProviderInfo();
-	FIndexedAssetVisualEntry Entry;
-	Entry.AssetPath = AssetPath;
-	Entry.ShardId = ShardKey.ShardId;
-	Entry.ShardPrefixDepth = ShardKey.PrefixDepth;
-	Entry.ProviderId = ProviderInfo.ProviderId.ToString();
-	Entry.ProviderVersion = ProviderInfo.ProviderVersion;
-	Entry.RenderRecipeVersion = Renderer.GetRenderRecipeVersion();
-	Entry.EmbeddingDim = Embedding.Num();
-	// CLIP 推理后 retriever 仍按 FP32 比较；FP16 节省 cohort embedding 表的存储字节数。
-	// 这里编码为 FP16 半精度落盘。
-	Entry.EmbeddingDtype = 1;
-	Entry.EmbeddingBytes.SetNumUninitialized(Embedding.Num() * sizeof(uint16));
+
+	TArray<FIndexedAssetVisualEntry> Entries;
+	TArray<TArray<uint8>> EmptyPngs; // semantic 不携带 preview，每 phase 一份空 blob。
+	Entries.Reserve(Phases.Num());
+	EmptyPngs.Reserve(Phases.Num());
+
+	for (const FAssetVisualPhaseDef& Phase : Phases)
 	{
+		FCanonicalRenderRequest Request;
+		Request.Asset = LoadedAsset;
+		Request.Resolution = 224; // CLIP-ViT-B/32 输入分辨率
+		Request.Views = { ECanonicalView::Iso };
+		Request.bComputeSilhouette = false;
+		Request.PhaseT = Phase.PhaseT;
+		Request.PhaseId = Phase.PhaseId;
+		Request.AssetClassHint = ClassHint;
+
+		TArray<FCanonicalRenderResult> Results;
+		if (!Renderer.RenderCanonical(Request, Results) || Results.Num() != 1)
+		{
+			UE_LOG(LogMonolithIndex, Warning,
+				TEXT("AssetVisualSemanticIndexer: 渲染 phase %u (t=%.3f) 失败 (%s)"),
+				static_cast<uint32>(Phase.PhaseId), Phase.PhaseT, *AssetData.PackageName.ToString());
+			return false;
+		}
+
+		TArray<float> Embedding;
+		if (!Provider->Encode(Results[0].ColorImage, Results[0].SilhouetteImage, Embedding))
+		{
+			// Encode 失败：commandlet 会把 mesh 重投 OfflineOnly 队列，等下次跑或下次模型就位。
+			return false;
+		}
+
+		FIndexedAssetVisualEntry Entry;
+		Entry.AssetPath = AssetPath;
+		Entry.ShardId = ShardKey.ShardId;
+		Entry.ShardPrefixDepth = ShardKey.PrefixDepth;
+		Entry.ProviderId = ProviderInfo.ProviderId.ToString();
+		Entry.ProviderVersion = ProviderInfo.ProviderVersion;
+		Entry.RenderRecipeVersion = Renderer.GetRenderRecipeVersion();
+		Entry.EmbeddingDim = Embedding.Num();
+		Entry.EmbeddingDtype = 1; // FP16 落盘
+		Entry.PhaseId = Phase.PhaseId;
+		Entry.PhaseT = Phase.PhaseT;
+		Entry.PhaseLabel = Phase.Label;
+
+		Entry.EmbeddingBytes.SetNumUninitialized(Embedding.Num() * sizeof(uint16));
 		// FP32 → FP16 round-to-nearest-even（足够推理用）。
 		uint16* Dst = reinterpret_cast<uint16*>(Entry.EmbeddingBytes.GetData());
 		for (int32 Index = 0; Index < Embedding.Num(); ++Index)
@@ -129,12 +143,10 @@ bool FAssetVisualSemanticIndexer::BuildArtifact(
 			uint32 Mant = F & 0x7fffff;
 			if (Exp <= 0)
 			{
-				// underflow → ±0
 				Dst[Index] = static_cast<uint16>(Sign);
 			}
 			else if (Exp >= 31)
 			{
-				// overflow / inf / nan
 				Dst[Index] = static_cast<uint16>(Sign | 0x7c00);
 			}
 			else
@@ -142,11 +154,11 @@ bool FAssetVisualSemanticIndexer::BuildArtifact(
 				Dst[Index] = static_cast<uint16>(Sign | (static_cast<uint32>(Exp) << 10) | (Mant >> 13));
 			}
 		}
-	}
 
-	// semantic indexer 不重复持久化 PNG；preview_view 字段在 Materialize 阶段从
-	// geometric cohort 同 mesh 行复用。
-	const TArray<uint8> EmptyPng;
+		Entries.Add(MoveTemp(Entry));
+		// semantic 不持久化 PNG；preview_view 路径在 Materialize 阶段从 geometric cohort 同 PhaseId 行复用。
+		EmptyPngs.Add(TArray<uint8>());
+	}
 
 	OutArtifact = FMonolithArtifact();
 	OutArtifact.ArtifactSchemaVersion = GetArtifactSchemaVersion();
@@ -154,7 +166,7 @@ bool FAssetVisualSemanticIndexer::BuildArtifact(
 	OutArtifact.IndexerVersion = GetIndexerVersion();
 	OutArtifact.ExecutionMode = GetExecutionMode();
 	OutArtifact.PackageName = AssetData.PackageName.ToString();
-	AssetVisualArtifactSerializer::SerializePayload(Entry, EmptyPng, OutArtifact.Payload);
+	AssetVisualArtifactSerializer::SerializePayload(Entries, EmptyPngs, OutArtifact.Payload);
 	return OutArtifact.Payload.Num() > 0;
 }
 
@@ -163,23 +175,44 @@ bool FAssetVisualSemanticIndexer::MaterializeArtifact(
 	FMonolithIndexDatabase& DB,
 	const int64 AssetId)
 {
-	FIndexedAssetVisualEntry Entry;
-	TArray<uint8> PreviewPng;
-	if (!AssetVisualArtifactSerializer::DeserializePayload(Artifact.Payload, Entry, PreviewPng))
+	TArray<FIndexedAssetVisualEntry> Entries;
+	TArray<TArray<uint8>> PerPhasePngs;
+	if (!AssetVisualArtifactSerializer::DeserializePayload(Artifact.Payload, Entries, PerPhasePngs))
+	{
+		return false;
+	}
+	if (Entries.Num() == 0)
 	{
 		return false;
 	}
 
-	Entry.AssetId = AssetId;
-
-	// preview_view 复用 geometric cohort 已落盘的 PNG。
-	const TOptional<FIndexedAssetVisualEntry> GeometricRow = DB.GetAssetVisualEntryForAsset(TEXT("AssetVisualGeometric"), AssetId);
-	if (GeometricRow.IsSet())
+	// preview_view 复用 geometric cohort 已落盘的 PNG（geometric 与 semantic 走同一份 GetPhasesForAsset，
+	// 同 phase_id 共用同一张 PNG）。这里按 PhaseId 在 geometric cohort 行里查匹配条目；
+	// 找不到匹配就 fallback 到任意可见行的 PreviewViewPath。
+	const TArray<FIndexedAssetVisualEntry> GeometricRows = DB.GetAssetVisualEntriesForAsset(TEXT("AssetVisualGeometric"), AssetId);
+	auto FindGeoPreviewForPhase = [&GeometricRows](uint8 PhaseId) -> FString
 	{
-		Entry.PreviewViewPath = GeometricRow.GetValue().PreviewViewPath;
-	}
+		for (const FIndexedAssetVisualEntry& Geo : GeometricRows)
+		{
+			if (Geo.PhaseId == PhaseId)
+			{
+				return Geo.PreviewViewPath;
+			}
+		}
+		return GeometricRows.Num() > 0 ? GeometricRows[0].PreviewViewPath : FString();
+	};
 
-	return DB.InsertAssetVisualEntry(TEXT("AssetVisualSemantic"), Entry) > 0;
+	bool bAllOk = true;
+	for (FIndexedAssetVisualEntry& Entry : Entries)
+	{
+		Entry.AssetId = AssetId;
+		Entry.PreviewViewPath = FindGeoPreviewForPhase(Entry.PhaseId);
+		if (DB.InsertAssetVisualEntry(TEXT("AssetVisualSemantic"), Entry) <= 0)
+		{
+			bAllOk = false;
+		}
+	}
+	return bAllOk;
 }
 
 bool FAssetVisualSemanticIndexer::MaterializeArtifactToShadow(
@@ -188,26 +221,43 @@ bool FAssetVisualSemanticIndexer::MaterializeArtifactToShadow(
 	const int64 AssetId,
 	const FString& CohortName)
 {
-	FIndexedAssetVisualEntry Entry;
-	TArray<uint8> PreviewPng;
-	if (!AssetVisualArtifactSerializer::DeserializePayload(Artifact.Payload, Entry, PreviewPng))
+	TArray<FIndexedAssetVisualEntry> Entries;
+	TArray<TArray<uint8>> PerPhasePngs;
+	if (!AssetVisualArtifactSerializer::DeserializePayload(Artifact.Payload, Entries, PerPhasePngs))
+	{
+		return false;
+	}
+	if (Entries.Num() == 0)
 	{
 		return false;
 	}
 
-	Entry.AssetId = AssetId;
-	const TOptional<FIndexedAssetVisualEntry> GeometricRow = DB.GetAssetVisualEntryForAsset(TEXT("AssetVisualGeometric"), AssetId);
-	if (GeometricRow.IsSet())
+	const TArray<FIndexedAssetVisualEntry> GeometricRows = DB.GetAssetVisualEntriesForAsset(TEXT("AssetVisualGeometric"), AssetId);
+	auto FindGeoPreviewForPhase = [&GeometricRows](uint8 PhaseId) -> FString
 	{
-		Entry.PreviewViewPath = GeometricRow.GetValue().PreviewViewPath;
-	}
-
-	FMonolithShadowIndexedAssetVisualEntry ShadowEntry;
-	ShadowEntry.Entry = Entry;
-	ShadowEntry.RowHash = ComputeAssetVisualRowHash(Entry);
+		for (const FIndexedAssetVisualEntry& Geo : GeometricRows)
+		{
+			if (Geo.PhaseId == PhaseId)
+			{
+				return Geo.PreviewViewPath;
+			}
+		}
+		return GeometricRows.Num() > 0 ? GeometricRows[0].PreviewViewPath : FString();
+	};
 
 	TArray<FMonolithShadowIndexedAssetVisualEntry> ShadowEntries;
-	ShadowEntries.Add(MoveTemp(ShadowEntry));
+	ShadowEntries.Reserve(Entries.Num());
+	for (FIndexedAssetVisualEntry& Entry : Entries)
+	{
+		Entry.AssetId = AssetId;
+		Entry.PreviewViewPath = FindGeoPreviewForPhase(Entry.PhaseId);
+
+		FMonolithShadowIndexedAssetVisualEntry ShadowEntry;
+		ShadowEntry.Entry = Entry;
+		ShadowEntry.RowHash = ComputeAssetVisualRowHash(Entry);
+		ShadowEntries.Add(MoveTemp(ShadowEntry));
+	}
+
 	return DB.ReplaceShadowAssetVisualEntriesForAsset(
 		TEXT("AssetVisualSemantic"),
 		CohortName,

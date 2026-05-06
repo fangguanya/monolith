@@ -346,8 +346,10 @@ uint64 ComputeAssetVisualRowHash(const FIndexedAssetVisualEntry& Entry)
 {
 	// AssetVisual 行哈希必须把 provider triple + embedding 字节都纳入，
 	// 这样 provider 升级或视觉特征任何变化都能立刻在 shadow Level 1 diff 里被发现。
+	// Multi-phase 后行身份 = (asset, phase_id, phase_t, phase_label) 全部参与，
+	// 否则同 asset 不同 phase 的两行哈希会重复（XOR 后互相抵消）。
 	TArray<uint8> Bytes;
-	Bytes.Reserve(96 + Entry.AssetPath.Len() + Entry.ShardId.Len() + Entry.ProviderId.Len() + Entry.PreviewViewPath.Len() + Entry.EmbeddingBytes.Num());
+	Bytes.Reserve(112 + Entry.AssetPath.Len() + Entry.ShardId.Len() + Entry.ProviderId.Len() + Entry.PreviewViewPath.Len() + Entry.PhaseLabel.Len() + Entry.EmbeddingBytes.Num());
 
 	MonolithIndexerShadowModeInternal::WriteString(Bytes, Entry.AssetPath);
 	MonolithIndexerShadowModeInternal::WriteString(Bytes, Entry.ShardId);
@@ -363,6 +365,13 @@ uint64 ComputeAssetVisualRowHash(const FIndexedAssetVisualEntry& Entry)
 		Bytes.Append(Entry.EmbeddingBytes.GetData(), Entry.EmbeddingBytes.Num());
 	}
 	MonolithIndexerShadowModeInternal::WriteString(Bytes, Entry.PreviewViewPath);
+
+	// Phase 字段：PhaseT 用 IEEE-754 bit pattern 写入避免浮点比较歧义。
+	MonolithIndexerShadowModeInternal::WriteUInt32(Bytes, static_cast<uint32>(Entry.PhaseId));
+	uint32 PhaseTBits = 0;
+	FMemory::Memcpy(&PhaseTBits, &Entry.PhaseT, sizeof(uint32));
+	MonolithIndexerShadowModeInternal::WriteUInt32(Bytes, PhaseTBits);
+	MonolithIndexerShadowModeInternal::WriteString(Bytes, Entry.PhaseLabel);
 
 	return FXxHash64::HashBuffer(Bytes.GetData(), static_cast<uint64>(Bytes.Num())).Hash;
 }

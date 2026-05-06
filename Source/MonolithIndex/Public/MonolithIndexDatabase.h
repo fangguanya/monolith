@@ -674,8 +674,13 @@ public:
 	int64 InsertAssetVisualEntry(const FString& CohortName, const FIndexedAssetVisualEntry& Entry);
 	/** 清空整张视觉 cohort production 表（不删 shadow）。Materialize 重跑前先清，避免 INSERT 累加。 */
 	bool ClearAssetVisualEntries(const FString& CohortName);
-	/** 读取某资产当前可见 revision 下的视觉行；不存在时返回空。 */
+	/** 读取某资产当前可见 revision 下的视觉行；不存在时返回空。
+	 *  Multi-phase 资产同 asset 在 cohort 内有多行，此 API 按 phase_id ASC 取第一行（即 phase 0）；
+	 *  需要全部 phase 行调 GetAssetVisualEntriesForAsset。 */
 	TOptional<FIndexedAssetVisualEntry> GetAssetVisualEntryForAsset(const FString& CohortName, int64 AssetId);
+	/** 读取某资产当前可见 revision 下所有 phase 的视觉行（按 phase_id ASC 排序）。
+	 *  单 phase 资产返回长度 1；多 phase 资产返回长度 N（与 GetPhasesForAsset 对应）。 */
+	TArray<FIndexedAssetVisualEntry> GetAssetVisualEntriesForAsset(const FString& CohortName, int64 AssetId);
 	/** 读取整张视觉 cohort 表，可选按 ShardId 过滤；用于 shard reducer 重建 ANN 快照。 */
 	TArray<FIndexedAssetVisualEntry> GetAssetVisualEntries(const FString& CohortName, const FString& ShardIdFilter = FString());
 	/** 用一整份新快照替换某资产在视觉 shadow 表里的行。 */

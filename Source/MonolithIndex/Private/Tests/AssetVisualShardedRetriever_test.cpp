@@ -125,3 +125,53 @@ bool FAssetVisualRetrieverDeterministicTest::RunTest(const FString& Parameters)
 	}
 	return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FAssetVisualRetrieverMultiPhaseHitTest,
+	"Monolith.Index.AssetVisual.Retriever.MultiPhaseHitCarriesPhaseId",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FAssetVisualRetrieverMultiPhaseHitTest::RunTest(const FString& Parameters)
+{
+	// Multi-phase 资产 = 同 AssetPath 出现 N 次（每 phase 一行）；query 与 phase 1 的向量最近时
+	// retriever 必须把 PhaseId=1 带回到 hit，调用方才能 dedup + 报告 best_phase_id。
+	FAssetVisualShardEmbeddings Shard;
+	Shard.ShardId = TEXT("Game.Anim");
+	Shard.AssetPaths = {
+		TEXT("/Game/Anim/SK_Walk.SK_Walk"), // phase 0：跟 query 偏离
+		TEXT("/Game/Anim/SK_Walk.SK_Walk"), // phase 1：跟 query 完全平行
+		TEXT("/Game/Anim/SK_Walk.SK_Walk"), // phase 2：跟 query 反向
+	};
+	Shard.RowPhaseIds = { 0, 1, 2 };
+	Shard.Vectors = {
+		0.0f, 1.0f, 0.0f, 0.0f, // phase 0 → cosine 0
+		1.0f, 0.0f, 0.0f, 0.0f, // phase 1 → cosine 1
+		-1.0f, 0.0f, 0.0f, 0.0f, // phase 2 → cosine -1
+	};
+	Shard.EmbeddingDim = 4;
+	Shard.bL2Normalized = true;
+
+	TArray<FAssetVisualShardEmbeddings> Shards = { MoveTemp(Shard) };
+
+	const TArray<float> Query = { 1.0f, 0.0f, 0.0f, 0.0f };
+	FAssetVisualRetrieverQuery QueryDesc;
+	QueryDesc.QueryVector = Query;
+	QueryDesc.TopK = 3;
+
+	TArray<FAssetVisualRetrieverHit> Hits;
+	FAssetVisualShardedRetriever Retriever;
+	Retriever.QueryAcrossShards(Shards, QueryDesc, Hits);
+
+	TestEqual(TEXT("3 hits returned"), Hits.Num(), 3);
+	if (Hits.Num() != 3)
+	{
+		return false;
+	}
+	// 最高分必须是 phase 1（cosine=1）。
+	TestEqual(TEXT("best hit is phase 1"), static_cast<int32>(Hits[0].PhaseId), 1);
+	TestTrue(TEXT("best score close to 1.0"), FMath::IsNearlyEqual(Hits[0].Score, 1.0f, 0.01f));
+	// 第二是 phase 0（cosine=0），第三是 phase 2（cosine=-1）。
+	TestEqual(TEXT("second hit is phase 0"), static_cast<int32>(Hits[1].PhaseId), 0);
+	TestEqual(TEXT("third hit is phase 2"), static_cast<int32>(Hits[2].PhaseId), 2);
+	return true;
+}

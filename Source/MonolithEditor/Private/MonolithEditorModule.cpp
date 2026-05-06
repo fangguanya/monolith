@@ -4,7 +4,9 @@
 #include "MonolithToolRegistry.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithSettings.h"
+#include "MonolithToolbar.h"
 #include "PropertyEditorModule.h"
+#include "ToolMenus.h"
 #include "Misc/OutputDeviceRedirector.h"
 
 #define LOCTEXT_NAMESPACE "FMonolithEditorModule"
@@ -25,11 +27,16 @@ void FMonolithEditorModule::StartupModule()
 		FOnGetDetailCustomizationInstance::CreateStatic(&FMonolithSettingsCustomization::MakeInstance)
 	);
 
+	// LevelEditor 工具栏入口：必须等 ToolMenus 系统起来后再 register。
+	UToolMenus::RegisterStartupCallback(
+		FSimpleMulticastDelegate::FDelegate::CreateStatic(&MonolithToolbar::RegisterToolbarEntries));
+
 	UE_LOG(LogMonolith, Log, TEXT("Monolith — Editor module loaded (13 actions)"));
 }
 
 void FMonolithEditorModule::ShutdownModule()
 {
+	MonolithToolbar::UnregisterToolbarEntries();
 	FMonolithToolRegistry::Get().UnregisterNamespace(TEXT("editor"));
 
 	if (FModuleManager::Get().IsModuleLoaded("PropertyEditor"))

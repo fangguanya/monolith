@@ -73,6 +73,33 @@ namespace MonolithCapture
 		TArray<ECanonicalView> Views;
 		/** 是否同时计算 silhouette（geometric provider 必需，semantic 不需要）。 */
 		bool bComputeSilhouette = false;
+		/*
+		 * Phase 采样时间（multi-phase 资产专用）。
+		 *
+		 *  - AnimSequence / AnimMontage / AnimBlueprint：归一化 0..1，乘以 anim 总时长后得到秒。
+		 *    PhaseT=0 = 起始姿势，0.5 = 中间，1.0 = 末尾。
+		 *  - NiagaraSystem / NiagaraEmitter：直接是仿真秒数（如 0.5s / 1.5s / 3.0s）。
+		 *  - 其他资产类（StaticMesh / Material / Widget 等）：忽略此字段。
+		 *
+		 * 默认 0 时 anim 走 ref pose，niagara 走 0 秒（点燃瞬间）。
+		 */
+		float PhaseT = 0.0f;
+		/*
+		 * Phase id（PhaseT 的稳定整数键，用于 multi-phase 资产识别第几相位）。
+		 *
+		 * 渲染器自己不消费此字段，仅用于诊断日志（PNG 文件名 / 日志 tag）。
+		 * artifact 的 phase 身份由 indexer 层在 FIndexedAssetVisualEntry 上携带。
+		 */
+		uint8 PhaseId = 0;
+		/*
+		 * 资产类提示（multi-phase 路径分发优化）。
+		 *
+		 * 留空时 renderer 自己用 `Cast<>` 链探测；显式传入可绕过探测顺序问题
+		 * （例如 AnimMontage 是 UAnimSequenceBase 的子类，indexer 想强制走 anim 旁路而不是 fallback）。
+		 *
+		 * 推荐取值：`AnimSequence` / `AnimMontage` / `AnimBlueprint` / `NiagaraSystem` / `NiagaraEmitter`。
+		 */
+		FName AssetClassHint;
 	};
 
 	/*

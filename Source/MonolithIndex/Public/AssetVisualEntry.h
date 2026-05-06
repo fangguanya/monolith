@@ -41,6 +41,21 @@ struct FIndexedAssetVisualEntry
 	TArray<uint8> EmbeddingBytes;
 	/** 持久化的 256×256 iso 预览 PNG 路径；query 结果的 `preview_view` 字段直接拿这个。 */
 	FString PreviewViewPath;
+
+	/*
+	 * Multi-phase 索引字段：让 VFX/Anim 等"时序资产"按多个时间点分别落 embedding 行。
+	 *
+	 *  - 单 phase 资产（StaticMesh/Material 等）：PhaseId=0, PhaseT=0, PhaseLabel="" 全默认；
+	 *    一个 asset 在 cohort 内仍是一行。
+	 *  - 多 phase 资产（AnimSequence/Niagara）：同一 asset 在 cohort 内有多行，
+	 *    PhaseId=0..N-1 对应 GetPhasesForAsset 给出的相位序号；search 端按 asset_path GROUP BY 取最高分。
+	 *
+	 * 三个字段一起决定一行的 phase 身份：PhaseId 是稳定整数键，PhaseT 是采样时间（秒或归一化），
+	 * PhaseLabel 是给搜索结果用的可读名（"early"/"peak"/"tail"）。
+	 */
+	uint8 PhaseId = 0;
+	float PhaseT = 0.0f;
+	FString PhaseLabel;
 };
 
 /** Shadow 模式下的视觉行；额外带稳定 row hash。 */

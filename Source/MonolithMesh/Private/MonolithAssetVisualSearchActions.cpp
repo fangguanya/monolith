@@ -200,6 +200,7 @@ namespace MonolithAssetVisualSearchInternal
 			Shard.bL2Normalized = true;
 
 			Shard.AssetPaths.Reserve(Pair.Value.Num());
+			Shard.RowPhaseIds.Reserve(Pair.Value.Num());
 			if (Pair.Value.Num() > 0)
 			{
 				Shard.EmbeddingDim = Pair.Value[0]->EmbeddingDim;
@@ -214,6 +215,7 @@ namespace MonolithAssetVisualSearchInternal
 					continue;
 				}
 				Shard.AssetPaths.Add(Entry->AssetPath);
+				Shard.RowPhaseIds.Add(Entry->PhaseId);
 				if (Entry->EmbeddingDtype == 0)
 				{
 					// FP32 直接 append。
@@ -266,7 +268,10 @@ namespace MonolithAssetVisualSearchInternal
 		const float RerankScore,
 		const float CategoryMatch,
 		const float SizeMatch,
-		const bool bStale)
+		const bool bStale,
+		const uint8 BestPhaseId,
+		const float BestPhaseT,
+		const FString& BestPhaseLabel)
 	{
 		TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
 		Obj->SetStringField(TEXT("asset_path"), VisualHit.AssetPath);
@@ -283,6 +288,12 @@ namespace MonolithAssetVisualSearchInternal
 
 		Obj->SetNumberField(TEXT("category_match"), CategoryMatch);
 		Obj->SetNumberField(TEXT("size_match"), SizeMatch);
+
+		// Multi-phase 命中信息：让调用方知道这次最优分来自哪个 phase（"早 / 中 / 晚 / 0.5s 仿真" 等）。
+		// 单 phase 资产 BestPhaseId=0, BestPhaseT=0, BestPhaseLabel=""，仍然正确。
+		Obj->SetNumberField(TEXT("best_phase_id"), static_cast<int32>(BestPhaseId));
+		Obj->SetNumberField(TEXT("best_phase_t"), BestPhaseT);
+		Obj->SetStringField(TEXT("best_phase_label"), BestPhaseLabel);
 		return Obj;
 	}
 }
@@ -474,24 +485,62 @@ FMonolithActionResult FMonolithAssetVisualSearchActions::HandleSearchAssetsByIma
 		});
 	}
 
-	// 7) 融合 + rerank：把两 cohort 的 hits 合并、按 final score 重排。
+	// 7) 融合 + dedup：每 (asset_path, provider) 组取最高分 phase。
+	//
+	//    Multi-phase 资产同 asset_path 在 cohort 里会出现多行（每 phase 一行 embedding），
+	//    retriever top-K 可能把同一 asset 的多个 phase 都返回；如果不 dedup，会浪费 result list 的槽位。
+	//    每 (asset_path, provider) 只保留最高分那一行 + 它对应的 PhaseId，给调用方报 best_phase_*。
 	struct FCandidate
 	{
 		FString AssetPath;
 		float VisualScore = 0.0f;
 		FString ProviderId;
 		FString ShardId;
+		uint8 BestPhaseId = 0;
 	};
-	TArray<FCandidate> Candidates;
+
+	auto MergeBestPhase = [](TMap<FString, FCandidate>& ByAsset, const FAssetVisualRetrieverHit& Hit, const FString& ProviderId)
+	{
+		FCandidate* Existing = ByAsset.Find(Hit.AssetPath);
+		if (!Existing)
+		{
+			FCandidate C;
+			C.AssetPath = Hit.AssetPath;
+			C.VisualScore = Hit.Score;
+			C.ProviderId = ProviderId;
+			C.ShardId = Hit.ShardId;
+			C.BestPhaseId = Hit.PhaseId;
+			ByAsset.Add(Hit.AssetPath, MoveTemp(C));
+			return;
+		}
+		if (Hit.Score > Existing->VisualScore)
+		{
+			Existing->VisualScore = Hit.Score;
+			Existing->ShardId = Hit.ShardId;
+			Existing->BestPhaseId = Hit.PhaseId;
+		}
+	};
+
+	TMap<FString, FCandidate> GeoByAsset;
 	for (const FAssetVisualRetrieverHit& H : Geometric.Hits)
 	{
-		FCandidate C; C.AssetPath = H.AssetPath; C.VisualScore = H.Score; C.ProviderId = Geometric.ProviderId; C.ShardId = H.ShardId;
-		Candidates.Add(MoveTemp(C));
+		MergeBestPhase(GeoByAsset, H, Geometric.ProviderId);
 	}
+	TMap<FString, FCandidate> SemByAsset;
 	for (const FAssetVisualRetrieverHit& H : Semantic.Hits)
 	{
-		FCandidate C; C.AssetPath = H.AssetPath; C.VisualScore = H.Score; C.ProviderId = Semantic.ProviderId; C.ShardId = H.ShardId;
-		Candidates.Add(MoveTemp(C));
+		MergeBestPhase(SemByAsset, H, Semantic.ProviderId);
+	}
+
+	TArray<FCandidate> Candidates;
+	Candidates.Reserve(GeoByAsset.Num() + SemByAsset.Num());
+	for (TPair<FString, FCandidate>& Pair : GeoByAsset)
+	{
+		Candidates.Add(MoveTemp(Pair.Value));
+	}
+	for (TPair<FString, FCandidate>& Pair : SemByAsset)
+	{
+		Candidates.Add(MoveTemp(Pair.Value));
 	}
 
 	// rerank：结合 MeshCatalog 的 size / category。
@@ -538,14 +587,35 @@ FMonolithActionResult FMonolithAssetVisualSearchActions::HandleSearchAssetsByIma
 					}
 				}
 
-				// 从 visual cohort 行里拿 preview_view 路径。
+				// 从 visual cohort 行里拿 best phase 对应的 preview_view 路径 + phase 元信息。
+				// 多 phase 资产命中的 PhaseId 决定了哪张 PNG 是最相似的；优先匹配 (asset_path, phase_id)。
+				// fallback：找不到精确匹配就用任意可见 PhaseId=0 行（兼容老数据）。
+				float BestPhaseT = 0.0f;
+				FString BestPhaseLabel;
 				const TArray<FIndexedAssetVisualEntry> GeoRows = DB.GetAssetVisualEntries(TEXT("AssetVisualGeometric"), FString());
+				bool bFoundPhase = false;
 				for (const FIndexedAssetVisualEntry& Row : GeoRows)
 				{
-					if (Row.AssetPath == C.AssetPath)
+					if (Row.AssetPath == C.AssetPath && Row.PhaseId == C.BestPhaseId)
 					{
 						PreviewViewPath = Row.PreviewViewPath;
+						BestPhaseT = Row.PhaseT;
+						BestPhaseLabel = Row.PhaseLabel;
+						bFoundPhase = true;
 						break;
+					}
+				}
+				if (!bFoundPhase)
+				{
+					for (const FIndexedAssetVisualEntry& Row : GeoRows)
+					{
+						if (Row.AssetPath == C.AssetPath)
+						{
+							PreviewViewPath = Row.PreviewViewPath;
+							BestPhaseT = Row.PhaseT;
+							BestPhaseLabel = Row.PhaseLabel;
+							break;
+						}
 					}
 				}
 
@@ -553,8 +623,14 @@ FMonolithActionResult FMonolithAssetVisualSearchActions::HandleSearchAssetsByIma
 				const float TotalScore = 0.7f * C.VisualScore + 0.3f * RerankScore;
 				const bool bStaleEntry = (CohortStaleList.Find(C.ProviderId == TEXT("geometric_v1") ? FString(TEXT("AssetVisualGeometric")) : FString(TEXT("AssetVisualSemantic"))) != INDEX_NONE);
 
+				FAssetVisualRetrieverHit VisualHit;
+				VisualHit.AssetPath = C.AssetPath;
+				VisualHit.Score = C.VisualScore;
+				VisualHit.ShardId = C.ShardId;
+				VisualHit.PhaseId = C.BestPhaseId;
 				ResultsJson.Add(MakeShared<FJsonValueObject>(
-					BuildHitJson({ C.AssetPath, C.VisualScore, C.ShardId }, C.ProviderId, PreviewViewPath, TotalScore, RerankScore, CategoryMatch, SizeMatch, bStaleEntry)));
+					BuildHitJson(VisualHit, C.ProviderId, PreviewViewPath, TotalScore, RerankScore, CategoryMatch, SizeMatch, bStaleEntry,
+						C.BestPhaseId, BestPhaseT, BestPhaseLabel)));
 			}
 			return FMonolithActionResult::Success(MakeShared<FJsonObject>());
 		});

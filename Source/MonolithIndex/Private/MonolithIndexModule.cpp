@@ -13,7 +13,6 @@
 #include "Editor.h"
 #include "SMonolithIndexStatusBar.h"
 #include "ToolMenus.h"
-#include "Widgets/Input/SButton.h"
 #include "Widgets/Text/STextBlock.h"
 
 /*
@@ -28,32 +27,6 @@
  */
 
 #define LOCTEXT_NAMESPACE "FMonolithIndexModule"
-
-namespace
-{
-bool CanStartManualFullIndex(const FToolMenuContext&)
-{
-	if (!GEditor)
-	{
-		return false;
-	}
-
-	if (const UMonolithIndexSubsystem* const Subsystem = GEditor->GetEditorSubsystem<UMonolithIndexSubsystem>())
-	{
-		return !Subsystem->IsIndexing();
-	}
-
-	return false;
-}
-
-void StartManualFullIndex(const FToolMenuContext&)
-{
-	if (GEditor)
-	{
-		GEditor->Exec(nullptr, TEXT("Monolith.StartIndex full"));
-	}
-}
-}
 
 void FMonolithIndexModule::StartupModule()
 {
@@ -144,35 +117,15 @@ void FMonolithIndexModule::RegisterMenus()
 
 	FToolMenuOwnerScoped OwnerScoped(this);
 
-	UToolMenu* const AssetsToolbarMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.LevelEditorToolBar.AssetsToolBar");
-	if (AssetsToolbarMenu)
+	// AssetsToolBar 上的"Full Index"独立按钮已删除。Full Index / Incremental Index 现在统一进入 MonolithEditor
+	// 模块注册的 "Monolith Index" dropdown 里（参考 MonolithToolbar.cpp 的"传统 Indexer"分组），避免工具栏被
+	// 多个 Monolith 入口塞满。这里仍然保留 MonolithIndexToolbar section 的占位 anchor，让 dropdown 能 InsertAfter。
+	if (UToolMenu* const AssetsToolbarMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.LevelEditorToolBar.AssetsToolBar"))
 	{
-		FToolMenuSection& ToolbarSection = AssetsToolbarMenu->AddSection(
+		AssetsToolbarMenu->AddSection(
 			TEXT("MonolithIndexToolbar"),
 			FText::GetEmpty(),
 			FToolMenuInsert(TEXT("Content"), EToolMenuInsertType::After));
-
-		ToolbarSection.AddEntry(
-			FToolMenuEntry::InitWidget(
-				TEXT("MonolithFullIndex"),
-				SNew(SButton)
-				.Text(LOCTEXT("MonolithFullIndexShortLabel", "Full Index"))
-				.ToolTipText(LOCTEXT("MonolithFullIndexTooltip", "Run a manual full Monolith index rebuild via 'Monolith.StartIndex full'."))
-				.IsEnabled_Lambda([]()
-				{
-					return CanStartManualFullIndex(FToolMenuContext());
-				})
-				.OnClicked_Lambda([]()
-				{
-					StartManualFullIndex(FToolMenuContext());
-					return FReply::Handled();
-				}),
-				LOCTEXT("MonolithFullIndexLabel", "Monolith Full Index"),
-				true,
-				false)
-		);
-
-		UE_LOG(LogMonolithIndex, Log, TEXT("Registered Monolith full index button in LevelEditor.LevelEditorToolBar.AssetsToolBar"));
 	}
 
 	UToolMenu* const StatusBarMenu = UToolMenus::Get()->ExtendMenu("LevelEditor.StatusBar.ToolBar");

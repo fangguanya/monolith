@@ -24,6 +24,8 @@ public class MonolithEditor : ModuleRules
 			"PropertyEditor",
 			"Slate",
 			"SlateCore",
+			"ToolMenus",
+			"LevelEditor",
 			"Json",
 			"JsonUtilities",
 			"MessageLog",

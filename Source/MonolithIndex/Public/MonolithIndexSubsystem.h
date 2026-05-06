@@ -218,6 +218,28 @@ public:
 	 * 必须在游戏线程调用。 */
 	void MaterializeAssetVisualFromCache();
 
+	/** 子进程入口：只 build artifact 写 DDC，不写 SQLite，按 shard 切分。
+	 *  ShardIndex / ShardCount 由父进程传入；hash(package_path) % ShardCount == ShardIndex 的 asset 才处理。
+	 *  跑完后调用方负责 RequestExit。 */
+	void MaterializeAssetVisualBuildShard(int32 ShardIndex, int32 ShardCount);
+
+	/** 父进程入口：N 路并行 build，等所有 child 退出后从 DDC merge 到 SQLite。
+	 *  NumWorkers <= 1 退化为单进程同步路径；推荐 4-8（受 GPU 显存制约）。 */
+	void MaterializeAssetVisualParallel(int32 NumWorkers);
+
+	/** 工具栏入口：清空指定 cohort 的 SQLite 行。下次 Materialize 会重做。 */
+	bool ClearAssetVisualCohort(FName CohortId);
+
+	/** 当前 visual_pending.txt 里待处理的 asset 数（非 0 时状态栏 / 工具栏会提示）。 */
+	int32 GetVisualPendingCount() const;
+
+	/** 工具栏入口：等价 Monolith.StartIndex full（manual-only path）。 */
+	void RequestFullIndexFromUI();
+	/** 工具栏入口：等价 Monolith.StartIndex incremental，前置 baseline 检查交给调用方。 */
+	void StartIncrementalIndexFromUI();
+	/** 工具栏入口：当前是否能跑 incremental（有 baseline）。 */
+	bool CanDoIncrementalIndexFromUI() const;
+
 	// --- 查询接口（给 MCP action 和 UI 调用） ---
 	/** 全文搜索。 */
 	TArray<FSearchResult> Search(const FString& Query, int32 Limit = 50);
@@ -257,6 +279,18 @@ public:
 
 private:
 	friend struct FMonolithIndexConsoleCommands;
+
+	/** MaterializeAssetVisualImpl 的内部参数：决定 build / materialize / shard 切分。
+	 *  公开放在 header 是因为 anonymous namespace 类型不能跨 .cpp 引用。 */
+	struct FMaterializeAssetVisualOpts
+	{
+		bool bMaterialize = true;       // 命中缓存 / build 完后是否写 SQLite
+		int32 ShardIndex = 0;           // 当前进程负责的 shard 序号；ShardCount=1 表示不分片
+		int32 ShardCount = 1;
+	};
+
+	/** 内部 helper：跑实际 materialize 循环；公共入口都包它。 */
+	void MaterializeAssetVisualImpl(const FMaterializeAssetVisualOpts& Opts);
 
 	/** full index 的后台任务小对象。 */
 	class FIndexingTask
